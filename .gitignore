@@ -1,0 +1,28 @@
+# Large dataset files
+data/KIT/dataset/combined_obd_dataset_watsonx.csv
+
+# macOS files
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Model files (large)
+*.pth
+*.pt
+*.bin
+
+# IDE
+.vscode/
+.idea/
+
