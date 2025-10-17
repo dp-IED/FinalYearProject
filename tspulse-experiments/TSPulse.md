@@ -1,4 +1,4 @@
-# TSPulse Observations
+# TSPulse Observations (KIT dataset)
 
 ## Config #1: Recipe defaults trained on one KIT file (2018-03-26_Seat_Leon_RT_S_Normal.csv)
 
@@ -148,7 +148,9 @@ pipeline = TimeSeriesAnomalyDetectionPipeline(
 - **Coolant anomalies detected**: 1679 (same as Config #2 and Config #1)
 - **Coolant anomaly percentage**: 5.00% (same as Config #2 and Config #1)
 
-*This is the best result so far, but still not close to 0% anomalies.*
+With a 0.5 anomaly score threshold, we get 37 anomalies, a 0.11% anomaly rate. This is a good result, we can consider that we have achieved a baseline on the KIT dataset.
+
+_This is the best result so far, but still not close to 0% anomalies._
 
 ## Config #4: Tried frequency reconstruction mode only
 
@@ -157,10 +159,10 @@ Removed AnomalyScoreMethods.PREDICTIVE.value from the prediction mode.
 ```python
 config = {
     "prediction_mode": [AnomalyScoreMethods.FREQUENCY_RECONSTRUCTION.value], # removed AnomalyScoreMethods.Predictive
-    "aggregation_length": 16, 
-    "aggregation_function": "mean", 
-    "smoothing_length": 1, 
-    "least_significant_scale": 0.02, 
+    "aggregation_length": 16,
+    "aggregation_function": "mean",
+    "smoothing_length": 1,
+    "least_significant_scale": 0.02,
     "least_significant_score": 0.2
 }
 
@@ -177,11 +179,11 @@ pipeline = TimeSeriesAnomalyDetectionPipeline(
         "Air Flow Rate from Mass Flow Sensor [g/s]"
     ],
     prediction_mode=config["prediction_mode"],
-    aggregation_length=config["aggregation_length"],  
-    aggr_function=config["aggregation_function"], 
-    smoothing_length=config["smoothing_length"],  
-    least_significant_scale=config["least_significant_scale"], 
-    least_significant_score=config["least_significant_score"], 
+    aggregation_length=config["aggregation_length"],
+    aggr_function=config["aggregation_function"],
+    smoothing_length=config["smoothing_length"],
+    least_significant_scale=config["least_significant_scale"],
+    least_significant_score=config["least_significant_score"],
 )
 ```
 
@@ -203,6 +205,59 @@ Same results as Config #3 and Config #2, same number of anomalies detected, exce
 ## Observations
 
 ### There seems to be an internal 5% default detection rate
+
 ### Solution: Take only those that have a .5 anomaly score or higher. This is a scuffed method, but it works for now.
+
 ### We could have multiple thresholds for different levels of severity (e.g. 0.5, 0.75, 1.0)
 
+# TSPulse Observations (CarOBD dataset)
+
+## Config #1: Using Config #3
+
+Using predictive mode only, same as Config #3 for KIT dataset, since it seems to be the best performing mode in terms of reducing the mean anomaly score.
+
+```python
+config = {
+    "prediction_mode": [AnomalyScoreMethods.PREDICTIVE.value], # removed AnomalyScoreMethods.FREQUENCY_RECONSTRUCTION
+    "aggregation_length": 16,
+    "aggregation_function": "mean",
+    "smoothing_length": 1,
+    "least_significant_scale": 0.02,
+    "least_significant_score": 0.2
+}
+
+# Configure anomaly detection pipeline for CarOBD dataset
+pipeline = TimeSeriesAnomalyDetectionPipeline(
+    model,
+    timestamp_column="Time",  # CarOBD dataset time column
+    target_columns=[
+        "COOLANT_TEMPERATURE",  # Primary target for coolant anomalies
+        "ENGINE_RPM",
+        "VEHICLE_SPEED",
+        "THROTTLE",
+        "INTAKE_MANIFOLD_PRESSURE",
+        "ENGINE_LOAD"
+    ],
+    prediction_mode=config["prediction_mode"],
+    aggregation_length=config["aggregation_length"],
+    aggr_function=config["aggregation_function"],
+    smoothing_length=config["smoothing_length"],
+    least_significant_scale=config["least_significant_scale"],
+    least_significant_score=config["least_significant_score"],
+)
+```
+
+### TSPulse Anomaly Detection Results
+
+- **Total points**: 34684 points
+- **Calculated threshold (95th percentile)**: 0.0008
+- **Max anomaly score**: 1.0000
+- **Min anomaly score**: 0.0000
+- **Mean anomaly score**: 0.0009
+
+### Coolant Temperature Anomaly Analysis
+
+- **Coolant anomalies detected**: 1735
+- **Coolant anomaly percentage**: 5.00%
+
+With a 0.5 anomaly score threshold, we get only 5 anomalies, a 0.01% anomaly rate. This is a good result, we can consider that we have achieved a baseline on both datasets.
