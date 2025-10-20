@@ -1,5 +1,27 @@
 # TSPulse Observations (KIT dataset)
 
+## Summary
+
+After experimenting with different prediction modes to detect anomalies in Engine Coolant temperatures, I suspect that the model has an internal calculation which results in a baseline 5% anomaly percentage.
+
+To solve this I take the raw anomaly scores assigned by the model to the datapoints, and consider anomalies only those with a 0.5 score or higher.
+
+This method is not ideal, I think this should be reworked to depend on the distribution of anomaly scores.
+
+Best configuration according to this measuring method:
+
+KIT: Config #3 (0.11% anomalies)
+carOBD: Config #3 (0.01% anomalies)
+
+The higher KIT anomaly % reflects a heavier high‑score tail caused by dataset/context differences (auxiliary features, transient driving patterns, sampling/normalization), while carOBD is steadier, yielding fewer >0.5 spikes.
+
+**Checks to run**
+- **Score distribution**: Compare CDFs/histograms; KS test between KIT vs carOBD anomaly scores.
+- **Residuals**: Per-feature residual variance and spike counts; separate warm‑up vs steady‑state.
+- **Temporal structure**: Resample to a common rate; check timestamp jitter/missing gaps.
+- **Feature alignment**: Use matched auxiliaries (e.g., replace `ENGINE_LOAD` vs `Air Flow Rate`) and re-run.
+- **Normalization**: Per‑trip robust scaling; verify units/ranges and leakage-free preprocessing.
+- **Sensitivity**: Sweep `smoothing_length`, `aggregation_function` (mean vs median), and percentile-based thresholds.
 ## Config #1: Recipe defaults trained on one KIT file (2018-03-26_Seat_Leon_RT_S_Normal.csv)
 
 Attempting to set a baseline anomaly score for coolant temperature. Should achieve close to 0% anomalies.
@@ -29,8 +51,6 @@ pipeline = TimeSeriesAnomalyDetectionPipeline(
 ```
 
 ### TSPulse Anomaly Detection Results
-
-Results columns: ['Time', 'Engine Coolant Temperature [°C]', 'Engine RPM [RPM]', 'Vehicle Speed Sensor [km/h]', 'Absolute Throttle Position [%]', 'Intake Manifold Absolute Pressure [kPa]', 'Air Flow Rate from Mass Flow Sensor [g/s]', 'anomaly_score']
 
 - **Total points**: 33563 points
 - **Calculated threshold (95th percentile)**: 0.0471
@@ -81,8 +101,6 @@ pipeline = TimeSeriesAnomalyDetectionPipeline(
 ```
 
 ### TSPulse Anomaly Detection Results
-
-Results columns: ['Time', 'Engine Coolant Temperature [°C]', 'Engine RPM [RPM]', 'Vehicle Speed Sensor [km/h]', 'Absolute Throttle Position [%]', 'Intake Manifold Absolute Pressure [kPa]', 'Air Flow Rate from Mass Flow Sensor [g/s]', 'anomaly_score']
 
 - **Total points**: 33563 points
 - **Calculated threshold (95th percentile)**: 0.0093 (lower than Config #1)
