@@ -1,0 +1,19 @@
+{
+  "mode": "motion",
+  "total_samples": 301695,
+  "normal_train_samples": 162451,
+  "normal_test_samples": 69622,
+  "anomaly_samples": 69622,
+  "injection_percentage": 0.15,
+  "injection_strategy": "random",
+  "level_distribution": {
+    "Level_I": 334,
+    "Level_II": 333,
+    "Level_III": 333
+  },
+  "snr_levels": {
+    "Level_I": 18,
+    "Level_II": 8,
+    "Level_III": 0
+  }
+}
