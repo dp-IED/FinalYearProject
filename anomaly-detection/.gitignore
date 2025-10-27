@@ -1,0 +1,32 @@
+# ML Models - Large files that can be regenerated
+models/*.pkl
+models/*.joblib
+ml/models/*.pkl
+ml/models/*.joblib
+ml/models/arima_models/*.pkl
+
+# Keep metadata files
+!models/*.json
+!ml/models/*.json
+!ml/models/arima_models/*.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
