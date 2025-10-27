@@ -1,0 +1,16 @@
+{
+  "adf_statistic": -7.625555786498467,
+  "adf_pvalue": 2.0732912590558364e-11,
+  "is_stationary": true,
+  "aic": 95402.36435593027,
+  "bic": 95485.05222965828,
+  "hqic": 95427.83077024668,
+  "order": [
+    4,
+    1,
+    4
+  ],
+  "data_points": 72226,
+  "ljung_box_pvalue": 6.589360893926659e-33,
+  "residuals_autocorrelated": true
+}
