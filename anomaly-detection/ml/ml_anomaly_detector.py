@@ -20,11 +20,11 @@ import os
 import pickle
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Tuple, Optional
 from sklearn.ensemble import IsolationForest
 from sklearn.svm import OneClassSVM
 from sklearn.preprocessing import RobustScaler
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, roc_auc_score, roc_curve, auc
 from sklearn.model_selection import train_test_split
 import warnings
 warnings.filterwarnings('ignore')
@@ -49,6 +49,54 @@ class CarOBDMLDataLoader:
             'INTAKE_AIR_TEMP ()'
         ]
         
+    def _handle_duplicate_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Handle duplicate column names in a DataFrame.
+        
+        Logic:
+        - If 1 duplicate (no next): take last
+        - If 3 or more duplicates: take middle
+        - If 2 duplicates: take first
+        
+        Args:
+            df: DataFrame with potentially duplicate columns
+            
+        Returns:
+            DataFrame with duplicate columns handled
+        """
+        if df.columns.duplicated().any():
+            # Get duplicate column names
+            duplicate_cols = df.columns[df.columns.duplicated(keep=False)]
+            unique_duplicate_names = duplicate_cols.unique()
+            
+            # Collect column indices to keep (all columns by default)
+            columns_to_keep = set(range(len(df.columns)))
+            
+            for col_name in unique_duplicate_names:
+                # Get all column indices with this name
+                col_indices = [i for i, name in enumerate(df.columns) if name == col_name]
+                n_duplicates = len(col_indices)
+                
+                if n_duplicates == 1:
+                    # If 1 duplicate (no next): take last (shouldn't happen, but handle it)
+                    continue
+                elif n_duplicates == 2:
+                    # If 2 duplicates: take first (remove the second)
+                    columns_to_keep.discard(col_indices[1])
+                else:  # 3 or more
+                    # If 3 or more duplicates: take middle (remove all others)
+                    middle_idx = n_duplicates // 2
+                    for i, idx in enumerate(col_indices):
+                        if i != middle_idx:
+                            columns_to_keep.discard(idx)
+            
+            # Select only columns to keep using positional indexing
+            columns_to_keep = sorted(list(columns_to_keep))
+            df_processed = df.iloc[:, columns_to_keep].copy()
+            return df_processed
+        
+        return df
+    
     def load_all_data(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """Load both idle and motion data."""
         print("Loading carOBD data for ML training...")
@@ -95,6 +143,10 @@ class CarOBDMLDataLoader:
         
         idle_combined = pd.concat(idle_data, ignore_index=True)
         motion_combined = pd.concat(motion_data, ignore_index=True)
+        
+        # Handle duplicate columns
+        idle_combined = self._handle_duplicate_columns(idle_combined)
+        motion_combined = self._handle_duplicate_columns(motion_combined)
         
         print(f"Loaded {len(idle_combined)} idle data points")
         print(f"Loaded {len(motion_combined)} motion data points")
@@ -145,15 +197,45 @@ class CarOBDMLDataLoader:
             # Throttle efficiency
             features['THROTTLE_EFFICIENCY'] = features['VEHICLE_SPEED ()'] / (features['THROTTLE ()'] + 1)
         
-        # Add rolling statistics for temporal features
+        # Add rolling statistics for temporal features (multiple window sizes)
+        rolling_windows = [3, 5, 10]
         for col in ['COOLANT_TEMPERATURE ()', 'ENGINE_RPM ()']:
             if col in features.columns:
-                # Rolling mean and std (3-point window for better sensitivity)
-                features[f'{col}_ROLLING_MEAN'] = features[col].rolling(window=3, min_periods=1).mean()
-                features[f'{col}_ROLLING_STD'] = features[col].rolling(window=3, min_periods=1).std()
+                for window in rolling_windows:
+                    # Rolling mean and std with different windows
+                    features[f'{col}_ROLLING_MEAN_{window}'] = features[col].rolling(window=window, min_periods=1).mean()
+                    features[f'{col}_ROLLING_STD_{window}'] = features[col].rolling(window=window, min_periods=1).std()
+                
+                # Rate of change (first derivative)
+                features[f'{col}_RATE_OF_CHANGE'] = features[col].diff().fillna(0)
+                
+                # Second derivative (acceleration)
+                features[f'{col}_ACCELERATION'] = features[f'{col}_RATE_OF_CHANGE'].diff().fillna(0)
+        
+        # Add cross-sensor relationships
+        if 'COOLANT_TEMPERATURE ()' in features.columns and 'INTAKE_AIR_TEMP ()' in features.columns:
+            # Temperature gradient
+            features['TEMP_GRADIENT'] = features['COOLANT_TEMPERATURE ()'] - features['INTAKE_AIR_TEMP ()']
+        
+        if 'ENGINE_LOAD ()' in features.columns and 'THROTTLE ()' in features.columns:
+            # Load efficiency
+            features['LOAD_EFFICIENCY'] = features['ENGINE_LOAD ()'] / (features['THROTTLE ()'] + 1)
+        
+        if 'VEHICLE_SPEED ()' in features.columns and 'ENGINE_RPM ()' in features.columns:
+            # Speed-RPM ratio (gear indicator)
+            features['SPEED_RPM_RATIO'] = features['VEHICLE_SPEED ()'] / (features['ENGINE_RPM ()'] + 1)
+        
+        # Statistical features (percentiles, min/max in rolling window)
+        for col in ['COOLANT_TEMPERATURE ()', 'ENGINE_RPM ()']:
+            if col in features.columns:
+                window = 10
+                features[f'{col}_ROLLING_MIN'] = features[col].rolling(window=window, min_periods=1).min()
+                features[f'{col}_ROLLING_MAX'] = features[col].rolling(window=window, min_periods=1).max()
+                features[f'{col}_ROLLING_RANGE'] = features[f'{col}_ROLLING_MAX'] - features[f'{col}_ROLLING_MIN']
         
         # Fill any NaN values created by rolling operations
         features = features.fillna(method='bfill').fillna(method='ffill')
+        features = features.fillna(0)  # Final fallback
         
         return features.values
     
@@ -168,24 +250,50 @@ class CarOBDMLDataLoader:
         if 'THROTTLE ()' in available_columns and 'VEHICLE_SPEED ()' in available_columns:
             feature_names.append('THROTTLE_EFFICIENCY')
         
-        # Add rolling feature names
+        # Add rolling feature names (multiple windows)
+        rolling_windows = [3, 5, 10]
         for col in ['COOLANT_TEMPERATURE ()', 'ENGINE_RPM ()']:
             if col in available_columns:
-                feature_names.extend([f'{col}_ROLLING_MEAN', f'{col}_ROLLING_STD'])
+                for window in rolling_windows:
+                    feature_names.extend([f'{col}_ROLLING_MEAN_{window}', f'{col}_ROLLING_STD_{window}'])
+                feature_names.extend([
+                    f'{col}_RATE_OF_CHANGE',
+                    f'{col}_ACCELERATION',
+                    f'{col}_ROLLING_MIN',
+                    f'{col}_ROLLING_MAX',
+                    f'{col}_ROLLING_RANGE'
+                ])
+        
+        # Add cross-sensor feature names
+        if 'COOLANT_TEMPERATURE ()' in available_columns and 'INTAKE_AIR_TEMP ()' in available_columns:
+            feature_names.append('TEMP_GRADIENT')
+        if 'ENGINE_LOAD ()' in available_columns and 'THROTTLE ()' in available_columns:
+            feature_names.append('LOAD_EFFICIENCY')
+        if 'VEHICLE_SPEED ()' in available_columns and 'ENGINE_RPM ()' in available_columns:
+            feature_names.append('SPEED_RPM_RATIO')
         
         return feature_names
     
     def create_realistic_fault_data(self, normal_data: np.ndarray, 
-                                  fault_percentage: float = 0.2) -> Tuple[np.ndarray, np.ndarray]:
+                                  fault_percentage: float = 0.2,
+                                  feature_names: Optional[List[str]] = None) -> Tuple[np.ndarray, np.ndarray, Dict]:
         """
         Create realistic fault-injected data based on automotive sensor failure patterns.
+        Tracks which columns were modified and by what percentage.
         
         Args:
             normal_data: Normal sensor data
             fault_percentage: Percentage of data to inject faults into
+            feature_names: Optional list of feature names for better tracking
             
         Returns:
-            Tuple of (features_with_faults, fault_labels)
+            Tuple of (features_with_faults, fault_labels, fault_info)
+            fault_info: Dict with keys:
+                - 'modified_columns': List[List[int]] - which columns were modified per sample
+                - 'percentage_changes': List[List[float]] - percentage change per column per sample
+                - 'fault_types': List[str] - type of fault injected per sample
+                - 'original_values': List[List[float]] - original values before modification
+                - 'modified_values': List[List[float]] - values after modification
         """
         print(f"Creating realistic fault data with {fault_percentage*100}% fault injection...")
         
@@ -200,48 +308,107 @@ class CarOBDMLDataLoader:
         # Create realistic faults based on automotive sensor failure patterns
         fault_features = normal_data.copy()
         
+        # Track fault information
+        modified_columns = [[] for _ in range(n_samples)]
+        percentage_changes = [[] for _ in range(n_samples)]
+        fault_types = [None] * n_samples
+        original_values = [[] for _ in range(n_samples)]
+        modified_values = [[] for _ in range(n_samples)]
+        
         for idx in fault_indices:
             # Add different types of realistic automotive sensor faults
             fault_type = np.random.choice(['coolant_bias', 'coolant_drift', 'coolant_stuck', 'rpm_bias', 'multi_sensor'])
+            fault_types[idx] = fault_type
+            
+            original_vals = fault_features[idx].copy()
             
             if fault_type == 'coolant_bias':
                 # Coolant temperature sensor bias (common fault)
                 # Add systematic offset of 10-30°C (more detectable than 5°C)
                 bias_amount = np.random.uniform(10, 30) * np.random.choice([-1, 1])
-                fault_features[idx, 0] += bias_amount  # Coolant temperature
+                original_val = fault_features[idx, 0]
+                fault_features[idx, 0] += bias_amount
+                modified_columns[idx].append(0)
+                original_values[idx].append(original_val)
+                modified_values[idx].append(fault_features[idx, 0])
+                # Calculate percentage change (avoid division by zero)
+                pct_change = (bias_amount / (abs(original_val) + 1e-8)) * 100
+                percentage_changes[idx].append(pct_change)
             
             elif fault_type == 'coolant_drift':
                 # Gradual coolant sensor drift (aging sensor)
                 # Simulate gradual temperature reading drift
                 drift_factor = np.random.uniform(0.8, 1.2)  # 20% drift
+                original_val = fault_features[idx, 0]
                 fault_features[idx, 0] *= drift_factor
+                modified_columns[idx].append(0)
+                original_values[idx].append(original_val)
+                modified_values[idx].append(fault_features[idx, 0])
+                pct_change = (drift_factor - 1.0) * 100
+                percentage_changes[idx].append(pct_change)
+                
                 # Also affect RPM-temperature relationship
                 if fault_features.shape[1] > 1:  # If RPM is available
-                    fault_features[idx, 1] *= np.random.uniform(0.9, 1.1)
+                    rpm_factor = np.random.uniform(0.9, 1.1)
+                    original_rpm = fault_features[idx, 1]
+                    fault_features[idx, 1] *= rpm_factor
+                    modified_columns[idx].append(1)
+                    original_values[idx].append(original_rpm)
+                    modified_values[idx].append(fault_features[idx, 1])
+                    percentage_changes[idx].append((rpm_factor - 1.0) * 100)
             
             elif fault_type == 'coolant_stuck':
                 # Stuck coolant sensor (common in automotive)
                 # Keep temperature at a fixed unrealistic value
                 stuck_temp = np.random.uniform(20, 120)  # Random stuck temperature
+                original_val = fault_features[idx, 0]
                 fault_features[idx, 0] = stuck_temp
+                modified_columns[idx].append(0)
+                original_values[idx].append(original_val)
+                modified_values[idx].append(stuck_temp)
+                pct_change = ((stuck_temp - original_val) / (abs(original_val) + 1e-8)) * 100
+                percentage_changes[idx].append(pct_change)
             
             elif fault_type == 'rpm_bias':
                 # RPM sensor bias (affects multiple derived features)
                 rpm_bias = np.random.uniform(100, 500) * np.random.choice([-1, 1])
                 if fault_features.shape[1] > 1:  # If RPM is available
+                    original_rpm = fault_features[idx, 1]
                     fault_features[idx, 1] += rpm_bias
+                    modified_columns[idx].append(1)
+                    original_values[idx].append(original_rpm)
+                    modified_values[idx].append(fault_features[idx, 1])
+                    pct_change = (rpm_bias / (abs(original_rpm) + 1e-8)) * 100
+                    percentage_changes[idx].append(pct_change)
             
             elif fault_type == 'multi_sensor':
                 # Multiple sensor degradation (realistic scenario)
                 # Add correlated faults across multiple sensors
                 degradation_factor = np.random.uniform(0.7, 1.3)
+                original_vals_copy = fault_features[idx].copy()
                 fault_features[idx] *= degradation_factor
                 # Add some noise to make it more realistic
                 noise_level = np.random.uniform(0.05, 0.15)
                 fault_features[idx] += np.random.normal(0, noise_level, fault_features.shape[1])
+                
+                # Track all modified columns
+                for col_idx in range(fault_features.shape[1]):
+                    modified_columns[idx].append(col_idx)
+                    original_values[idx].append(original_vals_copy[col_idx])
+                    modified_values[idx].append(fault_features[idx, col_idx])
+                    pct_change = (degradation_factor - 1.0) * 100
+                    percentage_changes[idx].append(pct_change)
+        
+        fault_info = {
+            'modified_columns': modified_columns,
+            'percentage_changes': percentage_changes,
+            'fault_types': fault_types,
+            'original_values': original_values,
+            'modified_values': modified_values
+        }
         
         print(f"Created {n_faults} realistic automotive sensor faults out of {n_samples} samples")
-        return fault_features, fault_labels
+        return fault_features, fault_labels, fault_info
 
 
 class MLAnomalyDetector:
@@ -261,18 +428,24 @@ class MLAnomalyDetector:
         # Set realistic default parameters
         self.params = {
             'isolation_forest': {
-                'contamination': 0.1,  # Expected proportion of anomalies
+                'contamination': 0.1,  # Expected proportion of anomalies (or 'auto' for auto-detection)
                 'random_state': 42,
                 'n_estimators': 200,  # More trees for better generalization
                 'max_samples': 0.8,   # Bootstrap sampling
                 'max_features': 0.8   # Feature subsampling
             },
             'one_class_svm': {
-                'nu': 0.1,  # Proportion of outliers
+                'nu': 0.1,  # Proportion of outliers (used with auto_threshold method)
                 'kernel': 'rbf',
                 'gamma': 'scale'
             }
         }
+        
+        # Auto-detection settings
+        self.use_auto_detection = kwargs.pop('use_auto_detection', False)
+        self.svm_auto_threshold = None  # Will be set during training if auto-detection enabled
+        self.svm_threshold_method = kwargs.pop('svm_threshold_method', 'percentile')  # 'percentile', 'iqr', 'std'
+        self.svm_threshold_percentile = kwargs.pop('svm_threshold_percentile', 5)  # For percentile method
         
         # Update with provided parameters
         if algorithm in self.params:
@@ -312,6 +485,12 @@ class MLAnomalyDetector:
         # Train models based on algorithm choice
         if self.algorithm == 'isolation_forest' or self.algorithm == 'both':
             print("Training Isolation Forest...")
+            
+            # Handle auto-detection for Isolation Forest
+            if self.use_auto_detection:
+                print("  Using auto-detection (contamination='auto')")
+                self.params['isolation_forest']['contamination'] = 'auto'
+            
             self.models['isolation_forest'] = IsolationForest(
                 **self.params['isolation_forest']
             )
@@ -321,13 +500,18 @@ class MLAnomalyDetector:
             val_scores = self.models['isolation_forest'].decision_function(X_val_scaled)
             train_scores = self.models['isolation_forest'].decision_function(X_train_scaled)
             
+            contamination_used = self.params['isolation_forest']['contamination']
             self.metadata['isolation_forest'] = {
                 'train_score_mean': float(np.mean(train_scores)),
                 'train_score_std': float(np.std(train_scores)),
                 'val_score_mean': float(np.mean(val_scores)),
                 'val_score_std': float(np.std(val_scores)),
-                'contamination': self.params['isolation_forest']['contamination']
+                'contamination': contamination_used,
+                'use_auto_detection': self.use_auto_detection
             }
+            
+            if self.use_auto_detection:
+                print("  Auto-detected threshold from training data distribution")
         
         if self.algorithm == 'one_class_svm' or self.algorithm == 'both':
             print("Training One-Class SVM...")
@@ -340,17 +524,62 @@ class MLAnomalyDetector:
             val_scores = self.models['one_class_svm'].decision_function(X_val_scaled)
             train_scores = self.models['one_class_svm'].decision_function(X_train_scaled)
             
+            # Auto-detect threshold for SVM if auto-detection is enabled
+            if self.use_auto_detection:
+                print("  Auto-detecting threshold from validation set...")
+                self.svm_auto_threshold = self._detect_svm_threshold(
+                    val_scores, 
+                    method=self.svm_threshold_method,
+                    percentile=self.svm_threshold_percentile
+                )
+                print(f"  Auto-detected threshold: {self.svm_auto_threshold:.4f} (method: {self.svm_threshold_method})")
+            
             self.metadata['one_class_svm'] = {
                 'train_score_mean': float(np.mean(train_scores)),
                 'train_score_std': float(np.std(train_scores)),
                 'val_score_mean': float(np.mean(val_scores)),
                 'val_score_std': float(np.std(val_scores)),
-                'nu': self.params['one_class_svm']['nu']
+                'nu': self.params['one_class_svm']['nu'],
+                'use_auto_detection': self.use_auto_detection,
+                'auto_threshold': float(self.svm_auto_threshold) if self.svm_auto_threshold is not None else None,
+                'threshold_method': self.svm_threshold_method if self.use_auto_detection else None
             }
         
         self.is_trained = True
         print("Training completed successfully!")
         return self
+    
+    def _detect_svm_threshold(self, scores: np.ndarray, method: str = 'percentile', 
+                             percentile: int = 5) -> float:
+        """
+        Auto-detect threshold for One-Class SVM based on validation scores.
+        
+        Args:
+            scores: Decision function scores from validation set
+            method: Method to use ('percentile', 'iqr', 'std')
+            percentile: Percentile to use for percentile method (default: 5)
+            
+        Returns:
+            Threshold value (scores below this are anomalies)
+        """
+        if method == 'percentile':
+            # Bottom X% are considered anomalies
+            threshold = np.percentile(scores, percentile)
+        elif method == 'iqr':
+            # Interquartile Range method
+            Q1 = np.percentile(scores, 25)
+            Q3 = np.percentile(scores, 75)
+            IQR = Q3 - Q1
+            threshold = Q1 - 1.5 * IQR  # Standard outlier detection
+        elif method == 'std':
+            # Standard deviation method (2 sigma rule)
+            mean_score = np.mean(scores)
+            std_score = np.std(scores)
+            threshold = mean_score - 2 * std_score
+        else:
+            raise ValueError(f"Unknown threshold method: {method}")
+        
+        return float(threshold)
     
     def predict(self, X: np.ndarray) -> Dict[str, np.ndarray]:
         """Predict anomalies in new data."""
@@ -363,10 +592,16 @@ class MLAnomalyDetector:
         predictions = {}
         
         for name, model in self.models.items():
-            # Get anomaly predictions (-1 for anomaly, 1 for normal)
-            pred = model.predict(X_scaled)
             # Get anomaly scores (higher = more normal, lower = more anomalous)
             scores = model.decision_function(X_scaled)
+            
+            # Handle auto-detection for One-Class SVM
+            if name == 'one_class_svm' and self.use_auto_detection and self.svm_auto_threshold is not None:
+                # Use auto-detected threshold instead of model's built-in threshold
+                pred = np.where(scores < self.svm_auto_threshold, -1, 1)
+            else:
+                # Use model's built-in prediction
+                pred = model.predict(X_scaled)
             
             predictions[name] = {
                 'predictions': pred,
@@ -451,7 +686,11 @@ class MLAnomalyDetector:
             'algorithm': self.algorithm,
             'params': self.params,
             'metadata': self.metadata,
-            'is_trained': self.is_trained
+            'is_trained': self.is_trained,
+            'use_auto_detection': self.use_auto_detection,
+            'svm_auto_threshold': self.svm_auto_threshold,
+            'svm_threshold_method': self.svm_threshold_method,
+            'svm_threshold_percentile': self.svm_threshold_percentile
         }
         
         with open(f"{filepath}.pkl", 'wb') as f:
@@ -473,6 +712,10 @@ class MLAnomalyDetector:
         detector.params = model_data['params']
         detector.metadata = model_data['metadata']
         detector.is_trained = model_data['is_trained']
+        detector.use_auto_detection = model_data.get('use_auto_detection', False)
+        detector.svm_auto_threshold = model_data.get('svm_auto_threshold', None)
+        detector.svm_threshold_method = model_data.get('svm_threshold_method', 'percentile')
+        detector.svm_threshold_percentile = model_data.get('svm_threshold_percentile', 5)
         
         print(f"ML model loaded from {filepath}.pkl")
         return detector
@@ -502,6 +745,7 @@ def evaluate_anomaly_detection(y_true: np.ndarray, predictions: Dict[str, Dict])
     
     for name, pred_data in predictions.items():
         y_pred = (pred_data['anomalies']).astype(int)
+        scores = pred_data['scores']  # Get anomaly scores
         
         # Calculate confusion matrix
         cm = confusion_matrix(y_true, y_pred)
@@ -520,6 +764,28 @@ def evaluate_anomaly_detection(y_true: np.ndarray, predictions: Dict[str, Dict])
         specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
         balanced_accuracy = (recall + specificity) / 2
         
+        # Calculate ROC-AUC
+        # Note: For anomaly scores, lower = more anomalous, so we need to invert
+        # for AUC calculation (which expects higher = more anomalous)
+        try:
+            if len(np.unique(y_true)) > 1:  # Need both classes for AUC
+                # Invert scores so higher = more anomalous (for ROC calculation)
+                inverted_scores = -scores  # Make higher = more anomalous
+                roc_auc = roc_auc_score(y_true, inverted_scores)
+                
+                # Calculate ROC curve for potential plotting
+                fpr, tpr, thresholds = roc_curve(y_true, inverted_scores)
+                pr_auc = auc(fpr, tpr)  # Same as roc_auc, but keep for consistency
+            else:
+                roc_auc = 0.0
+                fpr, tpr, thresholds = np.array([]), np.array([]), np.array([])
+                pr_auc = 0.0
+        except ValueError:
+            # Handle case where scores are constant or other edge cases
+            roc_auc = 0.0
+            fpr, tpr, thresholds = np.array([]), np.array([]), np.array([])
+            pr_auc = 0.0
+        
         results[name] = {
             'precision': precision,
             'recall': recall,
@@ -527,7 +793,13 @@ def evaluate_anomaly_detection(y_true: np.ndarray, predictions: Dict[str, Dict])
             'accuracy': accuracy,
             'specificity': specificity,
             'balanced_accuracy': balanced_accuracy,
-            'confusion_matrix': {'tn': tn, 'fp': fp, 'fn': fn, 'tp': tp}
+            'roc_auc': roc_auc,  # ROC-AUC score
+            'confusion_matrix': {'tn': tn, 'fp': fp, 'fn': fn, 'tp': tp},
+            'roc_curve': {  # For potential plotting
+                'fpr': fpr.tolist() if len(fpr) > 0 else [],
+                'tpr': tpr.tolist() if len(tpr) > 0 else [],
+                'thresholds': thresholds.tolist() if len(thresholds) > 0 else []
+            }
         }
     
     return results

@@ -72,7 +72,7 @@ def main():
         
         # Show confusion matrix
         cm = metrics['confusion_matrix']
-        print(f"  Confusion Matrix:")
+        print("  Confusion Matrix:")
         print(f"    True Positives: {cm['tp']}")
         print(f"    False Positives: {cm['fp']}")
         print(f"    False Negatives: {cm['fn']}")
