@@ -130,22 +130,41 @@ def calculate_metrics(
     if scores is not None:
         try:
             if len(np.unique(y_true)) > 1:  # Need both classes for AUC
+                # Verify score-label correlation (should be positive for LSTM: higher = more anomalous)
+                correlation = np.corrcoef(y_true, scores)[0, 1] if len(scores) > 1 else 0.0
+                
+                # Calculate ROC-AUC
                 roc_auc = roc_auc_score(y_true, scores)
                 fpr, tpr, _ = roc_curve(y_true, scores)
                 pr_auc = average_precision_score(y_true, scores)
                 
                 metrics['roc_auc'] = roc_auc
                 metrics['pr_auc'] = pr_auc
+                metrics['score_label_correlation'] = correlation  # Diagnostic: should be positive
                 metrics['roc_curve'] = {
                     'fpr': fpr.tolist(),
                     'tpr': tpr.tolist()
                 }
+                
+                # Diagnostic: Check if low AUC is due to score distribution issues
+                if roc_auc < 0.7 and len(np.unique(scores)) > 10:
+                    # Calculate score separation
+                    normal_scores = scores[y_true == 0]
+                    anomaly_scores = scores[y_true == 1]
+                    if len(normal_scores) > 0 and len(anomaly_scores) > 0:
+                        separation_ratio = np.mean(anomaly_scores) / (np.mean(normal_scores) + 1e-8)
+                        metrics['score_separation_ratio'] = separation_ratio
+                        
+                        # Check for overlap (diagnostic for low AUC)
+                        overlap_pct = np.sum(normal_scores > np.percentile(anomaly_scores, 5)) / len(normal_scores) * 100
+                        metrics['score_overlap_percentage'] = overlap_pct
             else:
                 metrics['roc_auc'] = 0.0
                 metrics['pr_auc'] = 0.0
-        except ValueError:
+        except ValueError as e:
             metrics['roc_auc'] = 0.0
             metrics['pr_auc'] = 0.0
+            metrics['roc_auc_error'] = str(e)
     
     return metrics
 

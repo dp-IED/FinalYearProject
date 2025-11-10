@@ -1,5 +1,11 @@
 # TSPulse Observations (KIT dataset)
 
+## Todo
+
+- Add bigger sampling rate to dataset in order to smooth out the pattern.
+- OR, since the difference in y is very small at each timestep: leads to step like patterns which are hard for the model to detect.
+- Improve Visualisation of the results, the current samples are good but don't provide information on what the prediction context is, where the anomaly was located and true/false score.
+
 ## Summary
 
 After experimenting with different prediction modes to detect anomalies in Engine Coolant temperatures, I suspect that the model has an internal calculation which results in a baseline 5% anomaly percentage.

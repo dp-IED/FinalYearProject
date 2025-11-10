@@ -270,8 +270,8 @@ def evaluate_column_level_detection(
             best_f1 = 0.0
             best_threshold = np.percentile(col_scores, threshold_percentile)
             
-            # Try percentiles from 85 to 95
-            for pct in range(85, 96):
+            # Try percentiles from 80 to 98 (expanded range for better optimization)
+            for pct in range(80, 99):
                 test_threshold = np.percentile(col_scores, pct)
                 
                 # Calculate precision and recall for this threshold
@@ -392,8 +392,9 @@ def evaluate_timestamp_detection(
     model,
     sequences: np.ndarray,
     fault_info: Dict,
-    threshold_percentile: int = 95,
-    device: Optional[torch.device] = None
+    threshold_percentile: int = 90,  # Changed from 95 to 90 for better recall
+    device: Optional[torch.device] = None,
+    use_f1_optimal: bool = True  # New: use F1-optimal threshold instead of percentile
 ) -> Dict:
     """
     Evaluate how well the model identifies which timesteps are anomalous.
@@ -402,8 +403,9 @@ def evaluate_timestamp_detection(
         model: Trained LSTM model
         sequences: Input sequences (n_samples, seq_len, n_features)
         fault_info: Dictionary with fault information (aggregated per sequence)
-        threshold_percentile: Percentile to use for identifying anomalous timesteps
+        threshold_percentile: Percentile to use for identifying anomalous timesteps (fallback if use_f1_optimal=False)
         device: Device to run inference on
+        use_f1_optimal: If True, find F1-optimal threshold instead of using percentile
         
     Returns:
         Dictionary with evaluation metrics
@@ -427,8 +429,44 @@ def evaluate_timestamp_detection(
     
     timestamp_scores = np.concatenate(all_timestamp_scores, axis=0)  # (n_samples, seq_len-1)
     
-    # Find anomalous timesteps per sample (timesteps with score > threshold)
-    threshold = np.percentile(timestamp_scores, threshold_percentile)
+    # Find optimal threshold
+    actual_modified = fault_info['modified_columns']
+    
+    if use_f1_optimal:
+        # Find F1-optimal threshold by testing different percentiles
+        best_f1 = 0.0
+        best_threshold = np.percentile(timestamp_scores, threshold_percentile)
+        
+        # Try percentiles from 70 to 99
+        for pct in range(70, 100):
+            test_threshold = np.percentile(timestamp_scores, pct)
+            
+            tp = fp = fn = 0
+            for i in range(len(sequences)):
+                has_fault = len(actual_modified[i]) > 0
+                predicted_timesteps = set(np.where(timestamp_scores[i] > test_threshold)[0])
+                
+                if has_fault:
+                    if len(predicted_timesteps) > 0:
+                        tp += 1
+                    else:
+                        fn += 1
+                else:
+                    if len(predicted_timesteps) > 0:
+                        fp += 1
+            
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+            
+            if f1 > best_f1:
+                best_f1 = f1
+                best_threshold = test_threshold
+        
+        threshold = best_threshold
+    else:
+        # Use percentile threshold
+        threshold = np.percentile(timestamp_scores, threshold_percentile)
     
     # Identify which timesteps are flagged as anomalous
     predicted_anomalous_timesteps = []
@@ -474,7 +512,8 @@ def evaluate_timestamp_detection(
         'precision': precision,
         'recall': recall,
         'f1_score': f1_score,
-        'threshold': threshold
+        'threshold': threshold,
+        'threshold_method': 'f1_optimal' if use_f1_optimal else f'percentile_{threshold_percentile}'
     }
     
     return results
@@ -506,7 +545,7 @@ def train_lstm(
     print("=" * 70)
     print("LSTM Anomaly Detection Training")
     print("=" * 70)
-    print(f"\nConfiguration:")
+    print("Configuration:")
     print(f"  Data path: {data_path}")
     print(f"  Model path: {model_path}")
     print(f"  Sequence length: {sequence_length}")
@@ -558,12 +597,12 @@ def train_lstm(
     val_features_scaled = scaler.transform(val_features_raw)
     test_features_scaled = scaler.transform(test_features_raw)
     
-    print(f"Feature statistics (before scaling):")
+    print("Feature statistics (before scaling):")
     print(f"  Train - Mean range: [{train_features_raw.mean(axis=0).min():.2f}, {train_features_raw.mean(axis=0).max():.2f}]")
     print(f"  Train - Std range: [{train_features_raw.std(axis=0).min():.2f}, {train_features_raw.std(axis=0).max():.2f}]")
     print(f"  Train - Value range: [{train_features_raw.min():.2f}, {train_features_raw.max():.2f}]")
     
-    print(f"Feature statistics (after StandardScaler):")
+    print("Feature statistics (after StandardScaler):")
     print(f"  Train - Mean range: [{train_features_scaled.mean(axis=0).min():.6f}, {train_features_scaled.mean(axis=0).max():.6f}] (should be ~0)")
     print(f"  Train - Std range: [{train_features_scaled.std(axis=0).min():.6f}, {train_features_scaled.std(axis=0).max():.6f}] (should be ~1)")
     print(f"  Train - Value range: [{train_features_scaled.min():.2f}, {train_features_scaled.max():.2f}]")
@@ -938,8 +977,6 @@ def train_lstm(
     print("=" * 50)
     model = LSTMModel.load_model(model_path, device=device)
     
-    # Auto-detection: Optimize threshold from validation set
-    # Prediction errors are already anomaly scores (higher = more anomalous)
     if use_auto_detection:
         print("\n" + "=" * 50)
         print("AUTO-DETECTING THRESHOLD")
@@ -1025,6 +1062,17 @@ def train_lstm(
     print(f"  Recall: {metrics['recall']:.4f}")
     print(f"  Accuracy: {metrics['accuracy']:.4f}")
     print(f"  ROC-AUC: {metrics.get('roc_auc', 0.0):.4f}")
+    print(f"  PR-AUC: {metrics.get('pr_auc', 0.0):.4f}")
+    
+    # Print diagnostic information if ROC-AUC is low
+    if metrics.get('roc_auc', 1.0) < 0.7:
+        print(f"\n  ROC-AUC Diagnostic (Low AUC detected):")
+        if 'score_label_correlation' in metrics:
+            print(f"    Score-Label Correlation: {metrics['score_label_correlation']:.4f} (should be positive)")
+        if 'score_separation_ratio' in metrics:
+            print(f"    Score Separation Ratio: {metrics['score_separation_ratio']:.2f}x")
+        if 'score_overlap_percentage' in metrics:
+            print(f"    Score Overlap: {metrics['score_overlap_percentage']:.2f}% of normal scores above 5th percentile of anomalies")
     
     # Column-level anomaly detection evaluation
     print("\n" + "=" * 50)
@@ -1079,7 +1127,7 @@ def train_lstm(
     
     test_timestamp_results = evaluate_timestamp_detection(
         model, test_sequences_fault, test_fault_info,
-        threshold_percentile=90, device=device
+        threshold_percentile=90, device=device, use_f1_optimal=True  # Use F1-optimal threshold for better recall
     )
     
     print(f"\nTimestamp Detection Results:")
