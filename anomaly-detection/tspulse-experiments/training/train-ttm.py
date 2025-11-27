@@ -1,3 +1,8 @@
+# %%
+# Install the tsfm library
+! pip install "granite-tsfm[notebooks] @ git+https://github.com/ibm-granite/granite-tsfm.git@v0.2.22"
+
+# %%
 import math
 import os
 
@@ -97,10 +102,9 @@ def mean_fill_missing_timestamps_and_remove_duplicates(df: pd.DataFrame, id_cols
 
 
 # %%
-def downsample_elapsed_time_data(df, time_col, source_file_col, downsample_factor=5):
+def downsample(df, time_col, source_file_col, downsample_factor=5):
     """
-    Downsample data where time_col is elapsed seconds (0, 1, 2, ...).
-    No datetime conversion needed.
+    Improved downsampling with better NaN handling.
     """
     result_dfs = []
     skipped = []
@@ -108,14 +112,19 @@ def downsample_elapsed_time_data(df, time_col, source_file_col, downsample_facto
     for source_file in df[source_file_col].unique():
         file_df = df[df[source_file_col] == source_file].copy()
         
-        # Must have enough samples
         if len(file_df) < downsample_factor * 2:
-            skipped.append((source_file, len(file_df)))
+            skipped.append((source_file, 'too_short', len(file_df)))
             continue
         
         file_df = file_df.sort_values(time_col).reset_index(drop=True)
         
-        # Pre-smooth each sensor based on its type
+        # Check for columns that are already all NaN
+        all_nan_cols = file_df.columns[file_df.isna().all()].tolist()
+        if all_nan_cols:
+            # Remove these columns for this drive
+            file_df = file_df.drop(columns=all_nan_cols)
+            print(f"⚠️  Drive {source_file}: removed all-NaN columns: {all_nan_cols}")
+        
         smoothed = file_df.copy()
         
         for col in smoothed.columns:
@@ -127,39 +136,53 @@ def downsample_elapsed_time_data(df, time_col, source_file_col, downsample_facto
             
             col_upper = col.upper()
             
-            # Sensor-specific smoothing windows
+            # Determine window size
             if any(kw in col_upper for kw in ['TEMPERATURE', 'COOLANT', 'CATALYST']):
-                window = min(20, len(file_df) // 3)  # Heavy smoothing
+                window = min(20, len(file_df) // 3)
             elif any(kw in col_upper for kw in ['RPM', 'SPEED', 'THROTTLE']):
-                window = min(3, len(file_df) // 5)   # Light smoothing
+                window = min(3, len(file_df) // 5)
             elif any(kw in col_upper for kw in ['PRESSURE']):
-                window = min(10, len(file_df) // 4)  # Medium smoothing
+                window = min(10, len(file_df) // 4)
             else:
-                window = min(5, len(file_df) // 4)   # Default medium
+                window = min(5, len(file_df) // 4)
             
             if window >= 2:
+                # Use min_periods=1 to avoid creating NaNs
                 smoothed[col] = smoothed[col].rolling(
                     window=window,
                     center=True,
-                    min_periods=1
+                    min_periods=1  # KEY: Always produce a value
                 ).mean()
         
-        # Decimate: take every Nth sample
+        # Decimate
         downsampled = smoothed.iloc[::downsample_factor].copy()
         downsampled[time_col] = np.arange(len(downsampled)) * downsample_factor
         
-        result_dfs.append(downsampled.reset_index(drop=True))
+        # Forward fill any remaining NaNs
+        downsampled = downsampled.fillna(method='ffill').fillna(method='bfill')
         
+        # Final check: ensure no all-NaN columns
+        all_nan_after = downsampled.columns[downsampled.isna().all()].tolist()
+        if all_nan_after:
+            print(f"⚠️  Drive {source_file}: all-NaN after processing: {all_nan_after}")
+            # Drop these columns
+            downsampled = downsampled.drop(columns=all_nan_after)
+        
+        # Only keep if we still have target column
+        if 'COOLANT_TEMPERATURE ()' not in downsampled.columns:
+            skipped.append((source_file, 'missing_target', len(file_df)))
+            continue
+        
+        result_dfs.append(downsampled.reset_index(drop=True))
+    
     if len(result_dfs) == 0:
-        print("❌ All drives too short!")
-        for source, length in skipped:
-            print(f"  Drive {source}: {length} samples (need ≥{downsample_factor*2})")
-        raise ValueError("No valid drives after filtering")
+        raise ValueError(f"No valid drives! Skipped: {skipped}")
     
     result = pd.concat(result_dfs, ignore_index=True)
+    
+    print(f"\nDownsampling: {len(df):,} → {len(result):,} samples ({len(result_dfs)} drives)")
     if skipped:
-        print(f"Skipped drives: {len(skipped)} (too short)")
-    print(f"{'='*60}\n")
+        print(f"Skipped {len(skipped)} drives: {dict(pd.Series([r for _, r, _ in skipped]).value_counts())}")
     
     return result
 
@@ -174,7 +197,7 @@ print(f"Unique drives: {data['drive_id'].nunique()}")
 
 data = mean_fill_missing_timestamps_and_remove_duplicates(data, id_cols=["drive_id"])
 data = remove_zero_variance_columns(data, exclude_cols=["drive_id"])
-data_downsampled = downsample_elapsed_time_data(
+data_downsampled = downsample(
     data,
     time_col='ENGINE_RUN_TINE ()',
     source_file_col='drive_id',
