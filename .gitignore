@@ -22,6 +22,9 @@ ENV/
 *.pt
 *.bin
 
+# TensorBoard logs
+events.out.tfevents.*
+
 # IDE
 .vscode/
 .idea/
