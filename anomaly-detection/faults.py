@@ -26,6 +26,11 @@ def create_realistic_fault_data(
     fault_features = normal_data.copy()
     fault_labels = np.zeros(n_samples, dtype=int)
     
+    # Pre-calculate stats for adaptive scaling
+    # Handle division by zero for constant columns by defaulting std to 1.0
+    sensor_stds = np.std(normal_data, axis=0)
+    sensor_stds[sensor_stds == 0] = 1.0
+    
     # Metadata tracking
     fault_type_list = [None] * n_samples
     original_values = [[] for _ in range(n_samples)]
@@ -44,13 +49,16 @@ def create_realistic_fault_data(
         sensor_idx = np.random.randint(0, n_sensors)
         start_idx = np.random.randint(0, n_samples - 50)  # Leave room for fault duration
         
+        # Get scale for this sensor
+        scale = sensor_stds[sensor_idx]
+
         # Inject based on fault type
         if fault_type == 'gradual_drift':
             duration = min(np.random.randint(50, 200), n_samples - start_idx)
             end_idx = start_idx + duration
             
             # Drift magnitude: 0.5 to 2.0 std (subtle drift)
-            drift_magnitude = np.random.uniform(0.5, 2.0) * np.random.choice([-1, 1])
+            drift_magnitude = np.random.uniform(0.5, 2.0) * scale * np.random.choice([-1, 1])
             drift = np.linspace(0, drift_magnitude, duration)
             
             # Store original values
@@ -72,8 +80,8 @@ def create_realistic_fault_data(
             duration = min(np.random.randint(1, 4), n_samples - start_idx)
             end_idx = start_idx + duration
             
-            # Large but brief spike
-            spike_value = np.random.uniform(3.0, 5.0) * np.random.choice([-1, 1])
+            # Large but brief spike (3 to 5 stds)
+            spike_value = np.random.uniform(3.0, 5.0) * scale * np.random.choice([-1, 1])
             
             for t in range(start_idx, end_idx):
                 original_values[t].append(fault_features[t, sensor_idx])
@@ -110,8 +118,8 @@ def create_realistic_fault_data(
             duration = min(np.random.randint(100, 300), n_samples - start_idx)
             end_idx = start_idx + duration
             
-            # Small consistent bias
-            bias = np.random.uniform(0.3, 1.0) * np.random.choice([-1, 1])
+            # Small consistent bias (0.3 to 1.0 std)
+            bias = np.random.uniform(0.3, 1.0) * scale * np.random.choice([-1, 1])
             
             for t in range(start_idx, end_idx):
                 original_values[t].append(fault_features[t, sensor_idx])
@@ -129,8 +137,8 @@ def create_realistic_fault_data(
             duration = min(np.random.randint(20, 60), n_samples - start_idx)
             end_idx = start_idx + duration
             
-            # High-frequency noise
-            noise = np.random.normal(0, 0.8, duration)
+            # High-frequency noise (0.8 std)
+            noise = np.random.normal(0, 0.8 * scale, duration)
             
             for t in range(start_idx, end_idx):
                 original_values[t].append(fault_features[t, sensor_idx])
