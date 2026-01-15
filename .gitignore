@@ -35,3 +35,4 @@ src/granite-tsfm
 anomaly-detection/dummy_problem/archive/train_df.csv
 anomaly-detection/dummy_problem/archive/validation_df.csv
 anomaly-detection/dummy_problem/train_df_head.csv
+anomaly-detection/data_creation/GDN
