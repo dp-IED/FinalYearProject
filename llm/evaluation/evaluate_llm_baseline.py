@@ -1,0 +1,506 @@
+"""
+Evaluate LLM-only baseline method on shared evaluation dataset.
+
+This script:
+1. Loads shared dataset
+2. Formats unnormalized windows for LLM prompts
+3. Runs LLM inference (or simulates it)
+4. Compares predictions to ground truth
+5. Computes evaluation metrics
+"""
+
+import numpy as np
+import json
+import argparse
+from pathlib import Path
+from typing import Dict, List, Optional
+import time
+import re
+
+try:
+    from mlx_lm import load, stream_generate
+except ImportError:
+    print("Warning: mlx_lm not available. Install with: pip install mlx-lm")
+    stream_generate = None
+    load = None
+
+from metrics import compute_all_metrics, format_metrics_report
+
+
+def format_window_for_llm(
+    window_data: np.ndarray,
+    sensor_names: List[str],
+    statistical_features: Optional[np.ndarray] = None,
+    use_statistical_features: bool = True
+) -> str:
+    """
+    Format a window of sensor data for LLM prompt.
+    
+    Based on baseline/README.md:
+    - Approach 1: Pass entire OBD logs (windows of 300 timesteps)
+    - Approach 2: Enrich with statistical features (min, max, range, mean, std, median, mode, skewness, kurtosis)
+    
+    Args:
+        window_data: (window_size, num_sensors) array - unnormalized sensor values
+        sensor_names: List of sensor names
+        statistical_features: Optional (num_sensors, 9) array with statistical features
+        use_statistical_features: Whether to include statistical features in prompt
+        
+    Returns:
+        Formatted string for LLM prompt
+    """
+    lines = []
+    lines.append("You are an automotive diagnostic expert analyzing OBD-II sensor data.")
+    lines.append("")
+    lines.append("Task: Identify which sensors are faulty and describe the fault type.")
+    lines.append("")
+    lines.append("Sensor Data Window (300 timesteps):")
+    lines.append("=" * 80)
+    
+    # Add statistical features if available and requested
+    if statistical_features is not None and use_statistical_features:
+        lines.append("\nStatistical Features for each sensor:")
+        lines.append("-" * 80)
+        feature_names = ['mean', 'std', 'min', 'max', 'range', 'median', 'mode', 'skewness', 'kurtosis']
+        for i, sensor_name in enumerate(sensor_names):
+            if i < len(statistical_features):
+                lines.append(f"\n{sensor_name}:")
+                for j, feat_name in enumerate(feature_names):
+                    if j < len(statistical_features[i]):
+                        lines.append(f"  {feat_name}: {statistical_features[i][j]:.4f}")
+        lines.append("")
+    
+    # Add time series data (sample strategically to reduce context length)
+    # Sample more aggressively: every 30-50 timesteps to get ~10-15 key points
+    lines.append("\nTime Series Data (key timesteps sampled):")
+    lines.append("-" * 80)
+    
+    # Sample strategically: beginning, middle sections, and end
+    window_size = window_data.shape[0]
+    if window_size > 50:
+        # Sample ~15 key points: start, middle sections, end
+        sample_indices = (
+            [0] +  # Beginning
+            list(range(window_size // 4, window_size // 2, window_size // 8)) +  # First half
+            list(range(window_size // 2, 3 * window_size // 4, window_size // 8)) +  # Second half
+            [window_size - 1]  # End
+        )
+        # Remove duplicates and sort
+        sample_indices = sorted(list(set(sample_indices)))
+    else:
+        # For small windows, use all points
+        sample_indices = list(range(window_size))
+    
+    # Header
+    header = "Time\t" + "\t".join([name.replace(' ()', '') for name in sensor_names])
+    lines.append(header)
+    
+    # Data rows
+    for t in sample_indices:
+        values = window_data[t]
+        row = f"{t}\t" + "\t".join([f"{val:.2f}" for val in values])
+        lines.append(row)
+    
+    lines.append(f"\n(Showing {len(sample_indices)} of {window_size} timesteps)")
+    
+    lines.append("")
+    lines.append("=" * 80)
+    lines.append("")
+    lines.append("Please analyze this sensor data and provide:")
+    lines.append("1. List of faulty sensor names (if any)")
+    lines.append("2. Fault type description (e.g., VSS_DROPOUT, COOLANT_DROPOUT, TPS_STUCK, MAF_SCALE_LOW, RPM_SPEED_DECOUPLE, gradual_drift, intermittent_spike, slow_response, bias_offset, electrical_jitter)")
+    lines.append("3. Brief reasoning for your diagnosis")
+    lines.append("")
+    lines.append("Format your response as:")
+    lines.append("Faulty Sensors: [sensor1, sensor2, ...] or None")
+    lines.append("Fault Type: [fault_type]")
+    lines.append("Reasoning: [your analysis]")
+    
+    return "\n".join(lines)
+
+
+def parse_llm_response(response: str, sensor_names: List[str]) -> Dict[str, any]:
+    """
+    Parse LLM response to extract fault predictions.
+    
+    Expected format:
+    Faulty Sensors: [sensor1, sensor2, ...] or None
+    Fault Type: [fault_type]
+    Reasoning: [analysis]
+    
+    Args:
+        response: LLM response text
+        sensor_names: List of sensor names to match against
+        
+    Returns:
+        Dictionary with predictions:
+        - 'window_label': int - is window faulty? (0 or 1)
+        - 'sensor_labels': (num_sensors,) binary array - which sensors are faulty
+        - 'fault_type': str - predicted fault type
+        - 'reasoning': str - LLM reasoning
+    """
+    sensor_labels = np.zeros(len(sensor_names), dtype=np.float32)
+    fault_type = "unknown"
+    reasoning = ""
+    
+    # Extract faulty sensors - be more flexible with format
+    faulty_sensors_match = re.search(r'Faulty Sensors?:\s*(.+?)(?:\n|Fault Type|Reasoning|$)', response, re.IGNORECASE | re.DOTALL)
+    if faulty_sensors_match:
+        faulty_sensors_str = faulty_sensors_match.group(1).strip()
+        
+        if faulty_sensors_str.lower() not in ['none', 'no', 'n/a', '']:
+            # Try to extract sensor names from the response
+            # Match sensor names (with or without parentheses, with spaces, underscores, etc.)
+            for i, sensor_name in enumerate(sensor_names):
+                # Try multiple variants including common LLM formatting variations
+                sensor_variants = [
+                    sensor_name,  # Full name: "VEHICLE_SPEED ()"
+                    sensor_name.replace(' ()', ''),  # "VEHICLE_SPEED"
+                    sensor_name.replace(' ()', '').replace('_', ' '),  # "VEHICLE SPEED"
+                    sensor_name.replace(' ()', '').replace('_', '_ '),  # "VEHICLE_ SPEED"
+                    sensor_name.split()[0] if ' ' in sensor_name else sensor_name,  # First word
+                    sensor_name.replace('ENGINE_', '').replace(' ()', ''),  # Shortened
+                ]
+                
+                # Also try matching key parts of sensor names
+                key_parts = {
+                    'VEHICLE_SPEED': ['vehicle', 'speed', 'vss'],
+                    'COOLANT_TEMPERATURE': ['coolant', 'temperature'],
+                    'THROTTLE': ['throttle', 'tps'],
+                    'ENGINE_RPM': ['rpm', 'engine rpm'],
+                    'ENGINE_LOAD': ['engine load', 'load'],
+                    'INTAKE_MANIFOLD_PRESSURE': ['intake', 'manifold', 'pressure', 'map', 'maf'],
+                    'SHORT_TERM_FUEL_TRIM': ['short term', 'fuel trim', 'stft'],
+                    'LONG_TERM_FUEL_TRIM': ['long term', 'fuel trim', 'ltft'],
+                }
+                
+                matched = False
+                for variant in sensor_variants:
+                    # Normalize for comparison (remove spaces, underscores, case-insensitive)
+                    variant_clean = variant.replace('_', '').replace(' ', '').lower()
+                    response_clean = faulty_sensors_str.replace('_', '').replace(' ', '').lower()
+                    
+                    if variant_clean in response_clean:
+                        sensor_labels[i] = 1.0
+                        matched = True
+                        break
+                
+                # If not matched by name, try key parts
+                if not matched:
+                    sensor_base = sensor_name.replace(' ()', '').replace('_', ' ')
+                    for key, parts in key_parts.items():
+                        if key in sensor_name:
+                            if any(part in faulty_sensors_str.lower() for part in parts):
+                                sensor_labels[i] = 1.0
+                                break
+    
+    # Extract fault type
+    fault_type_match = re.search(r'Fault Type:\s*(.+?)(?:\n|Reasoning|$)', response, re.IGNORECASE | re.DOTALL)
+    if fault_type_match:
+        fault_type = fault_type_match.group(1).strip()
+        # Clean up common prefixes/suffixes
+        fault_type = fault_type.split(',')[0].split('.')[0].strip()
+    
+    # Extract reasoning
+    reasoning_match = re.search(r'Reasoning:\s*(.+?)$', response, re.IGNORECASE | re.DOTALL)
+    if reasoning_match:
+        reasoning = reasoning_match.group(1).strip()
+    
+    window_label = int(sensor_labels.sum() > 0)
+    
+    return {
+        'window_label': window_label,
+        'sensor_labels': sensor_labels,
+        'fault_type': fault_type,
+        'reasoning': reasoning if reasoning else "No reasoning provided"
+    }
+
+
+def call_llm(
+    prompt: str,
+    model,
+    tokenizer,
+    max_tokens: int = 512,
+    temperature: float = 0.7
+) -> str:
+    """
+    Call LLM with prompt and return response.
+    
+    Args:
+        prompt: Input prompt text
+        model: Loaded MLX model
+        tokenizer: Loaded tokenizer
+        max_tokens: Maximum tokens to generate
+        temperature: Sampling temperature
+        
+    Returns:
+        Generated response text
+    """
+    if model is None or tokenizer is None:
+        raise RuntimeError("Model not loaded. Call load_llm_model() first.")
+    
+    messages = [{"role": "user", "content": prompt}]
+    formatted_prompt = tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True
+    )
+    
+    # Use stream_generate and collect all tokens (matching generate.py example)
+    response_parts = []
+    for response in stream_generate(model, tokenizer, formatted_prompt, max_tokens=max_tokens):
+        response_parts.append(response.text)
+    
+    return ''.join(response_parts)
+
+
+def load_llm_model(model_repo: str = "mlx-community/granite-4.0-h-micro-4bit"):
+    """
+    Load LLM model and tokenizer.
+    
+    Args:
+        model_repo: Model repository identifier
+        
+    Returns:
+        Tuple of (model, tokenizer)
+    """
+    if load is None:
+        raise ImportError("mlx_lm not available. Install with: pip install mlx-lm")
+    
+    print(f"Loading LLM model: {model_repo}")
+    model, tokenizer = load(model_repo)
+    print("✓ Model loaded successfully")
+    return model, tokenizer
+
+
+def evaluate_llm_baseline(
+    dataset_path: Path,
+    output_path: Optional[Path] = None,
+    use_statistical_features: bool = True,
+    model_repo: Optional[str] = None,
+    max_tokens: int = 512,
+    temperature: float = 0.7
+) -> Dict[str, any]:
+    """
+    Evaluate LLM baseline on shared dataset.
+    
+    Args:
+        dataset_path: Path to shared dataset (.npz file)
+        output_path: Optional path to save results JSON
+        use_statistical_features: Whether to include statistical features in prompts
+        model_repo: Model repository identifier (default: granite-4.0-h-micro-4bit)
+        max_tokens: Maximum tokens to generate
+        temperature: Sampling temperature
+        
+    Returns:
+        Dictionary with evaluation results
+    """
+    print("="*80)
+    print("Evaluating LLM Baseline")
+    print("="*80)
+    print(f"Dataset: {dataset_path}")
+    print(f"Use statistical features: {use_statistical_features}")
+    print()
+    
+    # Load LLM model
+    if model_repo is None:
+        model_repo = "mlx-community/granite-4.0-h-micro-4bit"
+    
+    try:
+        model, tokenizer = load_llm_model(model_repo)
+        print()
+    except Exception as e:
+        raise RuntimeError(f"Failed to load LLM model: {e}. Please ensure mlx-lm is installed.")
+    
+    # Load dataset
+    print("Loading dataset...")
+    data = np.load(dataset_path, allow_pickle=True)
+    
+    unnormalized_windows = data['unnormalized_windows']
+    sensor_labels_true = data['sensor_labels']
+    window_labels_true = data['window_labels']
+    
+    # Load metadata
+    metadata_path = dataset_path.parent / f"{dataset_path.stem}_metadata.json"
+    if metadata_path.exists():
+        with open(metadata_path, 'r') as f:
+            metadata = json.load(f)
+        sensor_names = metadata['dataset_info']['sensor_names']
+        statistical_features = np.array(metadata.get('statistical_features', []))
+    else:
+        # Fallback: use default sensor names
+        sensor_names = [
+            'ENGINE_RPM ()', 'VEHICLE_SPEED ()', 'THROTTLE ()', 'ENGINE_LOAD ()',
+            'COOLANT_TEMPERATURE ()', 'INTAKE_MANIFOLD_PRESSURE ()',
+            'SHORT_TERM_FUEL_TRIM_BANK_1 ()', 'LONG_TERM_FUEL_TRIM_BANK_1 ()'
+        ]
+        statistical_features = None
+    
+    num_windows = unnormalized_windows.shape[0]
+    print(f"  Loaded {num_windows} windows")
+    print(f"  Window size: {unnormalized_windows.shape[1]}")
+    print(f"  Sensors: {len(sensor_names)}")
+    print()
+    
+    # Run predictions
+    print("Running LLM predictions...")
+    window_labels_pred = []
+    sensor_labels_pred = []
+    fault_types_pred = []
+    reasoning_list = []
+    processing_times = []
+    context_lengths = []
+    
+    for window_idx in range(num_windows):
+        start_time = time.time()
+        
+        window_data = unnormalized_windows[window_idx]
+        stats = statistical_features[window_idx] if statistical_features is not None and len(statistical_features) > window_idx else None
+        
+        # Format prompt
+        prompt = format_window_for_llm(
+            window_data, sensor_names, stats, use_statistical_features
+        )
+        context_length = len(prompt.split())  # Approximate token count
+        
+        # Call LLM
+        try:
+            response = call_llm(prompt, model, tokenizer, max_tokens=max_tokens, temperature=temperature)
+            prediction = parse_llm_response(response, sensor_names)
+            prediction['reasoning'] = response[:200]  # Store first 200 chars of response
+        except Exception as e:
+            print(f"  Warning: LLM call failed for window {window_idx}: {e}")
+            # Fallback to no-fault prediction
+            prediction = {
+                'window_label': 0,
+                'sensor_labels': np.zeros(len(sensor_names), dtype=np.float32),
+                'fault_type': "unknown",
+                'reasoning': f"Error: {str(e)}"
+            }
+        
+        window_labels_pred.append(prediction['window_label'])
+        sensor_labels_pred.append(prediction['sensor_labels'])
+        fault_types_pred.append(prediction['fault_type'])
+        reasoning_list.append(prediction.get('reasoning', ''))
+        processing_times.append(time.time() - start_time)
+        context_lengths.append(context_length)
+        
+        if (window_idx + 1) % 100 == 0:
+            print(f"  Processed {window_idx + 1}/{num_windows} windows...")
+    
+    window_labels_pred = np.array(window_labels_pred)
+    sensor_labels_pred = np.array(sensor_labels_pred)
+    
+    avg_processing_time = np.mean(processing_times)
+    total_processing_time = np.sum(processing_times)
+    avg_context_length = np.mean(context_lengths) if context_lengths else 0
+    
+    print(f"  Average processing time: {avg_processing_time:.4f} seconds/window")
+    print(f"  Total processing time: {total_processing_time:.2f} seconds")
+    if avg_context_length > 0:
+        print(f"  Average context length: {avg_context_length:.0f} tokens")
+    print()
+    
+    # Compute metrics
+    print("Computing evaluation metrics...")
+    fault_types_true = data.get('fault_types', None)
+    
+    metrics = compute_all_metrics(
+        y_true_window=window_labels_true,
+        y_pred_window=window_labels_pred,
+        y_true_sensor=sensor_labels_true,
+        y_pred_sensor=sensor_labels_pred,
+        sensor_names=sensor_names,
+        fault_types=fault_types_true if fault_types_true is not None else None
+    )
+    
+    # Add efficiency metrics
+    metrics['efficiency'] = {
+        'avg_processing_time_seconds': float(avg_processing_time),
+        'total_processing_time_seconds': float(total_processing_time),
+        'windows_per_second': float(num_windows / total_processing_time),
+        'avg_context_length_tokens': float(avg_context_length),
+        'use_statistical_features': use_statistical_features
+    }
+    
+    # Print report
+    report = format_metrics_report(metrics)
+    print(report)
+    
+    # Save results
+    results = {
+        'method': 'llm_baseline',
+        'dataset': str(dataset_path),
+        'num_windows': int(num_windows),
+        'metrics': metrics,
+        'predictions': {
+            'window_labels': window_labels_pred.tolist(),
+            'sensor_labels': sensor_labels_pred.tolist(),
+            'fault_types': fault_types_pred,
+            'reasoning': reasoning_list[:10] if len(reasoning_list) > 10 else reasoning_list  # Sample reasoning
+        }
+    }
+    
+    if output_path:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"\n✓ Results saved to: {output_path}")
+    
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Evaluate LLM baseline on shared evaluation dataset'
+    )
+    parser.add_argument(
+        '--dataset',
+        type=str,
+        required=True,
+        help='Path to shared dataset .npz file'
+    )
+    parser.add_argument(
+        '--output',
+        type=str,
+        default='results/llm_baseline.json',
+        help='Output path for results JSON'
+    )
+    parser.add_argument(
+        '--use-statistical-features',
+        action='store_true',
+        default=True,
+        help='Include statistical features in LLM prompts'
+    )
+    parser.add_argument(
+        '--model-repo',
+        type=str,
+        default='mlx-community/granite-4.0-h-micro-4bit',
+        help='Model repository identifier for MLX LM'
+    )
+    parser.add_argument(
+        '--max-tokens',
+        type=int,
+        default=512,
+        help='Maximum tokens to generate'
+    )
+    parser.add_argument(
+        '--temperature',
+        type=float,
+        default=0.7,
+        help='Sampling temperature'
+    )
+    
+    args = parser.parse_args()
+    
+    evaluate_llm_baseline(
+        dataset_path=Path(args.dataset),
+        output_path=Path(args.output),
+        use_statistical_features=args.use_statistical_features,
+        model_repo=args.model_repo,
+        max_tokens=args.max_tokens,
+        temperature=args.temperature
+    )
+
+
+if __name__ == '__main__':
+    main()
