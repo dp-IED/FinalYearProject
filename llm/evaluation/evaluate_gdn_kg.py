@@ -28,6 +28,24 @@ from llm.helpers.KG import KnowledgeGraphBuilder
 from metrics import compute_all_metrics, format_metrics_report
 
 
+def sensor_labels_to_window_label(sensor_labels: np.ndarray) -> int:
+    """
+    Convert sensor-level labels to window-level sensor-indexed label.
+    
+    Args:
+        sensor_labels: (num_sensors,) binary array - which sensors are faulty
+        
+    Returns:
+        int: 0 if no fault, 1-8 if fault detected (1-indexed sensor index)
+             Uses the first faulty sensor index (primary sensor)
+    """
+    faulty_indices = np.where(sensor_labels > 0)[0]
+    if len(faulty_indices) == 0:
+        return 0
+    # Return first faulty sensor index + 1 (1-indexed: sensor 0 -> label 1, sensor 7 -> label 8)
+    return int(faulty_indices[0]) + 1
+
+
 def extract_predictions_from_kg(
     kg_builder: KnowledgeGraphBuilder,
     threshold: float = 0.5
@@ -66,9 +84,8 @@ def extract_predictions_from_kg(
                     sensor_labels[window_idx, sensor_idx] = 1.0
                     faulty_sensors_in_window.append(sensor_name)
         
-        # Window is faulty if any sensor is faulty
-        if sensor_labels[window_idx].sum() > 0:
-            window_labels[window_idx] = 1
+        # Convert sensor labels to sensor-indexed window label (0-8)
+        window_labels[window_idx] = sensor_labels_to_window_label(sensor_labels[window_idx])
         
         # Determine fault type from KG relationships
         fault_type = "unknown"
@@ -112,7 +129,8 @@ def evaluate_gdn_kg(
     model_path: Path,
     output_path: Optional[Path] = None,
     batch_size: int = 32,
-    device: str = 'cpu'
+    device: str = 'cpu',
+    limit: Optional[int] = None
 ) -> Dict[str, any]:
     """
     Evaluate GDN->KG method on shared dataset.
@@ -123,6 +141,7 @@ def evaluate_gdn_kg(
         output_path: Optional path to save results JSON
         batch_size: Batch size for GDN inference
         device: Device to run on ('cuda' or 'cpu')
+        limit: Optional limit on number of windows to process (for testing)
         
     Returns:
         Dictionary with evaluation results
@@ -157,6 +176,15 @@ def evaluate_gdn_kg(
         ]
     
     num_windows = normalized_windows.shape[0]
+    
+    # Apply limit if specified
+    if limit is not None and limit > 0:
+        num_windows = min(num_windows, limit)
+        normalized_windows = normalized_windows[:num_windows]
+        sensor_labels_true = sensor_labels_true[:num_windows]
+        window_labels_true = window_labels_true[:num_windows]
+        print(f"  ⚠️  LIMIT MODE: Processing only {num_windows} windows")
+    
     print(f"  Loaded {num_windows} windows")
     print(f"  Window size: {normalized_windows.shape[1]}")
     print(f"  Sensors: {len(sensor_names)}")
@@ -333,6 +361,12 @@ def main():
         default='cpu',
         help='Device to run on'
     )
+    parser.add_argument(
+        '--limit',
+        type=int,
+        default=None,
+        help='Limit number of windows to process (for testing)'
+    )
     
     args = parser.parse_args()
     
@@ -341,7 +375,8 @@ def main():
         model_path=Path(args.model_path),
         output_path=Path(args.output),
         batch_size=args.batch_size,
-        device=args.device
+        device=args.device,
+        limit=args.limit
     )
 
 

@@ -28,6 +28,24 @@ except ImportError:
 from metrics import compute_all_metrics, format_metrics_report
 
 
+def sensor_labels_to_window_label(sensor_labels: np.ndarray) -> int:
+    """
+    Convert sensor-level labels to window-level sensor-indexed label.
+    
+    Args:
+        sensor_labels: (num_sensors,) binary array - which sensors are faulty
+        
+    Returns:
+        int: 0 if no fault, 1-8 if fault detected (1-indexed sensor index)
+             Uses the first faulty sensor index (primary sensor)
+    """
+    faulty_indices = np.where(sensor_labels > 0)[0]
+    if len(faulty_indices) == 0:
+        return 0
+    # Return first faulty sensor index + 1 (1-indexed: sensor 0 -> label 1, sensor 7 -> label 8)
+    return int(faulty_indices[0]) + 1
+
+
 def format_window_for_llm(
     window_data: np.ndarray,
     sensor_names: List[str],
@@ -207,7 +225,8 @@ def parse_llm_response(response: str, sensor_names: List[str]) -> Dict[str, any]
     if reasoning_match:
         reasoning = reasoning_match.group(1).strip()
     
-    window_label = int(sensor_labels.sum() > 0)
+    # Convert sensor labels to sensor-indexed window label (0-8)
+    window_label = sensor_labels_to_window_label(sensor_labels)
     
     return {
         'window_label': window_label,
@@ -301,7 +320,8 @@ def evaluate_llm_baseline(
     use_statistical_features: bool = True,
     model_repo: Optional[str] = None,
     max_tokens: int = 512,
-    temperature: float = 0.7
+    temperature: float = 0.7,
+    limit: Optional[int] = None
 ) -> Dict[str, any]:
     """
     Evaluate LLM baseline on shared dataset.
@@ -313,6 +333,7 @@ def evaluate_llm_baseline(
         model_repo: Model repository identifier (default: granite-4.0-h-micro-4bit)
         max_tokens: Maximum tokens to generate
         temperature: Sampling temperature
+        limit: Optional limit on number of windows to process (for testing)
         
     Returns:
         Dictionary with evaluation results
@@ -359,6 +380,17 @@ def evaluate_llm_baseline(
         statistical_features = None
     
     num_windows = unnormalized_windows.shape[0]
+    
+    # Apply limit if specified
+    if limit is not None and limit > 0:
+        num_windows = min(num_windows, limit)
+        unnormalized_windows = unnormalized_windows[:num_windows]
+        sensor_labels_true = sensor_labels_true[:num_windows]
+        window_labels_true = window_labels_true[:num_windows]
+        if statistical_features is not None:
+            statistical_features = statistical_features[:num_windows]
+        print(f"  ⚠️  LIMIT MODE: Processing only {num_windows} windows")
+    
     print(f"  Loaded {num_windows} windows")
     print(f"  Window size: {unnormalized_windows.shape[1]}")
     print(f"  Sensors: {len(sensor_names)}")
@@ -516,6 +548,12 @@ def main():
         default=0.7,
         help='Sampling temperature'
     )
+    parser.add_argument(
+        '--limit',
+        type=int,
+        default=None,
+        help='Limit number of windows to process (for testing)'
+    )
     
     args = parser.parse_args()
     
@@ -525,7 +563,8 @@ def main():
         use_statistical_features=args.use_statistical_features,
         model_repo=args.model_repo,
         max_tokens=args.max_tokens,
-        temperature=args.temperature
+        temperature=args.temperature,
+        limit=args.limit
     )
 
 

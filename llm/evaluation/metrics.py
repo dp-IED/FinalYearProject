@@ -18,32 +18,86 @@ from sklearn.metrics import (
 
 def compute_window_level_metrics(
     y_true: np.ndarray,
-    y_pred: np.ndarray
+    y_pred: np.ndarray,
+    sensor_names: Optional[List[str]] = None
 ) -> Dict[str, float]:
     """
-    Compute window-level metrics (binary classification).
+    Compute window-level metrics (multi-class classification: 0-8).
+    
+    Window labels are sensor-indexed:
+    - 0 = no fault
+    - 1-8 = anomalous sensor index (1-indexed: sensor 0 -> label 1, sensor 7 -> label 8)
     
     Args:
-        y_true: (N,) binary array - true window labels
-        y_pred: (N,) binary array - predicted window labels
+        y_true: (N,) array - true window labels (0-8)
+        y_pred: (N,) array - predicted window labels (0-8)
+        sensor_names: Optional list of sensor names for per-class metrics
         
     Returns:
-        Dictionary with accuracy, precision, recall, F1
+        Dictionary with accuracy, precision, recall, F1 (weighted and macro),
+        and optionally per-class metrics
     """
     y_true = y_true.astype(int)
     y_pred = y_pred.astype(int)
     
+    # Overall accuracy
     accuracy = accuracy_score(y_true, y_pred)
-    precision = precision_score(y_true, y_pred, zero_division=0)
-    recall = recall_score(y_true, y_pred, zero_division=0)
-    f1 = f1_score(y_true, y_pred, zero_division=0)
     
-    return {
+    # Weighted metrics (accounts for class imbalance)
+    precision_weighted = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+    recall_weighted = recall_score(y_true, y_pred, average='weighted', zero_division=0)
+    f1_weighted = f1_score(y_true, y_pred, average='weighted', zero_division=0)
+    
+    # Macro metrics (unweighted average across classes)
+    precision_macro = precision_score(y_true, y_pred, average='macro', zero_division=0)
+    recall_macro = recall_score(y_true, y_pred, average='macro', zero_division=0)
+    f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
+    
+    metrics = {
         'window_accuracy': float(accuracy),
-        'window_precision': float(precision),
-        'window_recall': float(recall),
-        'window_f1': float(f1)
+        'window_precision_weighted': float(precision_weighted),
+        'window_recall_weighted': float(recall_weighted),
+        'window_f1_weighted': float(f1_weighted),
+        'window_precision_macro': float(precision_macro),
+        'window_recall_macro': float(recall_macro),
+        'window_f1_macro': float(f1_macro),
+        # Keep backward compatibility aliases (using weighted as default)
+        'window_precision': float(precision_weighted),
+        'window_recall': float(recall_weighted),
+        'window_f1': float(f1_weighted)
     }
+    
+    # Per-class metrics (for each sensor class 0-8)
+    if sensor_names is not None:
+        num_classes = len(sensor_names) + 1  # 0 (no fault) + sensors
+        per_class_metrics = {}
+        
+        # Class 0: No fault
+        class_0_mask_true = (y_true == 0)
+        class_0_mask_pred = (y_pred == 0)
+        per_class_metrics['no_fault'] = {
+            'precision': float(precision_score(class_0_mask_true, class_0_mask_pred, zero_division=0)),
+            'recall': float(recall_score(class_0_mask_true, class_0_mask_pred, zero_division=0)),
+            'f1': float(f1_score(class_0_mask_true, class_0_mask_pred, zero_division=0)),
+            'support': int(class_0_mask_true.sum())
+        }
+        
+        # Classes 1-8: Each sensor
+        for sensor_idx in range(len(sensor_names)):
+            class_label = sensor_idx + 1  # 1-indexed
+            class_mask_true = (y_true == class_label)
+            class_mask_pred = (y_pred == class_label)
+            
+            per_class_metrics[sensor_names[sensor_idx]] = {
+                'precision': float(precision_score(class_mask_true, class_mask_pred, zero_division=0)),
+                'recall': float(recall_score(class_mask_true, class_mask_pred, zero_division=0)),
+                'f1': float(f1_score(class_mask_true, class_mask_pred, zero_division=0)),
+                'support': int(class_mask_true.sum())
+            }
+        
+        metrics['per_class'] = per_class_metrics
+    
+    return metrics
 
 
 def compute_sensor_level_metrics(
@@ -159,32 +213,43 @@ def compute_per_fault_type_metrics(
 
 
 def compute_confusion_matrices(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
+    y_true_sensor: np.ndarray,
+    y_pred_sensor: np.ndarray,
+    y_true_window: Optional[np.ndarray] = None,
+    y_pred_window: Optional[np.ndarray] = None,
     sensor_names: Optional[List[str]] = None
 ) -> Dict[str, np.ndarray]:
     """
     Compute confusion matrices for window-level and sensor-level predictions.
     
     Args:
-        y_true: (N, num_sensors) binary array - true sensor labels
-        y_pred: (N, num_sensors) binary array - predicted sensor labels
+        y_true_sensor: (N, num_sensors) binary array - true sensor labels
+        y_pred_sensor: (N, num_sensors) binary array - predicted sensor labels
+        y_true_window: (N,) array - true window labels (0-8, sensor-indexed)
+        y_pred_window: (N,) array - predicted window labels (0-8, sensor-indexed)
         sensor_names: Optional list of sensor names
         
     Returns:
         Dictionary with confusion matrices
     """
-    y_true = y_true.astype(int)
-    y_pred = y_pred.astype(int)
+    y_true_sensor = y_true_sensor.astype(int)
+    y_pred_sensor = y_pred_sensor.astype(int)
     
-    # Window-level confusion matrix
-    window_true = (y_true.sum(axis=1) > 0).astype(int)
-    window_pred = (y_pred.sum(axis=1) > 0).astype(int)
-    window_cm = confusion_matrix(window_true, window_pred)
+    # Window-level confusion matrix (multi-class: 0-8)
+    if y_true_window is not None and y_pred_window is not None:
+        y_true_window = y_true_window.astype(int)
+        y_pred_window = y_pred_window.astype(int)
+        # Multi-class confusion matrix (9 classes: 0-8)
+        window_cm = confusion_matrix(y_true_window, y_pred_window, labels=list(range(9)))
+    else:
+        # Fallback: binary window-level (for backward compatibility)
+        window_true = (y_true_sensor.sum(axis=1) > 0).astype(int)
+        window_pred = (y_pred_sensor.sum(axis=1) > 0).astype(int)
+        window_cm = confusion_matrix(window_true, window_pred)
     
     # Sensor-level confusion matrix (flattened)
-    sensor_true_flat = y_true.flatten()
-    sensor_pred_flat = y_pred.flatten()
+    sensor_true_flat = y_true_sensor.flatten()
+    sensor_pred_flat = y_pred_sensor.flatten()
     sensor_cm = confusion_matrix(sensor_true_flat, sensor_pred_flat)
     
     matrices = {
@@ -196,9 +261,9 @@ def compute_confusion_matrices(
     if sensor_names:
         per_sensor_cm = {}
         for i, sensor_name in enumerate(sensor_names):
-            if i < y_true.shape[1]:
-                sensor_true = y_true[:, i]
-                sensor_pred = y_pred[:, i]
+            if i < y_true_sensor.shape[1]:
+                sensor_true = y_true_sensor[:, i]
+                sensor_pred = y_pred_sensor[:, i]
                 per_sensor_cm[sensor_name] = confusion_matrix(sensor_true, sensor_pred).tolist()
         
         matrices['per_sensor_confusion_matrices'] = per_sensor_cm
@@ -230,8 +295,10 @@ def compute_all_metrics(
     """
     metrics = {}
     
-    # Window-level metrics
-    metrics['window_level'] = compute_window_level_metrics(y_true_window, y_pred_window)
+    # Window-level metrics (multi-class: 0-8)
+    metrics['window_level'] = compute_window_level_metrics(
+        y_true_window, y_pred_window, sensor_names
+    )
     
     # Sensor-level metrics
     metrics['sensor_level'] = compute_sensor_level_metrics(
@@ -240,7 +307,7 @@ def compute_all_metrics(
     
     # Confusion matrices
     metrics['confusion_matrices'] = compute_confusion_matrices(
-        y_true_sensor, y_pred_sensor, sensor_names
+        y_true_sensor, y_pred_sensor, y_true_window, y_pred_window, sensor_names
     )
     
     # Per-fault-type metrics
@@ -270,13 +337,27 @@ def format_metrics_report(metrics: Dict[str, any]) -> str:
     
     # Window-level metrics
     if 'window_level' in metrics:
-        lines.append("Window-Level Metrics:")
+        lines.append("Window-Level Metrics (Sensor-Indexed: 0-8):")
         lines.append("-" * 40)
         wl = metrics['window_level']
         lines.append(f"  Accuracy:  {wl['window_accuracy']:.4f}")
-        lines.append(f"  Precision: {wl['window_precision']:.4f}")
-        lines.append(f"  Recall:    {wl['window_recall']:.4f}")
-        lines.append(f"  F1 Score:  {wl['window_f1']:.4f}")
+        lines.append(f"  Precision (weighted): {wl['window_precision_weighted']:.4f}")
+        lines.append(f"  Recall (weighted):    {wl['window_recall_weighted']:.4f}")
+        lines.append(f"  F1 Score (weighted):  {wl['window_f1_weighted']:.4f}")
+        lines.append(f"  Precision (macro): {wl['window_precision_macro']:.4f}")
+        lines.append(f"  Recall (macro):    {wl['window_recall_macro']:.4f}")
+        lines.append(f"  F1 Score (macro):  {wl['window_f1_macro']:.4f}")
+        
+        # Per-class metrics if available
+        if 'per_class' in wl:
+            lines.append("\n  Per-Class Metrics:")
+            for class_name, class_metrics in wl['per_class'].items():
+                if class_metrics['support'] > 0:  # Only show classes with support
+                    lines.append(f"    {class_name}:")
+                    lines.append(f"      Precision: {class_metrics['precision']:.4f}")
+                    lines.append(f"      Recall:    {class_metrics['recall']:.4f}")
+                    lines.append(f"      F1:        {class_metrics['f1']:.4f}")
+                    lines.append(f"      Support:   {class_metrics['support']}")
         lines.append("")
     
     # Sensor-level metrics

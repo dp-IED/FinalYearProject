@@ -38,6 +38,24 @@ from llm.evaluation.evaluate_llm_baseline import (
 from metrics import compute_all_metrics, format_metrics_report
 
 
+def sensor_labels_to_window_label(sensor_labels: np.ndarray) -> int:
+    """
+    Convert sensor-level labels to window-level sensor-indexed label.
+    
+    Args:
+        sensor_labels: (num_sensors,) binary array - which sensors are faulty
+        
+    Returns:
+        int: 0 if no fault, 1-8 if fault detected (1-indexed sensor index)
+             Uses the first faulty sensor index (primary sensor)
+    """
+    faulty_indices = np.where(sensor_labels > 0)[0]
+    if len(faulty_indices) == 0:
+        return 0
+    # Return first faulty sensor index + 1 (1-indexed: sensor 0 -> label 1, sensor 7 -> label 8)
+    return int(faulty_indices[0]) + 1
+
+
 def extract_window_kg_context(
     kg_builder: KnowledgeGraphBuilder,
     window_idx: int,
@@ -256,7 +274,7 @@ def format_kg_context_for_llm(
             affected = prop.get('affected_sensors', [])
             
             if prop_type == 'root':
-                lines.append(f"Root cause detected:")
+                lines.append("Root cause detected:")
                 lines.append(f"  Root sensor: {root_sensor} at window {root_window}")
                 if affected:
                     lines.append(f"  Affected sensors: {', '.join(affected)}")
@@ -334,7 +352,8 @@ def evaluate_gdn_kg_llm(
     model_repo: Optional[str] = None,
     max_tokens: int = 2048,  # Increased for KG-enhanced prompts
     temperature: float = 0.7,
-    use_statistical_features: bool = True
+    use_statistical_features: bool = True,
+    limit: Optional[int] = None
 ) -> Dict[str, any]:
     """
     Evaluate GDN->KG->LLM method on shared dataset.
@@ -349,6 +368,7 @@ def evaluate_gdn_kg_llm(
         max_tokens: Maximum tokens for LLM generation
         temperature: LLM sampling temperature
         use_statistical_features: Whether to include statistical features in prompts
+        limit: Optional limit on number of windows to process (for testing)
         
     Returns:
         Dictionary with evaluation results
@@ -395,6 +415,18 @@ def evaluate_gdn_kg_llm(
         statistical_features = None
     
     num_windows = normalized_windows.shape[0]
+    
+    # Apply limit if specified
+    if limit is not None and limit > 0:
+        num_windows = min(num_windows, limit)
+        normalized_windows = normalized_windows[:num_windows]
+        unnormalized_windows = unnormalized_windows[:num_windows]
+        sensor_labels_true = sensor_labels_true[:num_windows]
+        window_labels_true = window_labels_true[:num_windows]
+        if statistical_features is not None:
+            statistical_features = statistical_features[:num_windows]
+        print(f"  ⚠️  LIMIT MODE: Processing only {num_windows} windows")
+    
     print(f"  Loaded {num_windows} windows")
     print(f"  Window size: {normalized_windows.shape[1]}")
     print(f"  Sensors: {len(sensor_names)}")
@@ -508,9 +540,9 @@ def evaluate_gdn_kg_llm(
                 prediction = parse_llm_response(response, sensor_names)
                 prediction['reasoning'] = response[:200]  # Store first 200 chars
             except Exception as e:
-                # Fallback to no-fault prediction
+                # Fallback to no-fault prediction (window_label = 0)
                 prediction = {
-                    'window_label': 0,
+                    'window_label': 0,  # 0 = no fault
                     'sensor_labels': np.zeros(len(sensor_names), dtype=np.float32),
                     'fault_type': "unknown",
                     'reasoning': f"Error: {str(e)}"
@@ -651,6 +683,12 @@ def main():
         action='store_true',
         help='Disable statistical features in prompts'
     )
+    parser.add_argument(
+        '--limit',
+        type=int,
+        default=None,
+        help='Limit number of windows to process (for testing)'
+    )
     
     args = parser.parse_args()
     
@@ -663,7 +701,8 @@ def main():
         model_repo=args.model_repo,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
-        use_statistical_features=not args.no_statistical_features
+        use_statistical_features=not args.no_statistical_features,
+        limit=args.limit
     )
 
 
