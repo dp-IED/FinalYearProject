@@ -2,13 +2,35 @@
 Create shared evaluation dataset for comparing LLM-only vs GDN->KG methods.
 
 This script:
-1. Loads raw OBD data
-2. Preprocesses using the same pipeline as GDN training
-3. Creates normalized windows (for GDN->KG) and unnormalized windows (for LLM)
-4. Optionally injects faults for evaluation
-5. Saves standardized dataset
+1. Loads raw OBD data from CSV files
+2. Preprocesses using the SAME pipeline as GDN training (gdn.ipynb)
+3. Creates BOTH normalized windows (for GDN->KG) and unnormalized windows (for LLM)
+4. Optionally injects faults with sensor-level ground truth labels
+5. Computes statistical features for each window
+6. Saves standardized dataset for evaluation
 
-Both methods evaluate on the same windows with the same ground truth.
+IMPORTANT: Both methods evaluate on IDENTICAL windows with the SAME ground truth,
+ensuring fair comparison.
+
+Usage:
+    python llm/evaluation/create_shared_dataset.py \
+        --raw-data-path data/carOBD/obdiidata \
+        --output-dir llm/evaluation/shared_dataset \
+        --split test \
+        --fault-percentage 0.3 \
+        --max-windows 1000
+
+Output files:
+    - {split}.npz: Dataset arrays (normalized/unnormalized windows, labels, etc.)
+    - {split}_metadata.json: Dataset info, sensor names, window counts
+
+Dataset structure (all in one .npz file):
+    - normalized_windows: (N, 300, 8) - normalized [0,1] for GDN
+    - unnormalized_windows: (N, 300, 8) - real sensor values for LLM
+    - sensor_labels: (N, 8) - ground truth faulty sensors (binary)
+    - window_labels: (N,) - ground truth faulty windows (binary)
+    - fault_types: (N,) - fault type strings (VSS_DROPOUT, etc.)
+    - statistical_features: (N, 8, 9) - statistical features per sensor
 """
 
 import numpy as np
