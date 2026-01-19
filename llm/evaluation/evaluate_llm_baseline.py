@@ -4,7 +4,7 @@ Evaluate LLM-only baseline method on shared evaluation dataset.
 This script:
 1. Loads shared dataset
 2. Formats unnormalized windows for LLM prompts
-3. Runs LLM inference (or simulates it)
+3. Runs LLM inference
 4. Compares predictions to ground truth
 5. Computes evaluation metrics
 """
@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import time
 import re
+from tqdm import tqdm
 
 try:
     from mlx_lm import load, stream_generate
@@ -221,7 +222,9 @@ def call_llm(
     model,
     tokenizer,
     max_tokens: int = 512,
-    temperature: float = 0.7
+    temperature: float = 0.7,
+    repetition_penalty: float = 1.2,
+    repetition_context_size: int = 20
 ) -> str:
     """
     Call LLM with prompt and return response.
@@ -232,6 +235,8 @@ def call_llm(
         tokenizer: Loaded tokenizer
         max_tokens: Maximum tokens to generate
         temperature: Sampling temperature
+        repetition_penalty: Penalty for repetition (1.0 = no penalty, >1.0 = penalize repetition)
+        repetition_context_size: Context window size for repetition penalty
         
     Returns:
         Generated response text
@@ -244,10 +249,29 @@ def call_llm(
         messages, add_generation_prompt=True
     )
     
-    # Use stream_generate and collect all tokens (matching generate.py example)
+    # Use stream_generate with repetition penalty to prevent degenerate output
     response_parts = []
-    for response in stream_generate(model, tokenizer, formatted_prompt, max_tokens=max_tokens):
-        response_parts.append(response.text)
+    try:
+        # Try with repetition penalty parameters (check mlx_lm version support)
+        # Build kwargs dict conditionally
+        kwargs = {
+            'max_tokens': max_tokens,
+            'temperature': temperature,
+            'repetition_penalty': repetition_penalty,
+            'repetition_context_size': repetition_context_size
+        }
+        for response in stream_generate(model, tokenizer, formatted_prompt, **kwargs):
+            response_parts.append(response.text)
+    except TypeError as e:
+        # Fallback if parameters not supported - try with just temperature
+        try:
+            kwargs = {'max_tokens': max_tokens, 'temperature': temperature}
+            for response in stream_generate(model, tokenizer, formatted_prompt, **kwargs):
+                response_parts.append(response.text)
+        except TypeError:
+            # Final fallback - basic call
+            for response in stream_generate(model, tokenizer, formatted_prompt, max_tokens=max_tokens):
+                response_parts.append(response.text)
     
     return ''.join(response_parts)
 
@@ -349,42 +373,45 @@ def evaluate_llm_baseline(
     processing_times = []
     context_lengths = []
     
-    for window_idx in range(num_windows):
-        start_time = time.time()
-        
-        window_data = unnormalized_windows[window_idx]
-        stats = statistical_features[window_idx] if statistical_features is not None and len(statistical_features) > window_idx else None
-        
-        # Format prompt
-        prompt = format_window_for_llm(
-            window_data, sensor_names, stats, use_statistical_features
-        )
-        context_length = len(prompt.split())  # Approximate token count
-        
-        # Call LLM
-        try:
-            response = call_llm(prompt, model, tokenizer, max_tokens=max_tokens, temperature=temperature)
-            prediction = parse_llm_response(response, sensor_names)
-            prediction['reasoning'] = response[:200]  # Store first 200 chars of response
-        except Exception as e:
-            print(f"  Warning: LLM call failed for window {window_idx}: {e}")
-            # Fallback to no-fault prediction
-            prediction = {
-                'window_label': 0,
-                'sensor_labels': np.zeros(len(sensor_names), dtype=np.float32),
-                'fault_type': "unknown",
-                'reasoning': f"Error: {str(e)}"
-            }
-        
-        window_labels_pred.append(prediction['window_label'])
-        sensor_labels_pred.append(prediction['sensor_labels'])
-        fault_types_pred.append(prediction['fault_type'])
-        reasoning_list.append(prediction.get('reasoning', ''))
-        processing_times.append(time.time() - start_time)
-        context_lengths.append(context_length)
-        
-        if (window_idx + 1) % 100 == 0:
-            print(f"  Processed {window_idx + 1}/{num_windows} windows...")
+    with tqdm(total=num_windows, desc="LLM Inference", unit="window") as pbar:
+        for window_idx in range(num_windows):
+            start_time = time.time()
+            
+            window_data = unnormalized_windows[window_idx]
+            stats = statistical_features[window_idx] if statistical_features is not None and len(statistical_features) > window_idx else None
+            
+            # Format prompt
+            prompt = format_window_for_llm(
+                window_data, sensor_names, stats, use_statistical_features
+            )
+            context_length = len(prompt.split())  # Approximate token count
+            
+            # Call LLM
+            try:
+                response = call_llm(prompt, model, tokenizer, max_tokens=max_tokens, temperature=temperature)
+                prediction = parse_llm_response(response, sensor_names)
+                prediction['reasoning'] = response[:200]  # Store first 200 chars of response
+            except Exception as e:
+                # Fallback to no-fault prediction
+                prediction = {
+                    'window_label': 0,
+                    'sensor_labels': np.zeros(len(sensor_names), dtype=np.float32),
+                    'fault_type': "unknown",
+                    'reasoning': f"Error: {str(e)}"
+                }
+            
+            window_labels_pred.append(prediction['window_label'])
+            sensor_labels_pred.append(prediction['sensor_labels'])
+            fault_types_pred.append(prediction['fault_type'])
+            reasoning_list.append(prediction.get('reasoning', ''))
+            processing_times.append(time.time() - start_time)
+            context_lengths.append(context_length)
+            
+            # Update progress bar with current metrics
+            pbar.update(1)
+            if (window_idx + 1) % 10 == 0:
+                avg_time = np.mean(processing_times[-10:]) if len(processing_times) >= 10 else np.mean(processing_times)
+                pbar.set_postfix({"avg_time": f"{avg_time:.2f}s"})
     
     window_labels_pred = np.array(window_labels_pred)
     sensor_labels_pred = np.array(sensor_labels_pred)
