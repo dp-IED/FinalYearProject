@@ -305,6 +305,12 @@ class WindowStats:
     std: float
     min: float
     max: float
+    variance: float
+    num_zeros: int  # Count of zero readings (important for dropout detection)
+    trend: float  # Linear regression slope
+    median: float
+    q25: float  # 25th percentile
+    q75: float  # 75th percentile
     variation_from_normal: float  # Deviation from expected normal range
     anomaly_score: float = 0.0
 
@@ -359,6 +365,10 @@ class KnowledgeGraphBuilder:
         self.temporal_edges = []  # Temporal edges between windows
         self.anomaly_propagation_chains = []  # Fault propagation chains
         
+        # Store raw window data for Layer 3 (time-series access)
+        self.X_windows = None  # Normalized windows (N, 300, 8)
+        self.X_windows_unnormalized = None  # Unnormalized windows (N, 300, 8)
+        
         # Initialize sensor nodes in KG
         self._initialize_sensor_nodes()
         
@@ -379,19 +389,25 @@ class KnowledgeGraphBuilder:
             )
     
     def build_from_gdn_windows(self, X_windows: np.ndarray, sensor_labels: np.ndarray,
-                                window_labels: np.ndarray) -> nx.MultiDiGraph:
+                                window_labels: np.ndarray,
+                                X_windows_unnormalized: Optional[np.ndarray] = None) -> nx.MultiDiGraph:
         """
         Main entry point: Build KG by traversing windows temporally.
         
         Args:
-            X_windows: (num_windows, 300, 8) array - sensor data windows
+            X_windows: (num_windows, 300, 8) array - normalized sensor data windows
             sensor_labels: (num_windows, 8) array - binary fault labels per sensor
             window_labels: (num_windows,) array - window-level fault labels
+            X_windows_unnormalized: (num_windows, 300, 8) array - unnormalized sensor data windows (optional)
             
         Returns:
             Knowledge graph with temporal traversal
         """
         num_windows = len(X_windows)
+        
+        # Store window data for Layer 3 (time-series access)
+        self.X_windows = X_windows
+        self.X_windows_unnormalized = X_windows_unnormalized
         
         # Traverse windows sequentially
         for window_idx in range(num_windows):
@@ -427,11 +443,35 @@ class KnowledgeGraphBuilder:
         for sensor_idx, sensor_name in enumerate(self.sensor_names):
             sensor_values = window_data[:, sensor_idx]
             
+            # Compute all statistical properties
+            mean_val = float(np.mean(sensor_values))
+            std_val = float(np.std(sensor_values))
+            variance_val = float(np.var(sensor_values))
+            num_zeros_val = int(np.sum(sensor_values == 0))
+            
+            # Compute trend (linear regression slope)
+            timesteps = np.arange(len(sensor_values))
+            if len(sensor_values) > 1 and np.var(timesteps) > 0:
+                trend_val = float(np.polyfit(timesteps, sensor_values, 1)[0])
+            else:
+                trend_val = 0.0
+            
+            # Compute quartiles
+            median_val = float(np.median(sensor_values))
+            q25_val = float(np.percentile(sensor_values, 25))
+            q75_val = float(np.percentile(sensor_values, 75))
+            
             stats = WindowStats(
-                mean=float(np.mean(sensor_values)),
-                std=float(np.std(sensor_values)),
+                mean=mean_val,
+                std=std_val,
                 min=float(np.min(sensor_values)),
                 max=float(np.max(sensor_values)),
+                variance=variance_val,
+                num_zeros=num_zeros_val,
+                trend=trend_val,
+                median=median_val,
+                q25=q25_val,
+                q75=q75_val,
                 variation_from_normal=self._compute_variation_from_normal(
                     sensor_name, sensor_values
                 ),
@@ -514,11 +554,14 @@ class KnowledgeGraphBuilder:
                        EXPECTED_CORRELATIONS.get((sensor_j, sensor_i))
         
         # Threshold for considering correlation significant
-        corr_threshold = 0.3
+        # Based on correlation analysis: captures moderate-to-strong correlations (|r| >= 0.2)
+        # while filtering out weak/noise correlations
+        corr_threshold = 0.2  # Moderate correlation threshold
         deviation_threshold = 0.2
         
-        # Check if correlation is significant
-        if abs(window_corr) < corr_threshold:
+        # Check if correlation is significant (now includes all correlations above threshold)
+        # Filter out NaN, invalid correlations, and correlations that are essentially zero
+        if abs(window_corr) < corr_threshold or np.isnan(window_corr):
             return None, {}
         
         edge_attrs = {}
@@ -675,19 +718,21 @@ class KnowledgeGraphBuilder:
         - Identify root cause sensors
         - Track which sensors become affected in subsequent windows
         - Build fault propagation chains
+        
+        Only tracks sensors that become faulty for the FIRST TIME after the root sensor.
         """
         num_windows = len(sensor_labels)
         
-        # Find first occurrence of each faulty sensor
-        first_occurrence = {}
+        # Find first occurrence of EACH faulty sensor (for all sensors, not just roots)
+        first_occurrence_all = {}
         for window_idx in range(num_windows):
             for sensor_idx, sensor_name in enumerate(self.sensor_names):
                 if sensor_labels[window_idx, sensor_idx] > 0:
-                    if sensor_name not in first_occurrence:
-                        first_occurrence[sensor_name] = window_idx
+                    if sensor_name not in first_occurrence_all:
+                        first_occurrence_all[sensor_name] = window_idx
         
-        # Build propagation chains
-        for root_sensor, root_window in first_occurrence.items():
+        # Build propagation chains - only for sensors that become faulty FIRST TIME after root
+        for root_sensor, root_window in first_occurrence_all.items():
             chain = {
                 'root_sensor': root_sensor,
                 'root_window': root_window,
@@ -695,20 +740,31 @@ class KnowledgeGraphBuilder:
                 'propagation_timeline': []
             }
             
-            # Track which sensors become faulty after root sensor
-            for window_idx in range(root_window, num_windows):
-                affected_in_window = []
+            # Track sensors that become faulty for FIRST TIME after root sensor
+            # Only include sensors whose first occurrence is AFTER root_window
+            affected_first_occurrence = {}  # sensor_name -> first_window_after_root
+            
+            for window_idx in range(root_window + 1, num_windows):  # Start from root_window + 1
                 for sensor_idx, sensor_name in enumerate(self.sensor_names):
                     if sensor_labels[window_idx, sensor_idx] > 0:
-                        affected_in_window.append(sensor_name)
-                
-                if affected_in_window:
-                    chain['propagation_timeline'].append({
-                        'window': window_idx,
-                        'affected_sensors': affected_in_window
-                    })
+                        # Only track if this sensor's FIRST occurrence is after root_window
+                        if sensor_name in first_occurrence_all:
+                            sensor_first_window = first_occurrence_all[sensor_name]
+                            
+                            # Only include if:
+                            # 1. Sensor's first occurrence is AFTER root window
+                            # 2. We haven't tracked it yet (first time we see it after root)
+                            if sensor_first_window > root_window and sensor_name not in affected_first_occurrence:
+                                affected_first_occurrence[sensor_name] = sensor_first_window
+                                chain['propagation_timeline'].append({
+                                    'window': sensor_first_window,
+                                    'affected_sensors': [sensor_name]
+                                })
             
+            # Only add chain if there are affected sensors
             if chain['propagation_timeline']:
+                # Sort timeline by window
+                chain['propagation_timeline'].sort(key=lambda x: x['window'])
                 self.anomaly_propagation_chains.append(chain)
     
     def query_temporal_relationships(self, sensor1: str, sensor2: str,
