@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import time
 import sys
+from tqdm import tqdm
 
 # Add paths for imports
 project_root = Path(__file__).parent.parent.parent
@@ -194,12 +195,14 @@ def evaluate_gdn_kg(
     print("Processing data through GDN...")
     start_time = time.time()
     
-    kg_data = predictor.process_for_kg(
-        X_windows=normalized_windows,
-        sensor_labels=sensor_labels_true,  # Use ground truth for KG construction
-        window_labels=window_labels_true,
-        batch_size=batch_size
-    )
+    with tqdm(total=1, desc="GDN Data Processing", unit="step") as pbar:
+        kg_data = predictor.process_for_kg(
+            X_windows=normalized_windows,
+            sensor_labels=sensor_labels_true,  # Use ground truth for KG construction
+            window_labels=window_labels_true,
+            batch_size=batch_size
+        )
+        pbar.update(1)
     
     gdn_time = time.time() - start_time
     print(f"  GDN processing completed in {gdn_time:.2f} seconds")
@@ -209,17 +212,20 @@ def evaluate_gdn_kg(
     print("Building Knowledge Graph...")
     start_time = time.time()
     
-    kg_builder = KnowledgeGraphBuilder(
-        sensor_names=kg_data['sensor_names'],
-        sensor_embeddings=kg_data['sensor_embeddings'],
-        adjacency_matrix=kg_data['adjacency_matrix']
-    )
-    
-    kg = kg_builder.build_from_gdn_windows(
-        X_windows=kg_data['X_windows'],
-        sensor_labels=kg_data['sensor_labels'],
-        window_labels=kg_data['window_labels']
-    )
+    with tqdm(total=1, desc="KG Construction", unit="step") as pbar:
+        kg_builder = KnowledgeGraphBuilder(
+            sensor_names=kg_data['sensor_names'],
+            sensor_embeddings=kg_data['sensor_embeddings'],
+            adjacency_matrix=kg_data['adjacency_matrix']
+        )
+        pbar.update(0.5)
+        
+        kg = kg_builder.build_from_gdn_windows(
+            X_windows=kg_data['X_windows'],
+            sensor_labels=kg_data['sensor_labels'],
+            window_labels=kg_data['window_labels']
+        )
+        pbar.update(0.5)
     
     kg_time = time.time() - start_time
     print(f"  Knowledge Graph built in {kg_time:.2f} seconds")
@@ -230,7 +236,9 @@ def evaluate_gdn_kg(
     print("Extracting predictions from Knowledge Graph...")
     start_time = time.time()
     
-    predictions = extract_predictions_from_kg(kg_builder, threshold=0.5)
+    with tqdm(total=1, desc="Prediction Extraction", unit="step") as pbar:
+        predictions = extract_predictions_from_kg(kg_builder, threshold=0.5)
+        pbar.update(1)
     
     extraction_time = time.time() - start_time
     print(f"  Predictions extracted in {extraction_time:.2f} seconds")
