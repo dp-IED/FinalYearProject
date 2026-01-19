@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 from typing import List, Dict, Optional, Tuple, Union
 from pathlib import Path
+from tqdm import tqdm
 
 try:
     # Try relative import first (when used as a module)
@@ -200,16 +201,21 @@ class GDNPredictor:
         
         self.model.eval()
         with torch.no_grad():
-            for i in range(0, num_windows, batch_size):
-                batch = X_windows[i:i + batch_size]
-                
-                if return_global:
-                    sensor_probs, global_probs = self.model(batch, return_global=True)
+            num_batches = (num_windows + batch_size - 1) // batch_size
+            with tqdm(total=num_windows, desc="GDN Inference", unit="window", leave=False) as pbar:
+                for i in range(0, num_windows, batch_size):
+                    batch = X_windows[i:i + batch_size]
+                    batch_size_actual = batch.shape[0]
+                    
+                    if return_global:
+                        sensor_probs, global_probs = self.model(batch, return_global=True)
+                        all_sensor_probs.append(sensor_probs.cpu().numpy())
+                        all_global_probs.append(global_probs.cpu().numpy())
+                    else:
+                        sensor_probs = self.model(batch, return_global=False)
+                    
                     all_sensor_probs.append(sensor_probs.cpu().numpy())
-                    all_global_probs.append(global_probs.cpu().numpy())
-                else:
-                    sensor_probs = self.model(batch, return_global=False)
-                    all_sensor_probs.append(sensor_probs.cpu().numpy())
+                    pbar.update(batch_size_actual)
         
         sensor_probs = np.concatenate(all_sensor_probs, axis=0)
         
