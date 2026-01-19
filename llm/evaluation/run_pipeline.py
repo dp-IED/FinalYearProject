@@ -12,21 +12,35 @@ import subprocess
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 def run_command(cmd, description):
-    """Run a command and handle errors."""
+    """Run a command and handle errors. Streams output in real-time for progress bars."""
     print("\n" + "="*80)
     print(f"STEP: {description}")
     print("="*80)
     print(f"Command: {' '.join(cmd)}")
     print()
     
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # Use Popen to stream output in real-time so progress bars work
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,  # Combine stderr with stdout
+        text=True,
+        bufsize=1,  # Line buffered
+        universal_newlines=True
+    )
     
-    if result.returncode != 0:
-        print(f"❌ Error in {description}")
-        print(result.stderr)
+    # Stream output line by line to preserve progress bars
+    output_lines = []
+    for line in process.stdout:
+        print(line, end='')  # Print immediately (line already has newline)
+        output_lines.append(line)
+    
+    process.wait()
+    
+    if process.returncode != 0:
+        print(f"\n❌ Error in {description}")
         return False
     
-    print(result.stdout)
     return True
 
 
@@ -75,6 +89,12 @@ def main():
         action='store_true',
         help='Skip GDN->KG->LLM evaluation (faster, but no KG-enhanced LLM comparison)'
     )
+    parser.add_argument(
+        '--limit',
+        type=int,
+        default=None,
+        help='Limit number of windows to process (useful for testing). Applied to dataset creation and all evaluations.'
+    )
     
     args = parser.parse_args()
     
@@ -84,6 +104,8 @@ def main():
     print(f"Split: {args.split}")
     print(f"Output directory: {args.output_dir}")
     print(f"Results directory: {args.results_dir}")
+    if args.limit is not None:
+        print(f"⚠️  LIMIT MODE: Processing only {args.limit} windows")
     print()
     
     # Create directories
@@ -100,6 +122,8 @@ def main():
             '--output-dir', args.output_dir,
             '--split', args.split
         ]
+        if args.limit is not None:
+            cmd.extend(['--max-windows', str(args.limit)])
         if not run_command(cmd, "Creating Shared Dataset"):
             print("\n⚠️  Dataset creation failed.")
             if not dataset_path.exists():
@@ -124,6 +148,8 @@ def main():
         '--dataset', str(dataset_path),
         '--output', str(llm_results_path)
     ]
+    if args.limit is not None:
+        llm_cmd.extend(['--limit', str(args.limit)])
     
     if not run_command(llm_cmd, "Evaluating LLM Baseline"):
         print("\n⚠️  LLM evaluation failed. Continuing with GDN->KG evaluation...")
@@ -158,6 +184,8 @@ def main():
         '--output', str(gdn_kg_results_path),
         '--device', 'cpu'  # Use CPU by default
     ]
+    if args.limit is not None:
+        gdn_kg_cmd.extend(['--limit', str(args.limit)])
     
     if not run_command(gdn_kg_cmd, "Evaluating GDN->KG Method"):
         print("\n⚠️  GDN->KG evaluation failed.")
@@ -174,6 +202,8 @@ def main():
             '--output', str(gdn_kg_llm_results_path),
             '--device', 'cpu'  # Use CPU by default
         ]
+        if args.limit is not None:
+            gdn_kg_llm_cmd.extend(['--limit', str(args.limit)])
         
         if not run_command(gdn_kg_llm_cmd, "Evaluating GDN->KG->LLM Method"):
             print("\n⚠️  GDN->KG->LLM evaluation failed. Continuing with comparison...")
