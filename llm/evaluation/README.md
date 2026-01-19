@@ -30,17 +30,29 @@ The shared evaluation dataset contains:
 
 ### 1. Create Shared Dataset
 
-First, create the shared evaluation dataset from your gdn.ipynb outputs:
+Create the shared evaluation dataset from raw OBD data using the same preprocessing pipeline as GDN:
 
 ```bash
 python llm/evaluation/create_shared_dataset.py \
-    --normalized_path path/to/normalized_windows.pt \
-    --raw_data_path data/carOBD/obdiidata/ \
-    --output_dir llm/evaluation/shared_dataset/ \
-    --split test
+    --raw-data-path data/carOBD/obdiidata/ \
+    --output-dir llm/evaluation/shared_dataset/ \
+    --split test \
+    --fault-percentage 0.3
 ```
 
-**Note**: This script currently uses placeholder data for unnormalized windows. For full implementation, integrate with `gdn.ipynb` to track window boundaries and load actual unnormalized data.
+This script:
+
+- Loads raw OBD CSV files from the data directory
+- Applies the exact same preprocessing as GDN training (deduplication, downsampling, cross-channel features)
+- Creates both normalized windows (for GDN) and unnormalized windows (for LLM) from the same data
+- Optionally injects faults with sensor-level labels
+- Saves as `.npz` for fast loading and JSON metadata
+
+**Optional arguments:**
+
+- `--fault-percentage`: Percentage of windows to inject faults into (default: 0.3)
+- `--max-windows`: Limit total windows (useful for quick testing)
+- `--random-state`: Random seed for reproducibility
 
 ### 2. Evaluate LLM Baseline
 
@@ -50,7 +62,6 @@ Evaluate the LLM-only method:
 python llm/evaluation/evaluate_llm_baseline.py \
     --dataset llm/evaluation/shared_dataset/test.npz \
     --output results/llm_baseline.json \
-    --simulate  # Use --simulate for testing without actual LLM
 ```
 
 ### 3. Evaluate GDN->KG Method
@@ -129,6 +140,31 @@ The shared dataset is saved in multiple formats:
 - Contains unnormalized sensor values
 - Useful for LLM text processing
 
+## How create_shared_dataset.py Works
+
+The script creates datasets that are compatible with both the LLM baseline and GDN->KG methods:
+
+1. **Data Loading**: Reads raw OBD CSV files from `data/carOBD/obdiidata/`
+2. **Preprocessing**: Applies the identical pipeline as `train_gdn_center_loss.py`:
+   - Removes zero-variance columns
+   - Fills missing timestamps by averaging duplicates
+   - Downsamples data
+   - Filters out drives shorter than window_size + forecast_horizon
+   - Adds cross-channel features for relationship detection
+3. **Window Creation**:
+   - **Normalized windows**: Created using `build_clean_windows()` (same as GDN training)
+   - **Unnormalized windows**: Created directly from preprocessed data without normalization (for LLM)
+   - Both use the same window boundaries for fair comparison
+4. **Fault Injection** (optional):
+   - Uses `inject_faults_with_sensor_labels()` to inject realistic faults
+   - Provides sensor-level ground truth labels
+5. **Statistical Features**: Computes 9 features per sensor (mean, std, min, max, range, median, mode, skewness, kurtosis)
+6. **Output Format**:
+   - `.npz` file: Fast binary format for programmatic access
+   - JSON metadata: Human-readable dataset info and sensor names
+
+This ensures both methods evaluate on identical windows with the same ground truth.
+
 ## Integration Notes
 
 ### For LLM Evaluation
@@ -136,13 +172,9 @@ The shared dataset is saved in multiple formats:
 The LLM evaluator formats windows as text prompts. You can customize the prompt format in `evaluate_llm_baseline.py`:
 
 - `format_window_for_llm()`: Formats a window for LLM prompt
-- `simulate_llm_prediction()`: Placeholder for actual LLM integration
+- `parse_llm_response()`: Parses LLM response to extract fault predictions
 
-To integrate with an actual LLM:
-
-1. Replace `simulate_llm_prediction()` with your LLM API call
-2. Parse LLM response to extract sensor predictions
-3. Update the prediction format to match expected output
+The evaluator uses the MLX LM library to run inference with the Granite model. The prediction format matches the expected output structure with sensor labels, fault types, and reasoning.
 
 ### For GDN->KG Evaluation
 
@@ -171,10 +203,52 @@ Sensor-Level Metrics:
 ...
 ```
 
+## How create_shared_dataset.py Compares to gdn.ipynb
+
+Both follow the **same data processing pipeline** to ensure fair evaluation:
+
+| Step                         | gdn.ipynb                     | create_shared_dataset.py          |
+| ---------------------------- | ----------------------------- | --------------------------------- |
+| Data loading                 | Manual CSV loading            | Automatic from directory          |
+| Zero-variance removal        | ✓                             | ✓                                 |
+| Duplicate timestamp handling | ✓                             | ✓                                 |
+| Downsampling                 | ✓                             | ✓                                 |
+| Drive filtering              | ✓                             | ✓                                 |
+| Cross-channel features       | ✓                             | ✓                                 |
+| Window creation              | Using `build_clean_windows()` | Using `build_clean_windows()`     |
+| Normalization                | MinMax scaler                 | MinMax scaler (same)              |
+| Unnormalized windows         | Not tracked                   | ✓ Created with same boundaries    |
+| Fault injection              | Manual                        | Automated with labels             |
+| Statistical features         | Manual                        | Automated (9 features per sensor) |
+
+**Key difference**: The script **automatically creates unnormalized windows with matching boundaries** to the normalized windows, ensuring both LLM and GDN->KG methods evaluate on identical data.
+
+## Typical Workflow
+
+```bash
+# 1. Create the shared evaluation dataset
+python llm/evaluation/create_shared_dataset.py \
+    --raw-data-path data/carOBD/obdiidata \
+    --output-dir llm/evaluation/shared_dataset \
+    --split test \
+    --fault-percentage 0.3
+
+# 2. Run the full evaluation pipeline
+python llm/evaluation/run_pipeline.py \
+    --split test \
+    --skip-dataset-creation
+
+# 3. Results are saved in results/ directory
+# - llm_baseline_test.json
+# - gdn_kg_test.json
+# - comparison_test.html (visual report)
+# - comparison_test.json (metrics table)
+```
+
 ## Future Improvements
 
 1. **Actual LLM Integration**: Replace simulation with real LLM API calls
-2. **Window Boundary Tracking**: Integrate with gdn.ipynb to properly track window boundaries
-3. **Statistical Significance Testing**: Add statistical tests to compare methods
-4. **Visualization**: Add plots comparing metrics across fault types
-5. **Cross-Validation**: Support k-fold cross-validation for more robust evaluation
+2. **Statistical Significance Testing**: Add statistical tests to compare methods
+3. **Visualization**: Add plots comparing metrics across fault types
+4. **Cross-Validation**: Support k-fold cross-validation for more robust evaluation
+5. **Batch Processing**: Support processing multiple splits in one command
