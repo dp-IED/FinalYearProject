@@ -1,5 +1,5 @@
 """
-Run the complete evaluation pipeline: dataset creation -> LLM eval -> GDN->KG eval -> comparison.
+Run the complete evaluation pipeline: dataset creation -> LLM eval -> GDN->KG eval -> GDN->KG->LLM eval -> comparison.
 
 This script orchestrates the entire evaluation workflow.
 """
@@ -8,9 +8,7 @@ import argparse
 import sys
 from pathlib import Path
 import subprocess
-import json
 
-# Add paths for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 def run_command(cmd, description):
@@ -34,7 +32,7 @@ def run_command(cmd, description):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Run complete evaluation pipeline: dataset -> LLM -> GDN->KG -> comparison'
+        description='Run complete evaluation pipeline: dataset -> LLM -> GDN->KG -> GDN->KG->LLM -> comparison'
     )
     parser.add_argument(
         '--raw-data-path',
@@ -71,6 +69,11 @@ def main():
         '--skip-dataset-creation',
         action='store_true',
         help='Skip dataset creation (use existing dataset)'
+    )
+    parser.add_argument(
+        '--skip-kg-llm',
+        action='store_true',
+        help='Skip GDN->KG->LLM evaluation (faster, but no KG-enhanced LLM comparison)'
     )
     
     args = parser.parse_args()
@@ -160,10 +163,43 @@ def main():
         print("\n⚠️  GDN->KG evaluation failed.")
         return 1
     
-    # Step 4: Compare methods
-    if llm_results_path.exists() and gdn_kg_results_path.exists():
-        comparison_path = Path(args.results_dir) / f"comparison_{args.split}.html"
+    # Step 4: Evaluate GDN->KG->LLM
+    gdn_kg_llm_results_path = Path(args.results_dir) / f"gdn_kg_llm_{args.split}.json"
+    
+    if not args.skip_kg_llm:
+        gdn_kg_llm_cmd = [
+            'python', 'llm/evaluation/evaluate_gdn_kg_llm.py',
+            '--dataset', str(dataset_path),
+            '--model-path', str(model_path),
+            '--output', str(gdn_kg_llm_results_path),
+            '--device', 'cpu'  # Use CPU by default
+        ]
         
+        if not run_command(gdn_kg_llm_cmd, "Evaluating GDN->KG->LLM Method"):
+            print("\n⚠️  GDN->KG->LLM evaluation failed. Continuing with comparison...")
+    else:
+        print("\n⏭️  Skipping GDN->KG->LLM evaluation (--skip-kg-llm flag set)")
+    
+    # Step 5: Compare methods
+    comparison_path = Path(args.results_dir) / f"comparison_{args.split}.html"
+    
+    # Determine which comparison to run based on available results
+    has_llm = llm_results_path.exists()
+    has_gdn_kg = gdn_kg_results_path.exists()
+    has_gdn_kg_llm = gdn_kg_llm_results_path.exists()
+    
+    if has_llm and has_gdn_kg and has_gdn_kg_llm:
+        # Three-way comparison
+        compare_cmd = [
+            'python', 'llm/evaluation/compare_methods.py',
+            '--llm-results', str(llm_results_path),
+            '--gdn-kg-results', str(gdn_kg_results_path),
+            '--gdn-kg-llm-results', str(gdn_kg_llm_results_path),
+            '--output', str(comparison_path),
+            '--json-output', str(Path(args.results_dir) / f"comparison_{args.split}.json")
+        ]
+    elif has_llm and has_gdn_kg:
+        # Two-way comparison (fallback)
         compare_cmd = [
             'python', 'llm/evaluation/compare_methods.py',
             '--llm-results', str(llm_results_path),
@@ -171,28 +207,32 @@ def main():
             '--output', str(comparison_path),
             '--json-output', str(Path(args.results_dir) / f"comparison_{args.split}.json")
         ]
-        
-        if not run_command(compare_cmd, "Comparing Methods"):
-            print("\n⚠️  Comparison failed.")
-            return 1
-        
-        print("\n" + "="*80)
-        print("✓ PIPELINE COMPLETE!")
-        print("="*80)
-        print(f"\nResults:")
-        print(f"  - LLM Baseline: {llm_results_path}")
-        print(f"  - GDN->KG: {gdn_kg_results_path}")
-        print(f"  - Comparison: {comparison_path}")
-        print()
-        
-        return 0
     else:
         print("\n⚠️  Cannot compare methods - missing result files")
-        if not llm_results_path.exists():
+        if not has_llm:
             print(f"  Missing: {llm_results_path}")
-        if not gdn_kg_results_path.exists():
+        if not has_gdn_kg:
             print(f"  Missing: {gdn_kg_results_path}")
+        if not has_gdn_kg_llm and not args.skip_kg_llm:
+            print(f"  Missing: {gdn_kg_llm_results_path}")
         return 1
+    
+    if not run_command(compare_cmd, "Comparing Methods"):
+        print("\n⚠️  Comparison failed.")
+        return 1
+    
+    print("\n" + "="*80)
+    print("✓ PIPELINE COMPLETE!")
+    print("="*80)
+    print(f"\nResults:")
+    print(f"  - LLM Baseline: {llm_results_path}")
+    print(f"  - GDN->KG: {gdn_kg_results_path}")
+    if has_gdn_kg_llm:
+        print(f"  - GDN->KG->LLM: {gdn_kg_llm_results_path}")
+    print(f"  - Comparison: {comparison_path}")
+    print()
+    
+    return 0
 
 
 if __name__ == '__main__':
