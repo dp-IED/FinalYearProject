@@ -8,6 +8,7 @@ This script:
 4. Optionally injects faults with sensor-level ground truth labels
 5. Computes statistical features for each window
 6. Saves standardized dataset for evaluation
+7. Runs GDN anomaly detection on windows and loads results into Neo4j
 
 IMPORTANT: Both methods evaluate on IDENTICAL windows with the SAME ground truth,
 ensuring fair comparison.
@@ -18,19 +19,32 @@ Usage:
         --output-dir llm/evaluation/shared_dataset \
         --split test \
         --fault-percentage 0.3 \
-        --max-windows 1000
+        --max-windows 1000 \
+        --gdn-model-path anomaly-detection/best_center_loss_gdn.pt \
+        --neo4j-uri bolt://127.0.0.1:7687 \
+        --neo4j-user neo4j \
+        --neo4j-password password
 
 Output files:
     - {split}.npz: Dataset arrays (normalized/unnormalized windows, labels, etc.)
     - {split}_metadata.json: Dataset info, sensor names, window counts
 
+Neo4j Database:
+    - Loads windows, sensors, anomaly scores, correlations, and temporal relationships
+    - Clears existing data before loading (use --skip-neo4j to disable)
+
 Dataset structure (all in one .npz file):
     - normalized_windows: (N, 300, 8) - normalized [0,1] for GDN
     - unnormalized_windows: (N, 300, 8) - real sensor values for LLM
     - sensor_labels: (N, 8) - ground truth faulty sensors (binary)
-    - window_labels: (N,) - ground truth faulty windows (binary)
+    - window_labels: (N,) - window indices (0, 1, 2, ..., N-1)
     - fault_types: (N,) - fault type strings (VSS_DROPOUT, etc.)
     - statistical_features: (N, 8, 9) - statistical features per sensor
+
+Neo4j Three-Layer Architecture:
+    - Layer 1: Graph structure (correlations, violations, subsystems)
+    - Layer 2: Statistical summaries (mean, std, min, max, variance, num_zeros, trend, quartiles on HAS_READING)
+    - Layer 3: Raw time-series (Reading nodes with subsampled values, 15 points per window)
 """
 
 import numpy as np
@@ -61,6 +75,33 @@ from train_gdn_center_loss import (
     WINDOW_SIZE,
     FORECAST_HORIZON
 )
+
+# Add paths for GDN and KG imports
+project_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(project_root / 'anomaly-detection'))
+sys.path.insert(0, str(project_root))
+
+from gdn_processor import GDNPredictor
+from llm.helpers.KG import KnowledgeGraphBuilder
+from llm.kag.graphdb import Neo4jLoader
+
+
+def sensor_labels_to_window_label(sensor_labels: np.ndarray) -> int:
+    """
+    Convert sensor-level labels to window-level sensor-indexed label.
+    
+    Args:
+        sensor_labels: (num_sensors,) binary array - which sensors are faulty
+        
+    Returns:
+        int: 0 if no fault, 1-8 if fault detected (1-indexed sensor index)
+             Uses the first faulty sensor index (primary sensor)
+    """
+    faulty_indices = np.where(sensor_labels > 0)[0]
+    if len(faulty_indices) == 0:
+        return 0
+    # Return first faulty sensor index + 1 (1-indexed: sensor 0 -> label 1, sensor 7 -> label 8)
+    return int(faulty_indices[0]) + 1
 
 
 def compute_statistical_features(window_data: np.ndarray) -> np.ndarray:
@@ -114,7 +155,12 @@ def create_shared_evaluation_dataset(
     split: str = 'test',
     fault_percentage: float = 0.3,
     max_windows: Optional[int] = None,
-    random_state: int = 42
+    random_state: int = 42,
+    gdn_model_path: Optional[str] = None,
+    neo4j_uri: str = 'bolt://127.0.0.1:7687',
+    neo4j_user: str = 'neo4j',
+    neo4j_password: str = 'password',
+    skip_neo4j: bool = False
 ) -> Dict:
     """
     Create shared dataset by loading raw OBD data and preprocessing through GDN pipeline.
@@ -257,13 +303,18 @@ def create_shared_evaluation_dataset(
         
         X_normalized = X_faulty.numpy()
         sensor_labels = sensor_labels.numpy()
-        window_labels = window_labels.numpy()
+        window_labels_binary = window_labels.numpy()
         
-        print(f"  Injected faults into {window_labels.sum()} windows")
+        # Window labels are now window indices (0, 1, 2, ..., N-1)
+        # Keep binary fault indicator separate for Neo4j
+        window_labels = np.arange(len(sensor_labels), dtype=np.int64)
+        
+        print(f"  Injected faults into {(window_labels_binary > 0).sum()} windows")
+        print(f"  Window indices: 0 to {len(window_labels)-1}")
     else:
         print("\n5. No faults injected (fault_percentage=0)")
         sensor_labels = np.zeros((len(X_normalized), len(SENSOR_COLS_AVAILABLE)), dtype=np.float32)
-        window_labels = np.zeros(len(X_normalized), dtype=np.int64)
+        window_labels = np.arange(len(X_normalized), dtype=np.int64)  # Window indices
     
     # ========================================================================
     # 6. Compute statistical features
@@ -277,8 +328,14 @@ def create_shared_evaluation_dataset(
     # 7. Create fault types
     # ========================================================================
     fault_types = np.array(['unknown'] * len(X_normalized))
+    # Use window_labels_binary if it exists, otherwise check sensor_labels
+    if fault_percentage > 0:
+        window_labels_binary_check = window_labels_binary
+    else:
+        window_labels_binary_check = (sensor_labels.sum(axis=1) > 0).astype(np.int64)
+    
     for i in range(len(X_normalized)):
-        if window_labels[i] > 0:
+        if window_labels_binary_check[i] > 0:  # Check if window has any fault
             faulty_sensors = [SENSOR_COLS_AVAILABLE[j] for j in range(len(SENSOR_COLS_AVAILABLE)) if sensor_labels[i, j] > 0]
             if 'VEHICLE_SPEED' in str(faulty_sensors):
                 fault_types[i] = 'VSS_DROPOUT'
@@ -341,8 +398,8 @@ def create_shared_evaluation_dataset(
         'sensor_names': SENSOR_COLS_AVAILABLE,
         'metadata': {
             'window_ids': list(range(len(X_normalized))),
-            'num_faulty_windows': int(window_labels.sum()),
-            'num_normal_windows': int((window_labels == 0).sum())
+            'num_faulty_windows': int((sensor_labels.sum(axis=1) > 0).sum()),
+            'num_normal_windows': int((sensor_labels.sum(axis=1) == 0).sum())
         }
     }
     with open(json_path, 'w') as f:
@@ -351,14 +408,125 @@ def create_shared_evaluation_dataset(
     
     print(f"\n✓ Dataset created successfully!")
     print(f"  Windows: {len(X_normalized)}")
-    print(f"  Faulty windows: {window_labels.sum()}")
-    print(f"  Normal windows: {(window_labels == 0).sum()}")
+    num_faulty = int((sensor_labels.sum(axis=1) > 0).sum())
+    print(f"  Faulty windows: {num_faulty}")
+    print(f"  Normal windows: {len(X_normalized) - num_faulty}")
+    
+    # ========================================================================
+    # 10. Run GDN Anomaly Detection and Load to Neo4j
+    # ========================================================================
+    if not skip_neo4j and gdn_model_path is not None:
+        print("\n10. Running GDN anomaly detection and loading to Neo4j...")
+        
+        try:
+            # Resolve model path relative to project root
+            model_path = Path(gdn_model_path)
+            if not model_path.is_absolute():
+                model_path = project_root / model_path
+            
+            if not model_path.exists():
+                print(f"  ⚠️  Warning: GDN model not found at {model_path}")
+                print("  Skipping Neo4j loading...")
+            else:
+                # Load GDN model
+                print(f"  Loading GDN model from {model_path}...")
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                
+                # Detect embed_dim from model checkpoint
+                try:
+                    checkpoint = torch.load(model_path, map_location='cpu')
+                    # Try to infer embed_dim from checkpoint
+                    if 'sensor_embeddings' in checkpoint:
+                        detected_embed_dim = checkpoint['sensor_embeddings'].shape[1]
+                    else:
+                        # Try to get from model state dict
+                        for key in checkpoint.keys():
+                            if 'sensor_embeddings' in key:
+                                detected_embed_dim = checkpoint[key].shape[1] if hasattr(checkpoint[key], 'shape') else 64
+                                break
+                        else:
+                            detected_embed_dim = 64  # Default fallback
+                except:
+                    detected_embed_dim = 64  # Default fallback
+                
+                predictor = GDNPredictor(
+                    model_path=model_path,
+                    sensor_names=SENSOR_COLS_AVAILABLE,
+                    window_size=WINDOW_SIZE,
+                    embed_dim=detected_embed_dim,
+                    top_k=3,
+                    hidden_dim=32,
+                    device=device
+                )
+                
+                print(f"  ✓ GDN model loaded (device: {device})")
+                
+                # Process data through GDN
+                print("  Processing windows through GDN...")
+                kg_data = predictor.process_for_kg(
+                    X_windows=X_normalized,
+                    sensor_labels=sensor_labels,
+                    window_labels=window_labels.astype(np.int64),
+                    batch_size=32
+                )
+                
+                print("  ✓ GDN processing completed")
+                
+                # Build Knowledge Graph
+                print("  Building Knowledge Graph...")
+                kg_builder = KnowledgeGraphBuilder(
+                    sensor_names=kg_data['sensor_names'],
+                    sensor_embeddings=kg_data['sensor_embeddings'],
+                    adjacency_matrix=kg_data['adjacency_matrix']
+                )
+                
+                kg = kg_builder.build_from_gdn_windows(
+                    X_windows=kg_data['X_windows'],
+                    sensor_labels=kg_data['sensor_labels'],
+                    window_labels=kg_data['window_labels'],
+                    X_windows_unnormalized=X_unnormalized  # Pass unnormalized windows for Layer 3
+                )
+                
+                print(f"  ✓ Knowledge Graph built (nodes: {kg.number_of_nodes()}, edges: {kg.number_of_edges()})")
+                
+                # Load into Neo4j
+                print("  Loading into Neo4j...")
+                try:
+                    loader = Neo4jLoader(uri=neo4j_uri, user=neo4j_user, password=neo4j_password)
+                    # Clear database FIRST to remove any existing duplicate nodes
+                    loader.clear_database()
+                    # Then create schema (constraints)
+                    loader.create_schema()
+                    
+                    # Window labels are now window indices, but Neo4j needs binary fault indicator
+                    # Use sensor_labels to determine if window is faulty
+                    window_labels_binary = (sensor_labels.sum(axis=1) > 0).astype(np.int64)
+                    
+                    # Pass binary window labels and sensor_labels for fault_type/faulty_sensor calculation
+                    loader.load_from_kg_builder(kg_builder, 
+                                              window_labels=window_labels_binary,
+                                              sensor_labels=sensor_labels)
+                    
+                    print("  ✓ Neo4j loading completed")
+                except Exception as e:
+                    print(f"  ⚠️  Warning: Failed to load into Neo4j: {e}")
+                    print("  Continuing without Neo4j...")
+        
+        except Exception as e:
+            print(f"  ⚠️  Warning: Error during GDN/Neo4j processing: {e}")
+            print("  Continuing without Neo4j...")
+            import traceback
+            traceback.print_exc()
+    elif skip_neo4j:
+        print("\n10. Skipping Neo4j loading (--skip-neo4j flag set)")
+    elif gdn_model_path is None:
+        print("\n10. Skipping Neo4j loading (no GDN model path provided)")
     
     return {
         'npz_path': str(npz_path),
         'json_path': str(json_path),
         'num_windows': len(X_normalized),
-        'num_faulty': int(window_labels.sum())
+        'num_faulty': int((sensor_labels.sum(axis=1) > 0).sum())
     }
 
 
@@ -403,6 +571,35 @@ if __name__ == '__main__':
         default=42,
         help='Random seed for reproducibility'
     )
+    parser.add_argument(
+        '--gdn-model-path',
+        type=str,
+        default='anomaly-detection/best_center_loss_gdn.pt',
+        help='Path to GDN model checkpoint (default: anomaly-detection/best_center_loss_gdn.pt)'
+    )
+    parser.add_argument(
+        '--neo4j-uri',
+        type=str,
+        default='bolt://127.0.0.1:7687',
+        help='Neo4j connection URI (default: bolt://127.0.0.1:7687)'
+    )
+    parser.add_argument(
+        '--neo4j-user',
+        type=str,
+        default='neo4j',
+        help='Neo4j username (default: neo4j)'
+    )
+    parser.add_argument(
+        '--neo4j-password',
+        type=str,
+        default='password',
+        help='Neo4j password (default: password)'
+    )
+    parser.add_argument(
+        '--skip-neo4j',
+        action='store_true',
+        help='Skip Neo4j loading (useful when Neo4j is not available)'
+    )
     
     args = parser.parse_args()
     
@@ -412,5 +609,10 @@ if __name__ == '__main__':
         split=args.split,
         fault_percentage=args.fault_percentage,
         max_windows=args.max_windows,
-        random_state=args.random_state
+        random_state=args.random_state,
+        gdn_model_path=args.gdn_model_path,
+        neo4j_uri=args.neo4j_uri,
+        neo4j_user=args.neo4j_user,
+        neo4j_password=args.neo4j_password,
+        skip_neo4j=args.skip_neo4j
     )
