@@ -1,137 +1,0 @@
-================================================================================
-Evaluating GDN->KG->LLM Method
-================================================================================
-Dataset: llm/evaluation/shared_dataset/test_subset_100.npz
-GDN Model: anomaly-detection/best_center_loss_gdn.pt
-
-Loading LLM model: mlx-community/granite-4.0-h-micro-4bit
-Fetching 10 files:   0%|          | 0/10 [00:00<?, ?it/s]Fetching 10 files: 100%|██████████| 10/10 [00:00<00:00, 27395.85it/s]
-✓ Model loaded successfully
-
-Loading dataset...
-  Loaded 100 windows
-  Window size: 300
-  Sensors: 8
-
-Initializing GDN Predictor...
-  Warning: Strict loading failed: Error(s) in loading state_dict for MultiLabelGDN:
-	Missing key(s) in state_dict: "sensor_embeddings", "temporal_encoder.weight_ih_l0", "temporal_encoder.weight_hh_l0", "temporal_encoder.bias_ih_l0", "temporal_encoder.bias_hh_l0", "gat.att_src", "gat.att_dst", "gat.bias", "gat.lin.weight", "sensor_classifier.0.weight", "sensor_classifier.0.bias", "sensor_classifier.3.weight", "sensor_classifier.3.bias", "global_classifier.0.weight", "global_classifier.0.bias", "global_classifier.3.weight", "global_classifier.3.bias". 
-	Unexpected key(s) in state_dict: "model", "center_loss". 
-  Attempting partial loading...
-✓ Loaded model from anomaly-detection/best_center_loss_gdn.pt
-  Device: cpu
-  Sensors: 8
-  Window size: 300
-  Model loaded in 0.06 seconds
-
-Processing data through GDN...
-GDN Data Processing:   0%|          | 0/1 [00:00<?, ?step/s]GDN Data Processing: 100%|██████████| 1/1 [00:00<00:00, 161.56step/s]
-  GDN processing completed in 0.01 seconds
-
-Building Knowledge Graph...
-KG Construction:   0%|          | 0/1 [00:00<?, ?step/s]KG Construction: 100%|██████████| 1.0/1 [00:00<00:00, 29.73step/s]
-  Knowledge Graph built in 0.03 seconds
-  Nodes: 808, Edges: 1820
-
-Running LLM predictions with KG context...
-KG-Enhanced LLM Inference:   0%|          | 0/100 [00:00<?, ?window/s]KG-Enhanced LLM Inference:   1%|          | 1/100 [00:36<1:00:39, 36.76s/window]KG-Enhanced LLM Inference:   2%|▏         | 2/100 [01:22<1:09:08, 42.33s/window]KG-Enhanced LLM Inference:   3%|▎         | 3/100 [02:05<1:08:30, 42.37s/window]KG-Enhanced LLM Inference:   4%|▍         | 4/100 [02:47<1:07:24, 42.13s/window]KG-Enhanced LLM Inference:   5%|▌         | 5/100 [03:15<58:46, 37.12s/window]  KG-Enhanced LLM Inference:   6%|▌         | 6/100 [03:57<1:01:02, 38.97s/window]KG-Enhanced LLM Inference:   7%|▋         | 7/100 [04:40<1:02:04, 40.05s/window]KG-Enhanced LLM Inference:   8%|▊         | 8/100 [05:23<1:02:50, 40.98s/window]KG-Enhanced LLM Inference:   9%|▉         | 9/100 [06:06<1:03:23, 41.80s/window]KG-Enhanced LLM Inference:  10%|█         | 10/100 [06:50<1:03:33, 42.37s/window]KG-Enhanced LLM Inference:  10%|█         | 10/100 [06:50<1:03:33, 42.37s/window, avg_time=41.05s]KG-Enhanced LLM Inference:  11%|█         | 11/100 [07:40<1:06:21, 44.73s/window, avg_time=41.05s]KG-Enhanced LLM Inference:  12%|█▏        | 12/100 [08:36<1:10:37, 48.16s/window, avg_time=41.05s]KG-Enhanced LLM Inference:  13%|█▎        | 13/100 [09:32<1:13:21, 50.59s/window, avg_time=41.05s]KG-Enhanced LLM Inference:  14%|█▍        | 14/100 [10:26<1:14:02, 51.66s/window, avg_time=41.05s]KG-Enhanced LLM Inference:  15%|█▌        | 15/100 [10:43<58:09, 41.05s/window, avg_time=41.05s]  KG-Enhanced LLM Inference:  16%|█▌        | 16/100 [11:25<57:45, 41.26s/window, avg_time=41.05s]KG-Enhanced LLM Inference:  17%|█▋        | 17/100 [12:06<57:04, 41.26s/window, avg_time=41.05s]KG-Enhanced LLM Inference:  18%|█▊        | 18/100 [12:47<56:10, 41.11s/window, avg_time=41.05s]KG-Enhanced LLM Inference:  19%|█▉        | 19/100 [13:29<55:58, 41.46s/window, avg_time=41.05s]KG-Enhanced LLM Inference:  20%|██        | 20/100 [14:11<55:27, 41.59s/window, avg_time=41.05s]KG-Enhanced LLM Inference:  20%|██        | 20/100 [14:11<55:27, 41.59s/window, avg_time=44.08s]KG-Enhanced LLM Inference:  21%|██        | 21/100 [14:53<54:49, 41.64s/window, avg_time=44.08s]KG-Enhanced LLM Inference:  22%|██▏       | 22/100 [15:19<48:07, 37.02s/window, avg_time=44.08s]KG-Enhanced LLM Inference:  23%|██▎       | 23/100 [16:00<48:58, 38.17s/window, avg_time=44.08s]KG-Enhanced LLM Inference:  24%|██▍       | 24/100 [16:40<49:18, 38.93s/window, avg_time=44.08s]KG-Enhanced LLM Inference:  25%|██▌       | 25/100 [17:20<48:58, 39.18s/window, avg_time=44.08s]KG-Enhanced LLM Inference:  26%|██▌       | 26/100 [18:01<48:59, 39.73s/window, avg_time=44.08s]KG-Enhanced LLM Inference:  27%|██▋       | 27/100 [18:46<50:04, 41.15s/window, avg_time=44.08s]KG-Enhanced LLM Inference:  28%|██▊       | 28/100 [19:26<49:10, 40.98s/window, avg_time=44.08s]KG-Enhanced LLM Inference:  29%|██▉       | 29/100 [20:08<48:46, 41.21s/window, avg_time=44.08s]KG-Enhanced LLM Inference:  30%|███       | 30/100 [20:50<48:29, 41.56s/window, avg_time=44.08s]KG-Enhanced LLM Inference:  30%|███       | 30/100 [20:50<48:29, 41.56s/window, avg_time=39.95s]KG-Enhanced LLM Inference:  31%|███       | 31/100 [21:36<49:06, 42.71s/window, avg_time=39.95s]KG-Enhanced LLM Inference:  32%|███▏      | 32/100 [22:18<48:25, 42.74s/window, avg_time=39.95s]KG-Enhanced LLM Inference:  33%|███▎      | 33/100 [23:02<47:57, 42.95s/window, avg_time=39.95s]KG-Enhanced LLM Inference:  34%|███▍      | 34/100 [23:46<47:36, 43.27s/window, avg_time=39.95s]KG-Enhanced LLM Inference:  35%|███▌      | 35/100 [24:31<47:26, 43.78s/window, avg_time=39.95s]KG-Enhanced LLM Inference:  36%|███▌      | 36/100 [25:14<46:27, 43.56s/window, avg_time=39.95s]KG-Enhanced LLM Inference:  37%|███▋      | 37/100 [25:55<45:01, 42.89s/window, avg_time=39.95s]KG-Enhanced LLM Inference:  38%|███▊      | 38/100 [26:40<44:46, 43.34s/window, avg_time=39.95s]KG-Enhanced LLM Inference:  39%|███▉      | 39/100 [27:25<44:45, 44.02s/window, avg_time=39.95s]KG-Enhanced LLM Inference:  40%|████      | 40/100 [28:11<44:36, 44.61s/window, avg_time=39.95s]KG-Enhanced LLM Inference:  40%|████      | 40/100 [28:11<44:36, 44.61s/window, avg_time=44.10s]KG-Enhanced LLM Inference:  41%|████      | 41/100 [28:57<44:10, 44.92s/window, avg_time=44.10s]KG-Enhanced LLM Inference:  42%|████▏     | 42/100 [29:42<43:23, 44.89s/window, avg_time=44.10s]KG-Enhanced LLM Inference:  43%|████▎     | 43/100 [30:27<42:42, 44.95s/window, avg_time=44.10s]KG-Enhanced LLM Inference:  44%|████▍     | 44/100 [31:11<41:49, 44.82s/window, avg_time=44.10s]KG-Enhanced LLM Inference:  45%|████▌     | 45/100 [31:59<41:57, 45.77s/window, avg_time=44.10s]KG-Enhanced LLM Inference:  46%|████▌     | 46/100 [32:21<34:38, 38.48s/window, avg_time=44.10s]KG-Enhanced LLM Inference:  47%|████▋     | 47/100 [33:03<34:51, 39.46s/window, avg_time=44.10s]KG-Enhanced LLM Inference:  48%|████▊     | 48/100 [33:52<36:52, 42.55s/window, avg_time=44.10s]KG-Enhanced LLM Inference:  49%|████▉     | 49/100 [34:29<34:45, 40.89s/window, avg_time=44.10s]KG-Enhanced LLM Inference:  50%|█████     | 50/100 [35:18<36:02, 43.26s/window, avg_time=44.10s]KG-Enhanced LLM Inference:  50%|█████     | 50/100 [35:18<36:02, 43.26s/window, avg_time=42.68s]KG-Enhanced LLM Inference:  51%|█████     | 51/100 [36:06<36:21, 44.51s/window, avg_time=42.68s]KG-Enhanced LLM Inference:  52%|█████▏    | 52/100 [36:53<36:19, 45.41s/window, avg_time=42.68s]KG-Enhanced LLM Inference:  53%|█████▎    | 53/100 [37:43<36:41, 46.83s/window, avg_time=42.68s]KG-Enhanced LLM Inference:  54%|█████▍    | 54/100 [38:33<36:30, 47.62s/window, avg_time=42.68s]KG-Enhanced LLM Inference:  55%|█████▌    | 55/100 [39:22<36:03, 48.07s/window, avg_time=42.68s]KG-Enhanced LLM Inference:  56%|█████▌    | 56/100 [40:09<34:57, 47.68s/window, avg_time=42.68s]KG-Enhanced LLM Inference:  57%|█████▋    | 57/100 [40:56<34:04, 47.55s/window, avg_time=42.68s]KG-Enhanced LLM Inference:  58%|█████▊    | 58/100 [41:35<31:34, 45.10s/window, avg_time=42.68s]KG-Enhanced LLM Inference:  59%|█████▉    | 59/100 [42:23<31:24, 45.97s/window, avg_time=42.68s]KG-Enhanced LLM Inference:  60%|██████    | 60/100 [43:11<31:01, 46.54s/window, avg_time=42.68s]KG-Enhanced LLM Inference:  60%|██████    | 60/100 [43:11<31:01, 46.54s/window, avg_time=47.29s]KG-Enhanced LLM Inference:  61%|██████    | 61/100 [44:00<30:42, 47.24s/window, avg_time=47.29s]KG-Enhanced LLM Inference:  62%|██████▏   | 62/100 [44:50<30:30, 48.17s/window, avg_time=47.29s]KG-Enhanced LLM Inference:  63%|██████▎   | 63/100 [45:38<29:41, 48.15s/window, avg_time=47.29s]KG-Enhanced LLM Inference:  64%|██████▍   | 64/100 [46:26<28:46, 47.97s/window, avg_time=47.29s]KG-Enhanced LLM Inference:  65%|██████▌   | 65/100 [47:13<27:50, 47.73s/window, avg_time=47.29s]KG-Enhanced LLM Inference:  66%|██████▌   | 66/100 [47:40<23:31, 41.52s/window, avg_time=47.29s]KG-Enhanced LLM Inference:  67%|██████▋   | 67/100 [48:02<19:32, 35.53s/window, avg_time=47.29s]KG-Enhanced LLM Inference:  68%|██████▊   | 68/100 [48:27<17:17, 32.41s/window, avg_time=47.29s]KG-Enhanced LLM Inference:  69%|██████▉   | 69/100 [48:53<15:43, 30.45s/window, avg_time=47.29s]KG-Enhanced LLM Inference:  70%|███████   | 70/100 [49:25<15:30, 31.01s/window, avg_time=47.29s]KG-Enhanced LLM Inference:  70%|███████   | 70/100 [49:25<15:30, 31.01s/window, avg_time=37.39s]KG-Enhanced LLM Inference:  71%|███████   | 71/100 [49:51<14:16, 29.53s/window, avg_time=37.39s]KG-Enhanced LLM Inference:  72%|███████▏  | 72/100 [50:25<14:27, 30.97s/window, avg_time=37.39s]KG-Enhanced LLM Inference:  73%|███████▎  | 73/100 [50:55<13:46, 30.61s/window, avg_time=37.39s]KG-Enhanced LLM Inference:  74%|███████▍  | 74/100 [51:25<13:12, 30.49s/window, avg_time=37.39s]KG-Enhanced LLM Inference:  75%|███████▌  | 75/100 [51:55<12:37, 30.29s/window, avg_time=37.39s]KG-Enhanced LLM Inference:  76%|███████▌  | 76/100 [52:09<10:09, 25.39s/window, avg_time=37.39s]KG-Enhanced LLM Inference:  77%|███████▋  | 77/100 [52:41<10:29, 27.38s/window, avg_time=37.39s]KG-Enhanced LLM Inference:  78%|███████▊  | 78/100 [53:11<10:20, 28.20s/window, avg_time=37.39s]KG-Enhanced LLM Inference:  79%|███████▉  | 79/100 [53:41<09:59, 28.57s/window, avg_time=37.39s]KG-Enhanced LLM Inference:  80%|████████  | 80/100 [54:10<09:33, 28.68s/window, avg_time=37.39s]KG-Enhanced LLM Inference:  80%|████████  | 80/100 [54:10<09:33, 28.68s/window, avg_time=28.47s]KG-Enhanced LLM Inference:  81%|████████  | 81/100 [54:40<09:16, 29.29s/window, avg_time=28.47s]KG-Enhanced LLM Inference:  82%|████████▏ | 82/100 [55:14<09:08, 30.45s/window, avg_time=28.47s]KG-Enhanced LLM Inference:  83%|████████▎ | 83/100 [55:43<08:31, 30.08s/window, avg_time=28.47s]KG-Enhanced LLM Inference:  84%|████████▍ | 84/100 [55:54<06:31, 24.48s/window, avg_time=28.47s]KG-Enhanced LLM Inference:  85%|████████▌ | 85/100 [56:25<06:38, 26.53s/window, avg_time=28.47s]KG-Enhanced LLM Inference:  86%|████████▌ | 86/100 [56:54<06:20, 27.17s/window, avg_time=28.47s]KG-Enhanced LLM Inference:  87%|████████▋ | 87/100 [57:26<06:10, 28.52s/window, avg_time=28.47s]KG-Enhanced LLM Inference:  88%|████████▊ | 88/100 [57:56<05:49, 29.15s/window, avg_time=28.47s]KG-Enhanced LLM Inference:  89%|████████▉ | 89/100 [58:29<05:30, 30.06s/window, avg_time=28.47s]KG-Enhanced LLM Inference:  90%|█████████ | 90/100 [59:08<05:28, 32.88s/window, avg_time=28.47s]KG-Enhanced LLM Inference:  90%|█████████ | 90/100 [59:08<05:28, 32.88s/window, avg_time=29.84s]KG-Enhanced LLM Inference:  91%|█████████ | 91/100 [59:46<05:10, 34.48s/window, avg_time=29.84s]KG-Enhanced LLM Inference:  92%|█████████▏| 92/100 [1:00:09<04:07, 30.88s/window, avg_time=29.84s]KG-Enhanced LLM Inference:  93%|█████████▎| 93/100 [1:01:00<04:17, 36.85s/window, avg_time=29.84s]KG-Enhanced LLM Inference:  94%|█████████▍| 94/100 [1:02:02<04:27, 44.60s/window, avg_time=29.84s]KG-Enhanced LLM Inference:  95%|█████████▌| 95/100 [1:02:52<03:50, 46.02s/window, avg_time=29.84s]KG-Enhanced LLM Inference:  96%|█████████▌| 96/100 [1:03:40<03:07, 46.79s/window, avg_time=29.84s]KG-Enhanced LLM Inference:  97%|█████████▋| 97/100 [1:04:30<02:23, 47.81s/window, avg_time=29.84s]KG-Enhanced LLM Inference:  98%|█████████▊| 98/100 [1:04:49<01:17, 38.98s/window, avg_time=29.84s]KG-Enhanced LLM Inference:  99%|█████████▉| 99/100 [1:05:37<00:41, 41.78s/window, avg_time=29.84s]KG-Enhanced LLM Inference: 100%|██████████| 100/100 [1:06:24<00:00, 43.40s/window, avg_time=29.84s]KG-Enhanced LLM Inference: 100%|██████████| 100/100 [1:06:24<00:00, 43.40s/window, avg_time=43.61s]KG-Enhanced LLM Inference: 100%|██████████| 100/100 [1:06:24<00:00, 39.85s/window, avg_time=43.61s]
-/Users/darenpalmer/.pyenv/versions/3.13.2/lib/python3.13/site-packages/sklearn/metrics/_classification.py:407: UserWarning: A single label was found in 'y_true' and 'y_pred'. For the confusion matrix to have the correct shape, use the 'labels' parameter to pass all known labels.
-  warnings.warn(
-/Users/darenpalmer/.pyenv/versions/3.13.2/lib/python3.13/site-packages/sklearn/metrics/_classification.py:407: UserWarning: A single label was found in 'y_true' and 'y_pred'. For the confusion matrix to have the correct shape, use the 'labels' parameter to pass all known labels.
-  warnings.warn(
-/Users/darenpalmer/.pyenv/versions/3.13.2/lib/python3.13/site-packages/sklearn/metrics/_classification.py:407: UserWarning: A single label was found in 'y_true' and 'y_pred'. For the confusion matrix to have the correct shape, use the 'labels' parameter to pass all known labels.
-  warnings.warn(
-  Average processing time: 39.8468 seconds/window
-  Total LLM processing time: 3984.68 seconds
-
-Computing evaluation metrics...
-================================================================================
-EVALUATION METRICS REPORT
-================================================================================
-
-Window-Level Metrics:
-----------------------------------------
-  Accuracy:  0.7100
-  Precision: 0.0000
-  Recall:    0.0000
-  F1 Score:  0.0000
-
-Sensor-Level Metrics:
-----------------------------------------
-  Accuracy:  0.9575
-  Precision: 0.0000
-  Recall:    0.0000
-  F1 Score:  0.0000
-
-Per-Sensor Metrics:
-----------------------------------------
-  ENGINE_RPM ():
-    Accuracy:  1.0000
-    Precision: 0.0000
-    Recall:    0.0000
-    F1 Score:  0.0000
-    TP: 0, FP: 0, FN: 0, TN: 100
-  VEHICLE_SPEED ():
-    Accuracy:  0.8400
-    Precision: 0.0000
-    Recall:    0.0000
-    F1 Score:  0.0000
-    TP: 0, FP: 0, FN: 16, TN: 84
-  THROTTLE ():
-    Accuracy:  0.9900
-    Precision: 0.0000
-    Recall:    0.0000
-    F1 Score:  0.0000
-    TP: 0, FP: 0, FN: 1, TN: 99
-  ENGINE_LOAD ():
-    Accuracy:  1.0000
-    Precision: 0.0000
-    Recall:    0.0000
-    F1 Score:  0.0000
-    TP: 0, FP: 0, FN: 0, TN: 100
-  COOLANT_TEMPERATURE ():
-    Accuracy:  0.9300
-    Precision: 0.0000
-    Recall:    0.0000
-    F1 Score:  0.0000
-    TP: 0, FP: 0, FN: 7, TN: 93
-  INTAKE_MANIFOLD_PRESSURE ():
-    Accuracy:  0.9500
-    Precision: 0.0000
-    Recall:    0.0000
-    F1 Score:  0.0000
-    TP: 0, FP: 0, FN: 5, TN: 95
-  SHORT_TERM_FUEL_TRIM_BANK_1 ():
-    Accuracy:  0.9500
-    Precision: 0.0000
-    Recall:    0.0000
-    F1 Score:  0.0000
-    TP: 0, FP: 0, FN: 5, TN: 95
-  LONG_TERM_FUEL_TRIM_BANK_1 ():
-    Accuracy:  1.0000
-    Precision: 0.0000
-    Recall:    0.0000
-    F1 Score:  0.0000
-    TP: 0, FP: 0, FN: 0, TN: 100
-
-Per-Fault-Type Metrics:
-----------------------------------------
-  COOLANT (N=7):
-    Window F1: 0.0000
-    Sensor F1: 0.0000
-  MAF_SCA (N=5):
-    Window F1: 0.0000
-    Sensor F1: 0.0000
-  TPS_STU (N=1):
-    Window F1: 0.0000
-    Sensor F1: 0.0000
-  VSS_DRO (N=16):
-    Window F1: 0.0000
-    Sensor F1: 0.0000
-  unknown (N=71):
-    Window F1: 0.0000
-    Sensor F1: 0.0000
-
-================================================================================
-
-✓ Results saved to: results/gdn_kg_llm_test_subset.json
