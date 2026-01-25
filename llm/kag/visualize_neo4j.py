@@ -32,9 +32,8 @@ def get_correlation_network_query(window_idx: int) -> str:
     """
     query = f"""
     // Correlation network for window {window_idx}
-    MATCH (w:Window {{label: {window_idx}}})-[:HAS_READING]->(s:Sensor)
-    MATCH (s1:Sensor)-[r:CORRELATES_WITH {{window: {window_idx}}}]->(s2:Sensor)
-    WHERE s1 IN s OR s2 IN s
+    MATCH (w:Window {{label: {window_idx}}})
+    MATCH (s1:Sensor {{window: {window_idx}}})-[r:CORRELATES_WITH]->(s2:Sensor {{window: {window_idx}}})
     RETURN s1, s2, r, w
     """
     return query.strip()
@@ -53,7 +52,7 @@ def get_violations_query(window_idx: int) -> str:
     query = f"""
     // Relationship violations in window {window_idx}
     MATCH (w:Window {{label: {window_idx}}})
-    MATCH (s1:Sensor)-[r:CORRELATES_WITH {{window: {window_idx}}}]->(s2:Sensor)
+    MATCH (s1:Sensor {{window: {window_idx}}})-[r:CORRELATES_WITH]->(s2:Sensor {{window: {window_idx}}})
     WHERE r.is_violation = true
     RETURN w, s1, s2, r
     ORDER BY r.deviation DESC
@@ -63,18 +62,17 @@ def get_violations_query(window_idx: int) -> str:
 
 def get_anomaly_propagation_query() -> str:
     """
-    Generate Cypher query to visualize anomaly propagation chains across windows.
+    Generate Cypher query to visualize temporal window ordering.
+    PROPAGATES relationships no longer exist - windows are connected via PRECEDES.
     
     Returns:
         Cypher query string
     """
     query = """
-    // Anomaly propagation chains
-    MATCH (s1:Sensor)-[p:PROPAGATES]->(s2:Sensor)
-    MATCH (w1:Window {label: p.from_window})
-    MATCH (w2:Window {label: p.to_window})
-    RETURN s1, s2, p, w1, w2
-    ORDER BY p.from_window, p.to_window
+    // Temporal window ordering via PRECEDES relationships
+    MATCH (w1:Window)-[:PRECEDES]->(w2:Window)
+    RETURN w1, w2
+    ORDER BY w1.label, w2.label
     """
     return query.strip()
 
@@ -85,8 +83,8 @@ def get_temporal_evolution_query(sensor1: str, sensor2: str,
     Generate Cypher query to show relationship evolution over time.
     
     Args:
-        sensor1: First sensor name
-        sensor2: Second sensor name
+        sensor1: Base sensor name (e.g., "ENGINE_RPM")
+        sensor2: Base sensor name (e.g., "THROTTLE")
         start_window: Starting window index
         end_window: Ending window index
         
@@ -95,14 +93,15 @@ def get_temporal_evolution_query(sensor1: str, sensor2: str,
     """
     query = f"""
     // Temporal evolution of relationship between {sensor1} and {sensor2}
-    MATCH (s1:Sensor {{name: '{sensor1}'}})
-    MATCH (s2:Sensor {{name: '{sensor2}'}})
+    MATCH (s1:Sensor)
+    WHERE s1.window >= {start_window} AND s1.window <= {end_window}
+      AND s1.base_sensor_name = '{sensor1}'
+    MATCH (s2:Sensor)
+    WHERE s2.window = s1.window AND s2.base_sensor_name = '{sensor2}'
     MATCH (s1)-[r:CORRELATES_WITH]->(s2)
-    WHERE r.window >= {start_window} AND r.window <= {end_window}
-    MATCH (w:Window)
-    WHERE w.label = r.window
+    MATCH (w:Window {{label: s1.window}})
     RETURN s1, s2, r, w
-    ORDER BY r.window
+    ORDER BY s1.window
     """
     return query.strip()
 
@@ -120,9 +119,9 @@ def get_window_summary_query(window_idx: int) -> str:
     query = f"""
     // Complete window {window_idx} summary
     MATCH (w:Window {{label: {window_idx}}})
-    OPTIONAL MATCH (w)-[hr:HAS_READING]->(s:Sensor)
-    OPTIONAL MATCH (s1:Sensor)-[r:CORRELATES_WITH {{window: {window_idx}}}]->(s2:Sensor)
-    RETURN w, s, hr, s1, s2, r
+    OPTIONAL MATCH (s:Sensor {{window: {window_idx}}})-[:BELONGS_TO]->(w)
+    OPTIONAL MATCH (s1:Sensor {{window: {window_idx}}})-[r:CORRELATES_WITH]->(s2:Sensor {{window: {window_idx}}})
+    RETURN w, s, s1, s2, r
     """
     return query.strip()
 
@@ -140,11 +139,10 @@ def get_faulty_sensors_query(window_idx: int) -> str:
     query = f"""
     // Faulty sensors in window {window_idx}
     MATCH (w:Window {{label: {window_idx}}})
-    MATCH (w)-[hr:HAS_READING]->(s:Sensor)
-    WHERE hr.is_faulty = true
-    OPTIONAL MATCH (s)-[r:CORRELATES_WITH {{window: {window_idx}}}]->(s2:Sensor)
-    OPTIONAL MATCH (s3:Sensor)-[r2:CORRELATES_WITH {{window: {window_idx}}}]->(s)
-    RETURN w, s, hr, s2, r, s3, r2
+    MATCH (s:Sensor {{window: {window_idx}, is_faulty: true}})-[:BELONGS_TO]->(w)
+    OPTIONAL MATCH (s)-[r:CORRELATES_WITH]->(s2:Sensor {{window: {window_idx}}})
+    OPTIONAL MATCH (s3:Sensor {{window: {window_idx}}})-[r2:CORRELATES_WITH]->(s)
+    RETURN w, s, s2, r, s3, r2
     """
     return query.strip()
 
@@ -167,9 +165,9 @@ def visualize_window_network(window_idx: int, driver: neo4j.Driver,
         # Query window data
         result = session.run("""
             MATCH (w:Window {label: $window_idx})
-            MATCH (w)-[hr:HAS_READING]->(s:Sensor)
-            OPTIONAL MATCH (s1:Sensor)-[r:CORRELATES_WITH {window: $window_idx}]->(s2:Sensor)
-            RETURN s, hr, s1, s2, r
+            MATCH (s:Sensor {window: $window_idx})-[:BELONGS_TO]->(w)
+            OPTIONAL MATCH (s1:Sensor {window: $window_idx})-[r:CORRELATES_WITH]->(s2:Sensor {window: $window_idx})
+            RETURN s, s1, s2, r
         """, window_idx=window_idx)
         
         # Build NetworkX graph
@@ -182,8 +180,8 @@ def visualize_window_network(window_idx: int, driver: neo4j.Driver,
             sensor = record.get('s')
             if sensor:
                 sensor_name = sensor['name']
-                is_faulty = record.get('hr', {}).get('is_faulty', False)
-                anomaly_score = record.get('hr', {}).get('anomaly_score', 0.0)
+                is_faulty = sensor.get('is_faulty', False)
+                anomaly_score = sensor.get('anomaly_score', 0.0)
                 
                 G.add_node(sensor_name)
                 sensor_colors[sensor_name] = 'red' if is_faulty else 'lightblue'
@@ -198,13 +196,13 @@ def visualize_window_network(window_idx: int, driver: neo4j.Driver,
                 s1_name = s1['name']
                 s2_name = s2['name']
                 is_violation = r.get('is_violation', False)
-                correlation = r.get('correlation', 0.0)
+                actual_correlation = r.get('actual_correlation', 0.0)
                 
                 if not G.has_edge(s1_name, s2_name):
                     G.add_edge(s1_name, s2_name, 
-                             weight=abs(correlation),
+                             weight=abs(actual_correlation),
                              is_violation=is_violation,
-                             correlation=correlation)
+                             correlation=actual_correlation)
         
         # Create visualization
         plt.figure(figsize=figsize)
@@ -312,11 +310,11 @@ def visualize_correlation_heatmap(window_idx: int, driver: neo4j.Driver,
     with driver.session() as session:
         # Query correlations
         result = session.run("""
-            MATCH (s1:Sensor)-[r:CORRELATES_WITH {window: $window_idx}]->(s2:Sensor)
-            RETURN s1.name AS sensor1, s2.name AS sensor2, 
-                   r.correlation AS correlation,
+            MATCH (s1:Sensor {window: $window_idx})-[r:CORRELATES_WITH]->(s2:Sensor {window: $window_idx})
+            RETURN s1.base_sensor_name AS sensor1, s2.base_sensor_name AS sensor2, 
+                   r.actual_correlation AS correlation,
                    r.is_violation AS is_violation
-            ORDER BY s1.name, s2.name
+            ORDER BY s1.base_sensor_name, s2.base_sensor_name
         """, window_idx=window_idx)
         
         # Build correlation matrix
@@ -389,12 +387,14 @@ def visualize_violations_over_time(start_window: int, end_window: int,
         # Query violations over time
         result = session.run("""
             MATCH (s1:Sensor)-[r:CORRELATES_WITH]->(s2:Sensor)
-            WHERE r.window >= $start AND r.window <= $end AND r.is_violation = true
-            RETURN r.window AS window, 
+            WHERE s1.window >= $start AND s1.window <= $end 
+              AND s1.window = s2.window
+              AND r.is_violation = true
+            RETURN s1.window AS window, 
                    COUNT(*) AS violation_count,
                    AVG(r.deviation) AS avg_deviation,
                    MAX(r.deviation) AS max_deviation
-            ORDER BY r.window
+            ORDER BY s1.window
         """, start=start_window, end=end_window)
         
         windows = []

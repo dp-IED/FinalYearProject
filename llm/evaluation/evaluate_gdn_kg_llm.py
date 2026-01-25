@@ -28,13 +28,16 @@ sys.path.insert(0, str(project_root / 'anomaly-detection'))
 sys.path.insert(0, str(project_root))
 
 from gdn_processor import GDNPredictor
-from llm.helpers.KG import KnowledgeGraphBuilder, EXPECTED_CORRELATIONS, SENSOR_SUBSYSTEMS
+from llm.helpers.KG import KnowledgeGraphBuilder, EXPECTED_CORRELATIONS, SENSOR_SUBSYSTEMS, compute_window_similarity
 from llm.evaluation.evaluate_llm_baseline import (
     load_llm_model,
     call_llm,
     parse_llm_response,
     format_window_for_llm
 )
+from llm.kag.graphdb import Neo4jLoader
+from llm.kag.solver_v2 import KAGIterativeSolver
+from llm.kag.neo4j_queries import Neo4jKAGQueries
 from metrics import compute_all_metrics, format_metrics_report
 
 
@@ -97,50 +100,91 @@ def extract_window_kg_context(
     for sensor_name in kg_builder.sensor_names:
         desc = sensor_descriptions.get(sensor_name, {})
         subsystem = SENSOR_SUBSYSTEMS.get(sensor_name, 'Unknown')
+        # Use prediction threshold (0.5) instead of ground truth check
+        # anomaly_score is now GDN prediction, not ground truth label
+        prediction_threshold = 0.5
+        stat = window_stats.get(sensor_name)
+        is_faulty = stat.anomaly_score > prediction_threshold if stat else False
+        
         entity_info = {
             'name': sensor_name,
             'type': 'Sensor',
             'subsystem': subsystem,
             'description': desc.get('description', ''),
-            'is_faulty': window_stats.get(sensor_name, {}).anomaly_score > 0 if sensor_name in window_stats else False
+            'is_faulty': is_faulty  # Based on GDN prediction threshold, not ground truth
         }
         context['entities'].append(entity_info)
     
     # Extract relationships from current window
-    # Include all violations and relationships involving anomalous sensors
+    # Include all violations and relationships involving sensors with high GDN prediction scores
     # Also include significant correlations (threshold 0.3)
     correlation_threshold = 0.3
-    anomalous_sensors = {sensor_name for sensor_name, stat in window_stats.items() if stat.anomaly_score > 0}
+    prediction_threshold = 0.5  # Threshold for GDN predictions (not ground truth)
+    anomalous_sensors = {sensor_name for sensor_name, stat in window_stats.items() 
+                        if stat.anomaly_score > prediction_threshold}  # Based on GDN predictions
     
     for u, v, data in window_graph.edges(data=True):
         edge_type = data.get('edge_type', 'correlates_with')
-        correlation = data.get('correlation', 0)
-        expected_correlation = data.get('expected_correlation', 0)
-        deviation = data.get('correlation_deviation', 0)
+        
+        # Support both old and new attribute formats for backward compatibility
+        correlation = data.get('correlation', 0)  # Old format (preserved)
+        correlation_strength = data.get('correlation_strength', abs(correlation))  # New format
+        correlation_direction = data.get('correlation_direction', 'positive' if correlation > 0 else 'negative')
+        
+        # Domain knowledge expectations (new format)
+        violates_domain = data.get('violates_domain_expectation', False)
+        domain_expected_type = data.get('domain_expected_type', None)
+        domain_expected_strength = data.get('domain_expected_strength', None)
+        
+        # GDN expectations (new format)
+        expected_correlation_gdn = data.get('expected_correlation_gdn', data.get('expected_correlation', 0))  # Fallback to old format
+        deviation_from_gdn = data.get('deviation_from_gdn', data.get('correlation_deviation', 0))  # Fallback to old format
+        violates_gdn = data.get('violates_gdn_expectation', False)
+        
+        # GDN scores
+        gdn_score_source = data.get('gdn_score_source', 0)
+        gdn_score_target = data.get('gdn_score_target', 0)
+        potential_fault_indicator = data.get('potential_fault_indicator', False)
         
         # Include if:
-        # 1. It's a violation (always important)
+        # 1. It's a violation (domain or GDN expectation violated)
         # 2. It involves an anomalous sensor (contextual information)
         # 3. It's a significant correlation (above threshold)
-        is_violation = edge_type == 'violates_expected_relation'
+        # 4. It's a potential fault indicator
+        is_violation = violates_domain or violates_gdn
         involves_anomaly = u in anomalous_sensors or v in anomalous_sensors
-        is_significant = abs(correlation) >= correlation_threshold
+        is_significant = correlation_strength >= correlation_threshold
         
-        if not (is_violation or involves_anomaly or is_significant):
+        if not (is_violation or involves_anomaly or is_significant or potential_fault_indicator):
             continue
         
         relationship = {
             'source': u,
             'target': v,
             'relation': edge_type,
-            'correlation': float(correlation),
-            'expected_correlation': float(expected_correlation),
-            'deviation': float(deviation)
+            'correlation': float(correlation),  # Preserved for backward compatibility
+            'correlation_strength': float(correlation_strength),
+            'correlation_direction': correlation_direction,
+            'expected_correlation_gdn': float(expected_correlation_gdn),
+            'deviation_from_gdn': float(deviation_from_gdn),
+            'violates_domain_expectation': violates_domain,
+            'violates_gdn_expectation': violates_gdn,
+            'gdn_score_source': float(gdn_score_source),
+            'gdn_score_target': float(gdn_score_target),
+            'potential_fault_indicator': potential_fault_indicator
         }
+        
+        # Add domain knowledge if available
+        if domain_expected_type:
+            relationship['domain_expected_type'] = domain_expected_type
+        if domain_expected_strength:
+            relationship['domain_expected_strength'] = domain_expected_strength
+        if 'violation_type' in data:
+            relationship['violation_type'] = data['violation_type']
         
         context['relationships'].append(relationship)
         
-        # Track violations separately
+        # Track violations separately (both domain and GDN violations)
         if is_violation:
             context['violations'].append(relationship)
     
@@ -154,8 +198,10 @@ def extract_window_kg_context(
                 'anomaly_scores': {}
             }
             
+            # Use prediction threshold (0.5) for GDN predictions, not ground truth
+            prediction_threshold = 0.5
             for sensor_name, stat in prev_stats.items():
-                if stat.anomaly_score > 0:
+                if stat.anomaly_score > prediction_threshold:  # Based on GDN prediction threshold
                     temporal_info['faulty_sensors'].append(sensor_name)
                     temporal_info['anomaly_scores'][sensor_name] = float(stat.anomaly_score)
             
@@ -211,11 +257,9 @@ def format_kg_context_for_llm(
     """
     lines = []
     lines.append("Knowledge Graph Representation:")
-    lines.append("=" * 80)
     
     # All entities with their status and metadata
     lines.append("\nENTITIES:")
-    lines.append("-" * 80)
     for entity in kg_context['entities']:
         status = "⚠️ ANOMALOUS" if entity.get('is_faulty') else "✓ Normal"
         lines.append(f"{status}: {entity['name']}")
@@ -225,33 +269,75 @@ def format_kg_context_for_llm(
     
     # All relationships (not filtered - show all significant ones)
     lines.append("\nRELATIONSHIPS:")
-    lines.append("-" * 80)
     if kg_context['relationships']:
         for rel in kg_context['relationships']:
             rel_type = rel['relation']
             source = rel['source']
             target = rel['target']
             corr = rel.get('correlation', 0)
-            exp_corr = rel.get('expected_correlation', 0)
             
-            if rel_type == 'violates_expected_relation':
-                dev = rel.get('deviation', 0)
-                lines.append(f"⚠️ VIOLATION: {source} --[{rel_type}]--> {target}")
-                lines.append(f"  Expected correlation: {exp_corr:.3f}")
-                lines.append(f"  Actual correlation: {corr:.3f}")
-                lines.append(f"  Deviation: {dev:.3f}")
+            # Check for violations (domain or GDN expectations)
+            violates_domain = rel.get('violates_domain_expectation', False)
+            violates_gdn = rel.get('violates_gdn_expectation', False)
+            correlation_direction = rel.get('correlation_direction', 'positive')
+            correlation_strength = rel.get('correlation_strength', abs(corr))
+            potential_fault = rel.get('potential_fault_indicator', False)
+            
+            if violates_domain or violates_gdn:
+                # Violation detected
+                violation_types = []
+                if violates_domain:
+                    violation_types.append('domain expectation')
+                if violates_gdn:
+                    violation_types.append('GDN expectation')
+                
+                violation_type_detail = rel.get('violation_type', 'unknown')
+                lines.append(f"⚠️ VIOLATION ({', '.join(violation_types)}): {source} --[{rel_type}]--> {target}")
+                lines.append(f"  Correlation: {corr:.3f} ({correlation_direction}, strength: {correlation_strength:.3f})")
+                
+                if violates_domain:
+                    domain_type = rel.get('domain_expected_type', 'unknown')
+                    domain_strength = rel.get('domain_expected_strength', 'unknown')
+                    lines.append(f"  Domain expected: {domain_type} ({domain_strength})")
+                    if violation_type_detail != 'unknown':
+                        lines.append(f"  Violation type: {violation_type_detail}")
+                
+                if violates_gdn:
+                    exp_corr_gdn = rel.get('expected_correlation_gdn', 0)
+                    dev_gdn = rel.get('deviation_from_gdn', 0)
+                    lines.append(f"  GDN expected correlation: {exp_corr_gdn:.3f}")
+                    lines.append(f"  Deviation from GDN: {dev_gdn:.3f}")
+                
+                if potential_fault:
+                    gdn_src = rel.get('gdn_score_source', 0)
+                    gdn_tgt = rel.get('gdn_score_target', 0)
+                    lines.append(f"  ⚠️ Potential fault indicator (GDN scores: {gdn_src:.2f}, {gdn_tgt:.2f})")
             else:
+                # Normal relationship
                 lines.append(f"{source} --[{rel_type}]--> {target}")
-                lines.append(f"  Correlation: {corr:.3f}")
-                if exp_corr != 0:
-                    lines.append(f"  Expected correlation: {exp_corr:.3f}")
+                lines.append(f"  Correlation: {corr:.3f} ({correlation_direction}, strength: {correlation_strength:.3f})")
+                
+                # Show domain expectations if available
+                domain_type = rel.get('domain_expected_type')
+                if domain_type:
+                    domain_strength = rel.get('domain_expected_strength', 'unknown')
+                    lines.append(f"  Domain expected: {domain_type} ({domain_strength})")
+                
+                # Show GDN expectations
+                exp_corr_gdn = rel.get('expected_correlation_gdn', 0)
+                if exp_corr_gdn != 0:
+                    lines.append(f"  GDN expected correlation: {exp_corr_gdn:.3f}")
+                
+                if potential_fault:
+                    gdn_src = rel.get('gdn_score_source', 0)
+                    gdn_tgt = rel.get('gdn_score_target', 0)
+                    lines.append(f"  GDN scores: {gdn_src:.2f}, {gdn_tgt:.2f}")
     else:
         lines.append("No significant relationships detected.")
     
     # Temporal context (all relevant previous windows)
     if kg_context['temporal_context']:
         lines.append("\nTEMPORAL CONTEXT:")
-        lines.append("-" * 80)
         for temp in kg_context['temporal_context']:
             lines.append(f"Window {temp['window_idx']}:")
             if temp['faulty_sensors']:
@@ -266,7 +352,6 @@ def format_kg_context_for_llm(
     # Anomaly propagation chains
     if kg_context['anomaly_propagation']:
         lines.append("\nANOMALY PROPAGATION:")
-        lines.append("-" * 80)
         for prop in kg_context['anomaly_propagation']:
             prop_type = prop.get('type', 'unknown')
             root_sensor = prop.get('root_sensor', 'unknown')
@@ -283,6 +368,126 @@ def format_kg_context_for_llm(
                 lines.append(f"  Root sensor: {root_sensor}")
                 if affected:
                     lines.append(f"  Affected sensors in this window: {', '.join(affected)}")
+    
+    lines.append("\n" + "=" * 80)
+    
+    return "\n".join(lines)
+
+
+def format_embedding_context(
+    window_idx: int,
+    kg_builder: KnowledgeGraphBuilder,
+    gds_client=None
+) -> str:
+    """
+    Format embedding-space analysis for LLM prompt.
+    
+    Args:
+        window_idx: Index of the window
+        kg_builder: KnowledgeGraphBuilder instance with window_embeddings
+        gds_client: Optional Neo4j GraphDataScience client for querying similar windows
+    
+    Returns:
+        Formatted markdown string with embedding-space analysis
+    """
+    lines = []
+    
+    # Check if embedding data is available
+    if window_idx not in kg_builder.window_embeddings:
+        return ""
+    
+    embedding_data = kg_builder.window_embeddings[window_idx]
+    dist_normal = embedding_data['dist_normal']
+    dist_anomalous = embedding_data['dist_anomalous']
+    confidence = embedding_data['confidence']
+    
+    # Typical ranges (from plan)
+    normal_mean = 0.085
+    normal_std = 0.03
+    anomalous_mean = 0.138
+    anomalous_std = 0.04
+    
+    # Compute z-scores
+    z_score_normal = (dist_normal - normal_mean) / normal_std if normal_std > 0 else 0.0
+    z_score_anomalous = (dist_anomalous - anomalous_mean) / anomalous_std if anomalous_std > 0 else 0.0
+    
+    lines.append("\nEmbedding Space Analysis:")
+    
+    # Distance to normal center
+    lines.append(f"\nDistance to Normal Center: {dist_normal:.4f}")
+    normal_range_str = f"{normal_mean:.3f} ± {normal_std:.3f}"
+    if dist_normal < normal_mean - normal_std:
+        interpretation = "significantly closer than typical"
+    elif dist_normal < normal_mean + normal_std:
+        interpretation = "within typical normal range"
+    else:
+        interpretation = f"{abs(z_score_normal):.1f} standard deviations above typical"
+    lines.append(f"  Typical normal range: {normal_range_str}")
+    lines.append(f"  Interpretation: {interpretation}")
+    lines.append(f"  Z-score: {z_score_normal:.2f}")
+    
+    # Distance to anomalous center
+    lines.append(f"\nDistance to Anomalous Center: {dist_anomalous:.4f}")
+    anomalous_range_str = f"{anomalous_mean:.3f} ± {anomalous_std:.3f}"
+    if dist_anomalous < anomalous_mean - anomalous_std:
+        interpretation = "significantly closer than typical"
+    elif dist_anomalous < anomalous_mean + anomalous_std:
+        interpretation = "within typical anomalous range"
+    else:
+        interpretation = f"{abs(z_score_anomalous):.1f} standard deviations above typical"
+    lines.append(f"  Typical anomalous range: {anomalous_range_str}")
+    lines.append(f"  Interpretation: {interpretation}")
+    lines.append(f"  Z-score: {z_score_anomalous:.2f}")
+    
+    # Confidence score
+    lines.append(f"\nConfidence Score: {confidence:.3f}")
+    if confidence > 0.7:
+        conf_interpretation = "high confidence (likely normal)"
+    elif confidence > 0.3:
+        conf_interpretation = "moderate confidence (uncertain)"
+    else:
+        conf_interpretation = "low confidence (likely anomalous)"
+    lines.append(f"  Interpretation: {conf_interpretation}")
+    
+    # Query Neo4j for similar anomalous windows if available
+    if gds_client is not None:
+        try:
+            # Query for 3 most similar anomalous windows
+            query = """
+                MATCH (w1:Window {idx: $window_idx})-[s:SIMILAR_TO]->(w2:Window)
+                WHERE w2.predicted_class = "anomalous"
+                OPTIONAL MATCH (w2)-[:BELONGS_TO]->(sensor:Sensor)
+                WHERE sensor.is_faulty = true
+                RETURN DISTINCT w2.idx AS window_idx,
+                       s.similarity AS similarity,
+                       s.distance AS distance,
+                       collect(DISTINCT sensor.base_sensor_name) AS faulty_sensors
+                ORDER BY s.similarity DESC
+                LIMIT 3
+            """
+            
+            with gds_client.driver.session() as session:
+                result = session.run(query, {"window_idx": window_idx})
+                similar_cases = []
+                for record in result:
+                    similar_cases.append({
+                        "window_idx": record["window_idx"],
+                        "similarity": float(record["similarity"]) if record["similarity"] is not None else 0.0,
+                        "distance": float(record["distance"]) if record["distance"] is not None else 0.0,
+                        "faulty_sensors": record["faulty_sensors"] if record["faulty_sensors"] else []
+                    })
+            
+            if similar_cases:
+                lines.append("\nSimilar Anomalous Cases:")
+                for case in similar_cases:
+                    lines.append(f"  Window {case['window_idx']}:")
+                    lines.append(f"    Similarity: {case['similarity']:.3f}, Distance: {case['distance']:.4f}")
+                    if case['faulty_sensors']:
+                        sensors_str = ", ".join(case['faulty_sensors'][:3])  # Limit to 3 sensors
+                        lines.append(f"    Faulty sensors: {sensors_str}")
+        except Exception as e:
+            # If Neo4j query fails, continue without similar cases
+            pass
     
     lines.append("\n" + "=" * 80)
     
@@ -330,15 +535,46 @@ def format_window_with_kg_for_llm(
     lines.append("")
     lines.append(kg_section)
     lines.append("")
-    lines.append("Please analyze this knowledge graph representation and provide:")
-    lines.append("1. List of faulty sensor names (if any)")
-    lines.append("2. Fault type description (e.g., VSS_DROPOUT, COOLANT_DROPOUT, TPS_STUCK, MAF_SCALE_LOW, RPM_SPEED_DECOUPLE, gradual_drift, intermittent_spike, slow_response, bias_offset, electrical_jitter)")
-    lines.append("3. Brief reasoning for your diagnosis")
+    
+    # Add embedding-space explanation if embeddings are available (simplified)
+    if window_idx in kg_builder.window_embeddings:
+        embedding_data = kg_builder.window_embeddings[window_idx]
+        dist_normal = embedding_data['dist_normal']
+        dist_anomalous = embedding_data['dist_anomalous']
+        confidence = embedding_data['confidence']
+        
+        lines.append("Embedding Analysis:")
+        lines.append(f"Distance to normal center: {dist_normal:.3f}")
+        lines.append(f"Distance to anomalous center: {dist_anomalous:.3f}")
+        lines.append(f"Confidence: {confidence:.2f}")
+        if dist_normal < 0.12:
+            lines.append("Interpretation: Likely normal")
+        elif dist_normal > 0.12 and dist_anomalous < 0.15:
+            lines.append("Interpretation: Likely anomalous")
+        else:
+            lines.append("Interpretation: Uncertain/edge case")
+        lines.append("")
+    
+    lines.append("Please analyze this knowledge graph representation and provide your diagnosis.")
     lines.append("")
-    lines.append("Format your response as:")
-    lines.append("Faulty Sensors: [sensor1, sensor2, ...] or None")
-    lines.append("Fault Type: [fault_type]")
-    lines.append("Reasoning: [your analysis]")
+    lines.append("IMPORTANT: You MUST respond with ONLY a valid JSON object. No markdown, no code blocks (no ```), no explanations before or after.")
+    lines.append("")
+    lines.append("Required JSON format:")
+    lines.append('{"faulty_sensors": ["SENSOR_NAME"] or [], "fault_type": "FAULT_TYPE" or null, "reasoning": "explanation", "confidence": 0.85}')
+    lines.append("")
+    lines.append("Example 1 (with fault):")
+    lines.append('{"faulty_sensors": ["VEHICLE_SPEED"], "fault_type": "VSS_DROPOUT", "reasoning": "Vehicle speed sensor shows dropout pattern", "confidence": 0.9}')
+    lines.append("")
+    lines.append("Example 2 (no fault):")
+    lines.append('{"faulty_sensors": [], "fault_type": null, "reasoning": "All sensors appear normal", "confidence": 0.85}')
+    lines.append("")
+    lines.append("Available sensor names:")
+    for name in kg_builder.sensor_names:
+        lines.append(f"  - {name.replace(' ()', '')}")
+    lines.append("")
+    lines.append("Fault types: VSS_DROPOUT, COOLANT_DROPOUT, MAF_SCALE, TPS_STUCK, gradual_drift")
+    lines.append("")
+    lines.append("CRITICAL: Output ONLY the JSON object. Start with { and end with }. No other text.")
     
     return "\n".join(lines)
 
@@ -350,10 +586,15 @@ def evaluate_gdn_kg_llm(
     batch_size: int = 32,
     device: str = 'cpu',
     model_repo: Optional[str] = None,
-    max_tokens: int = 2048,  # Increased for KG-enhanced prompts
+    max_tokens: Optional[int] = None,  # None = no limit (model supports 128k context)
     temperature: float = 0.7,
     use_statistical_features: bool = True,
-    limit: Optional[int] = None
+    limit: Optional[int] = None,
+    use_embeddings: bool = True,
+    neo4j_sync: bool = True,
+    neo4j_uri: str = "bolt://127.0.0.1:7687",
+    neo4j_user: str = "neo4j",
+    neo4j_password: str = "password"
 ) -> Dict[str, any]:
     """
     Evaluate GDN->KG->LLM method on shared dataset.
@@ -365,7 +606,7 @@ def evaluate_gdn_kg_llm(
         batch_size: Batch size for GDN inference
         device: Device to run on ('cuda' or 'cpu')
         model_repo: LLM model repository identifier
-        max_tokens: Maximum tokens for LLM generation
+        max_tokens: Maximum tokens for LLM generation (None = no limit)
         temperature: LLM sampling temperature
         use_statistical_features: Whether to include statistical features in prompts
         limit: Optional limit on number of windows to process (for testing)
@@ -467,8 +708,8 @@ def evaluate_gdn_kg_llm(
     with tqdm(total=1, desc="GDN Data Processing", unit="step") as pbar:
         kg_data = predictor.process_for_kg(
             X_windows=normalized_windows,
-            sensor_labels=sensor_labels_true,
-            window_labels=window_labels_true,
+            sensor_labels=sensor_labels_true,  # Ground truth kept for evaluation only
+            window_labels=window_labels_true,  # Ground truth kept for evaluation only
             batch_size=batch_size
         )
         pbar.update(1)
@@ -477,7 +718,26 @@ def evaluate_gdn_kg_llm(
     print(f"  GDN processing completed in {gdn_time:.2f} seconds")
     print()
     
-    # Build Knowledge Graph (reuse from evaluate_gdn_kg.py)
+    # Extract and store embeddings if available
+    embedding_time = 0.0
+    similarity_edges = None
+    if use_embeddings and 'window_embeddings' in kg_data:
+        print("Extracting and storing window embeddings...")
+        start_time = time.time()
+        
+        window_embeddings = kg_data['window_embeddings']
+        distances_to_normal = kg_data['distances_to_normal']
+        distances_to_anomalous = kg_data['distances_to_anomalous']
+        center_embeddings = kg_data['center_embeddings']
+        
+        # Store embeddings in kg_builder (will be created below)
+        # We'll do this after kg_builder is created
+        
+        embedding_time = time.time() - start_time
+        print(f"  Embeddings extracted in {embedding_time:.2f} seconds")
+        print()
+    
+    # Build Knowledge Graph using GDN predictions (not ground truth labels)
     print("Building Knowledge Graph...")
     start_time = time.time()
     
@@ -489,10 +749,10 @@ def evaluate_gdn_kg_llm(
         )
         pbar.update(0.5)
         
+        # Use GDN predictions (not ground truth) for KG construction
         kg = kg_builder.build_from_gdn_windows(
             X_windows=kg_data['X_windows'],
-            sensor_labels=kg_data['sensor_labels'],
-            window_labels=kg_data['window_labels']
+            gdn_predictions=kg_data['gdn_predictions']  # GDN predictions, not ground truth labels
         )
         pbar.update(0.5)
     
@@ -500,6 +760,87 @@ def evaluate_gdn_kg_llm(
     print(f"  Knowledge Graph built in {kg_time:.2f} seconds")
     print(f"  Nodes: {kg.number_of_nodes()}, Edges: {kg.number_of_edges()}")
     print()
+    
+    # Store embeddings in kg_builder if available
+    if use_embeddings and 'window_embeddings' in kg_data:
+        print("Storing window embeddings in KG builder...")
+        start_time = time.time()
+        
+        for window_idx in range(num_windows):
+            if window_idx < len(window_embeddings):
+                kg_builder.store_window_embeddings(
+                    window_idx,
+                    window_embeddings[window_idx],
+                    distances_to_normal[window_idx],
+                    distances_to_anomalous[window_idx]
+                )
+        
+        print(f"  Stored embeddings for {len(kg_builder.window_embeddings)} windows")
+        print(f"  Embedding storage completed in {time.time() - start_time:.2f} seconds")
+        print()
+        
+        # Compute window similarities
+        print("Computing window similarities...")
+        start_time = time.time()
+        similarity_edges = compute_window_similarity(kg_builder.window_embeddings, k=5)
+        similarity_time = time.time() - start_time
+        print(f"  Computed {len(similarity_edges)} similarity edges in {similarity_time:.2f} seconds")
+        print()
+        
+        # Sync to Neo4j if enabled
+        if neo4j_sync:
+            print("Syncing embeddings to Neo4j...")
+            start_time = time.time()
+            try:
+                loader = Neo4jLoader(uri=neo4j_uri, user=neo4j_user, password=neo4j_password)
+                loader.connect()
+                
+                # Sync embeddings and centers
+                loader.sync_embeddings_to_neo4j(
+                    kg_builder.window_embeddings,
+                    center_embeddings,
+                    gdn_predictions=kg_data['gdn_predictions'],
+                    batch_size=100
+                )
+                
+                # Sync similarity edges
+                if similarity_edges:
+                    loader.sync_similarity_edges_to_neo4j(
+                        similarity_edges,
+                        window_embeddings=kg_builder.window_embeddings,
+                        batch_size=1000
+                    )
+                
+                loader.close()
+                neo4j_time = time.time() - start_time
+                print(f"  Neo4j sync completed in {neo4j_time:.2f} seconds")
+                print()
+            except Exception as e:
+                print(f"  ⚠️  Warning: Neo4j sync failed: {e}")
+                print("  Continuing without Neo4j sync...")
+                print()
+    
+    # Initialize KAG Solver (requires Neo4j)
+    solver = None
+    if neo4j_sync:
+        try:
+            print("Initializing KAG Iterative Solver...")
+            queries = Neo4jKAGQueries(neo4j_uri, neo4j_user, neo4j_password)
+            solver = KAGIterativeSolver(
+                kg_builder=kg_builder,
+                neo4j_queries=queries,
+                sensor_names=sensor_names,
+                model=model,
+                tokenizer=tokenizer,
+                max_iterations=1  # Single iteration for evaluation
+            )
+            print("  ✓ KAG Solver initialized")
+            print()
+        except Exception as e:
+            print(f"  ⚠️  Warning: Failed to initialize KAG Solver: {e}")
+            print("  Falling back to direct LLM approach...")
+            print()
+            solver = None
     
     # Run LLM predictions with KG context
     print("Running LLM predictions with KG context...")
@@ -513,40 +854,141 @@ def evaluate_gdn_kg_llm(
         for window_idx in range(num_windows):
             start_time = time.time()
             
-            # Extract KG context for this window
-            kg_context = extract_window_kg_context(kg_builder, window_idx, temporal_context_windows=2)
-            
-            # Get window data
-            window_data = unnormalized_windows[window_idx]
-            stats = statistical_features[window_idx] if statistical_features is not None and len(statistical_features) > window_idx else None
-            
-            # Format prompt with KG context
-            prompt = format_window_with_kg_for_llm(
-                window_data, sensor_names, kg_context, window_idx, kg_builder,
-                stats, use_statistical_features
-            )
-            
-            # Call LLM with repetition penalty to prevent degenerate output
-            try:
-                response = call_llm(
-                    prompt, 
-                    model, 
-                    tokenizer, 
-                    max_tokens=max_tokens, 
-                    temperature=temperature,
-                    repetition_penalty=1.2,  # Penalize repetition
-                    repetition_context_size=20  # Context window for repetition check
+            # Use KAG Solver if available, otherwise fall back to direct LLM
+            if solver is not None:
+                try:
+                    # Use KAG two-stage approach
+                    result = solver.solve(window_idx)
+                    
+                    # Map solver output to evaluation format
+                    prediction = {
+                        'window_label': result['window_label'],
+                        'sensor_labels': result['sensor_labels'],
+                        'fault_type': result['fault_type'],
+                        'reasoning': result.get('reasoning_trace', [{}])[-1].get('answer', '') if result.get('reasoning_trace') else ''
+                    }
+                    
+                    # Extract reasoning from trace if available
+                    if result.get('reasoning_trace') and len(result['reasoning_trace']) > 0:
+                        last_trace = result['reasoning_trace'][-1]
+                        if 'answer' in last_trace:
+                            prediction['reasoning'] = last_trace['answer'][:500]  # Limit length
+                except Exception as e:
+                    # Fallback to no-fault prediction on solver error
+                    prediction = {
+                        'window_label': 0,
+                        'sensor_labels': np.zeros(len(sensor_names), dtype=np.float32),
+                        'fault_type': None,
+                        'reasoning': f"KAG Solver error: {str(e)}"
+                    }
+            else:
+                # Fallback to direct LLM approach (original method)
+                # Extract KG context for this window
+                kg_context = extract_window_kg_context(kg_builder, window_idx, temporal_context_windows=2)
+                
+                # Get window data
+                window_data = unnormalized_windows[window_idx]
+                stats = statistical_features[window_idx] if statistical_features is not None and len(statistical_features) > window_idx else None
+                
+                # Format prompt with KG context
+                prompt = format_window_with_kg_for_llm(
+                    window_data, sensor_names, kg_context, window_idx, kg_builder,
+                    stats, use_statistical_features
                 )
-                prediction = parse_llm_response(response, sensor_names)
-                prediction['reasoning'] = response[:200]  # Store first 200 chars
-            except Exception as e:
-                # Fallback to no-fault prediction (window_label = 0)
-                prediction = {
-                    'window_label': 0,  # 0 = no fault
-                    'sensor_labels': np.zeros(len(sensor_names), dtype=np.float32),
-                    'fault_type': "unknown",
-                    'reasoning': f"Error: {str(e)}"
-                }
+                
+                # Add embedding context if available
+                if use_embeddings and window_idx in kg_builder.window_embeddings:
+                    try:
+                        # Try to get Neo4j client for similar windows query
+                        gds_client = None
+                        if neo4j_sync:
+                            try:
+                                loader = Neo4jLoader(uri=neo4j_uri, user=neo4j_user, password=neo4j_password)
+                                loader.connect()
+                                gds_client = loader
+                            except Exception:
+                                pass  # Continue without Neo4j client
+                        
+                        embedding_context = format_embedding_context(window_idx, kg_builder, gds_client)
+                        if embedding_context:
+                            prompt += "\n\n" + embedding_context
+                        
+                        if gds_client:
+                            gds_client.close()
+                    except Exception:
+                        # If embedding context fails, continue without it
+                        pass
+                
+                # Call LLM with repetition penalty to prevent degenerate output
+                try:
+                    # Check prompt length and warn if too long
+                    prompt_tokens_est = len(prompt.split())  # Rough estimate
+                    if prompt_tokens_est > 2000:
+                        print(f"  ⚠️  Warning: Prompt is very long (~{prompt_tokens_est} tokens)")
+                    
+                    # Model supports 128k tokens - no max_tokens limit
+                    # The prompt will be handled by the model's context window
+                    call_kwargs = {
+                        "temperature": 0.3,  # Lower temperature for more deterministic JSON output
+                        "repetition_penalty": 1.2,  # Moderate penalty (1.5 was too aggressive)
+                        "repetition_context_size": 32  # Moderate context window
+                    }
+                    if max_tokens is not None:
+                        call_kwargs["max_tokens"] = max_tokens
+                    response = call_llm(
+                        prompt, 
+                        model, 
+                        tokenizer, 
+                        **call_kwargs
+                    )
+                    
+                    # Check if response looks valid (has JSON structure)
+                    has_json_structure = '{' in response and '}' in response
+                    # Check for repetitive patterns (same char repeated many times)
+                    response_start = response[:200].strip()
+                    is_repetitive = (
+                        len(set(response_start)) < 5 and len(response_start) > 20
+                    ) or (
+                        response_start.count(response_start[0] if response_start else '') > len(response_start) * 0.8
+                    )
+                    
+                    if is_repetitive and not has_json_structure:
+                        # Response is degenerate - try to extract any valid JSON first
+                        import re
+                        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response, re.DOTALL)
+                        if json_match:
+                            try:
+                                # Try to parse the JSON even if response is repetitive
+                                prediction = parse_llm_response(json_match.group(0), sensor_names)
+                                prediction['reasoning'] = f"Extracted JSON from repetitive response: {response[:200]}"
+                            except:
+                                # Fallback
+                                prediction = {
+                                    'window_label': 0,
+                                    'sensor_labels': np.zeros(len(sensor_names), dtype=np.float32),
+                                    'fault_type': None,
+                                    'reasoning': f"LLM response was degenerate (repetitive output): {response[:100]}"
+                                }
+                        else:
+                            # No JSON found - use fallback
+                            print(f"  ⚠️  Window {window_idx}: Degenerate LLM response detected, using fallback")
+                            prediction = {
+                                'window_label': 0,
+                                'sensor_labels': np.zeros(len(sensor_names), dtype=np.float32),
+                                'fault_type': None,
+                                'reasoning': f"LLM response was degenerate (repetitive output): {response[:100]}"
+                            }
+                    else:
+                        prediction = parse_llm_response(response, sensor_names)
+                        prediction['reasoning'] = response[:500]  # Store first 500 chars for debugging
+                except Exception as e:
+                    # Fallback to no-fault prediction (window_label = 0)
+                    prediction = {
+                        'window_label': 0,  # 0 = no fault
+                        'sensor_labels': np.zeros(len(sensor_names), dtype=np.float32),
+                        'fault_type': None,
+                        'reasoning': f"Error: {str(e)}"
+                    }
             
             window_labels_pred.append(prediction['window_label'])
             sensor_labels_pred.append(prediction['sensor_labels'])
@@ -558,6 +1000,13 @@ def evaluate_gdn_kg_llm(
             if (window_idx + 1) % 10 == 0:
                 avg_time = np.mean(processing_times[-10:]) if len(processing_times) >= 10 else np.mean(processing_times)
                 pbar.set_postfix({"avg_time": f"{avg_time:.2f}s"})
+    
+    # Cleanup solver if it was initialized
+    if solver is not None and hasattr(solver, 'queries') and hasattr(solver.queries, 'close'):
+        try:
+            solver.queries.close()
+        except Exception:
+            pass
     
     window_labels_pred = np.array(window_labels_pred)
     sensor_labels_pred = np.array(sensor_labels_pred)
@@ -669,8 +1118,9 @@ def main():
     parser.add_argument(
         '--max-tokens',
         type=int,
-        default=2048,
-        help='Maximum tokens for LLM generation (default: 2048 for KG-enhanced prompts)'
+        default=None,
+        nargs='?',
+        help='Maximum tokens for LLM generation (default: None = no limit, model supports up to 128k context)'
     )
     parser.add_argument(
         '--temperature',
@@ -689,6 +1139,48 @@ def main():
         default=None,
         help='Limit number of windows to process (for testing)'
     )
+    parser.add_argument(
+        '--use-embeddings',
+        action='store_true',
+        default=True,
+        help='Enable embedding extraction and similarity computation (default: True)'
+    )
+    parser.add_argument(
+        '--no-embeddings',
+        dest='use_embeddings',
+        action='store_false',
+        help='Disable embedding extraction'
+    )
+    parser.add_argument(
+        '--neo4j-sync',
+        action='store_true',
+        default=True,
+        help='Sync embeddings to Neo4j (default: True)'
+    )
+    parser.add_argument(
+        '--no-neo4j-sync',
+        dest='neo4j_sync',
+        action='store_false',
+        help='Disable Neo4j sync (NOTE: KAG Solver requires Neo4j - will fall back to direct LLM if disabled)'
+    )
+    parser.add_argument(
+        '--neo4j-uri',
+        type=str,
+        default='bolt://127.0.0.1:7687',
+        help='Neo4j connection URI'
+    )
+    parser.add_argument(
+        '--neo4j-user',
+        type=str,
+        default='neo4j',
+        help='Neo4j username'
+    )
+    parser.add_argument(
+        '--neo4j-password',
+        type=str,
+        default='password',
+        help='Neo4j password'
+    )
     
     args = parser.parse_args()
     
@@ -702,7 +1194,12 @@ def main():
         max_tokens=args.max_tokens,
         temperature=args.temperature,
         use_statistical_features=not args.no_statistical_features,
-        limit=args.limit
+        limit=args.limit,
+        use_embeddings=args.use_embeddings,
+        neo4j_sync=args.neo4j_sync,
+        neo4j_uri=args.neo4j_uri,
+        neo4j_user=args.neo4j_user,
+        neo4j_password=args.neo4j_password
     )
 
 

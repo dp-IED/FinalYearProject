@@ -88,7 +88,7 @@ def extract_predictions_from_kg(
         window_labels[window_idx] = sensor_labels_to_window_label(sensor_labels[window_idx])
         
         # Determine fault type from KG relationships
-        fault_type = "unknown"
+        fault_type = None  # No fault type if no fault
         if window_labels[window_idx] > 0:
             # Check for relationship violations
             violations = []
@@ -226,8 +226,8 @@ def evaluate_gdn_kg(
     with tqdm(total=1, desc="GDN Data Processing", unit="step") as pbar:
         kg_data = predictor.process_for_kg(
             X_windows=normalized_windows,
-            sensor_labels=sensor_labels_true,  # Use ground truth for KG construction
-            window_labels=window_labels_true,
+            sensor_labels=sensor_labels_true,  # Ground truth kept for evaluation only
+            window_labels=window_labels_true,  # Ground truth kept for evaluation only
             batch_size=batch_size
         )
         pbar.update(1)
@@ -236,7 +236,7 @@ def evaluate_gdn_kg(
     print(f"  GDN processing completed in {gdn_time:.2f} seconds")
     print()
     
-    # Build Knowledge Graph
+    # Build Knowledge Graph using GDN predictions (not ground truth labels)
     print("Building Knowledge Graph...")
     start_time = time.time()
     
@@ -248,10 +248,10 @@ def evaluate_gdn_kg(
         )
         pbar.update(0.5)
         
+        # Use GDN predictions (not ground truth) for KG construction
         kg = kg_builder.build_from_gdn_windows(
             X_windows=kg_data['X_windows'],
-            sensor_labels=kg_data['sensor_labels'],
-            window_labels=kg_data['window_labels']
+            gdn_predictions=kg_data['gdn_predictions']  # GDN predictions, not ground truth labels
         )
         pbar.update(0.5)
     

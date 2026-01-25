@@ -9,11 +9,13 @@ Provides metrics for:
 """
 
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
-    confusion_matrix, classification_report
+    confusion_matrix, classification_report, roc_auc_score
 )
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 
 def compute_window_level_metrics(
@@ -179,8 +181,10 @@ def compute_per_fault_type_metrics(
     Returns:
         Dictionary with metrics per fault type
     """
-    unique_fault_types = np.unique(fault_types)
-    unique_fault_types = [ft for ft in unique_fault_types if ft is not None and ft != '']
+    # Filter out None and empty strings before getting unique values
+    # (numpy.unique doesn't work well with None in object arrays)
+    valid_fault_types = [ft for ft in fault_types if ft is not None and ft != '']
+    unique_fault_types = list(set(valid_fault_types)) if valid_fault_types else []
     
     per_fault_metrics = {}
     
@@ -239,8 +243,28 @@ def compute_confusion_matrices(
     if y_true_window is not None and y_pred_window is not None:
         y_true_window = y_true_window.astype(int)
         y_pred_window = y_pred_window.astype(int)
-        # Multi-class confusion matrix (9 classes: 0-8)
-        window_cm = confusion_matrix(y_true_window, y_pred_window, labels=list(range(9)))
+        # Get unique labels that actually exist in TRUE labels (sklearn requires at least one label in y_true)
+        # Convert to Python int to avoid type mismatch issues
+        unique_true_labels = sorted([int(l) for l in set(y_true_window)])
+        # Filter to only include valid labels (0-8) that exist in true labels
+        all_possible_labels = list(range(9))
+        labels_to_use = [l for l in all_possible_labels if l in unique_true_labels]
+        
+        if len(labels_to_use) > 0:
+            # Multi-class confusion matrix (only for labels that exist in y_true)
+            # Ensure labels are Python ints, not numpy types
+            labels_to_use = [int(l) for l in labels_to_use]
+            window_cm = confusion_matrix(y_true_window, y_pred_window, labels=labels_to_use)
+        else:
+            # Fallback: use all labels that exist in y_true (no filtering to 0-8)
+            # This handles edge cases where labels might be outside 0-8 range
+            if len(unique_true_labels) > 0:
+                # Convert to Python ints
+                unique_true_labels = [int(l) for l in unique_true_labels]
+                window_cm = confusion_matrix(y_true_window, y_pred_window, labels=unique_true_labels)
+            else:
+                # Last resort: no labels specified (sklearn will infer)
+                window_cm = confusion_matrix(y_true_window, y_pred_window)
     else:
         # Fallback: binary window-level (for backward compatibility)
         window_true = (y_true_sensor.sum(axis=1) > 0).astype(int)
@@ -311,10 +335,14 @@ def compute_all_metrics(
     )
     
     # Per-fault-type metrics
-    if fault_types is not None:
-        metrics['per_fault_type'] = compute_per_fault_type_metrics(
-            y_true_sensor, y_pred_sensor, fault_types, sensor_names
-        )
+    if fault_types is not None and len(fault_types) > 0:
+        try:
+            metrics['per_fault_type'] = compute_per_fault_type_metrics(
+                y_true_sensor, y_pred_sensor, fault_types, sensor_names
+            )
+        except Exception as e:
+            # If fault type metrics fail, continue without them
+            pass
     
     return metrics
 
@@ -400,3 +428,214 @@ def format_metrics_report(metrics: Dict[str, any]) -> str:
     lines.append("="*80)
     
     return "\n".join(lines)
+
+
+def compute_embedding_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    distances_to_normal: np.ndarray,
+    distances_to_anomalous: np.ndarray
+) -> Dict[str, float]:
+    """
+    Compute embedding-based metrics.
+    
+    Args:
+        y_true: (N,) binary array - true labels (0=normal, 1=anomalous)
+        y_pred: (N,) binary array - predicted labels (0=normal, 1=anomalous)
+        distances_to_normal: (N,) array - distances to normal center
+        distances_to_anomalous: (N,) array - distances to anomalous center
+    
+    Returns:
+        Dictionary with embedding metrics
+    """
+    y_true = y_true.astype(int)
+    y_pred = y_pred.astype(int)
+    
+    # Distance separation: mean(dist_anomalous) - mean(dist_normal)
+    normal_mask = y_true == 0
+    anomalous_mask = y_true == 1
+    
+    if normal_mask.any() and anomalous_mask.any():
+        mean_dist_normal = float(np.mean(distances_to_normal[normal_mask]))
+        mean_dist_anomalous = float(np.mean(distances_to_anomalous[anomalous_mask]))
+        distance_separation = mean_dist_anomalous - mean_dist_normal
+    else:
+        distance_separation = 0.0
+        mean_dist_normal = 0.0
+        mean_dist_anomalous = 0.0
+    
+    # Distance AUC: ROC AUC using dist_to_normal as score
+    # Higher distance = more anomalous, so use negative distance for AUC
+    try:
+        if len(np.unique(y_true)) > 1:  # Need both classes
+            distance_auc = float(roc_auc_score(y_true, -distances_to_normal))
+        else:
+            distance_auc = 0.0
+    except Exception:
+        distance_auc = 0.0
+    
+    # Confidence calibration: correlation between confidence and correctness
+    # Confidence = 1 / (1 + exp(dist_normal - dist_anomalous))
+    # Higher confidence when dist_normal < dist_anomalous (closer to normal)
+    confidence_scores = 1.0 / (1.0 + np.exp(distances_to_normal - distances_to_anomalous))
+    correctness = (y_true == y_pred).astype(float)
+    
+    try:
+        confidence_calibration = float(np.corrcoef(confidence_scores, correctness)[0, 1])
+        if np.isnan(confidence_calibration):
+            confidence_calibration = 0.0
+    except Exception:
+        confidence_calibration = 0.0
+    
+    return {
+        'distance_separation': float(distance_separation),
+        'mean_dist_normal': float(mean_dist_normal),
+        'mean_dist_anomalous': float(mean_dist_anomalous),
+        'distance_auc': float(distance_auc),
+        'confidence_calibration': float(confidence_calibration)
+    }
+
+
+def analyze_embedding_errors(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    embeddings: np.ndarray,
+    centers: np.ndarray
+) -> Dict[str, Any]:
+    """
+    Analyze embedding-space characteristics of prediction errors.
+    
+    Args:
+        y_true: (N,) binary array - true labels
+        y_pred: (N,) binary array - predicted labels
+        embeddings: (N, hidden_dim) array - window embeddings
+        centers: (2, hidden_dim) array - class centers [normal, anomalous]
+    
+    Returns:
+        Dictionary with error analysis
+    """
+    y_true = y_true.astype(int)
+    y_pred = y_pred.astype(int)
+    
+    # Find errors
+    false_positives = (y_true == 0) & (y_pred == 1)
+    false_negatives = (y_true == 1) & (y_pred == 0)
+    
+    normal_center = centers[0]
+    anomalous_center = centers[1]
+    
+    # Compute distances for errors
+    fp_distances_normal = []
+    fp_distances_anomalous = []
+    fn_distances_normal = []
+    fn_distances_anomalous = []
+    
+    if false_positives.any():
+        fp_embeddings = embeddings[false_positives]
+        fp_distances_normal = [
+            float(np.linalg.norm(emb - normal_center)) for emb in fp_embeddings
+        ]
+        fp_distances_anomalous = [
+            float(np.linalg.norm(emb - anomalous_center)) for emb in fp_embeddings
+        ]
+    
+    if false_negatives.any():
+        fn_embeddings = embeddings[false_negatives]
+        fn_distances_normal = [
+            float(np.linalg.norm(emb - normal_center)) for emb in fn_embeddings
+        ]
+        fn_distances_anomalous = [
+            float(np.linalg.norm(emb - anomalous_center)) for emb in fn_embeddings
+        ]
+    
+    # Determine which center errors are closer to
+    fp_closer_to_normal = sum(1 for d_n, d_a in zip(fp_distances_normal, fp_distances_anomalous) if d_n < d_a)
+    fp_closer_to_anomalous = len(fp_distances_normal) - fp_closer_to_normal
+    
+    fn_closer_to_normal = sum(1 for d_n, d_a in zip(fn_distances_normal, fn_distances_anomalous) if d_n < d_a)
+    fn_closer_to_anomalous = len(fn_distances_normal) - fn_closer_to_normal
+    
+    return {
+        'num_false_positives': int(false_positives.sum()),
+        'num_false_negatives': int(false_negatives.sum()),
+        'fp_mean_dist_normal': float(np.mean(fp_distances_normal)) if fp_distances_normal else 0.0,
+        'fp_mean_dist_anomalous': float(np.mean(fp_distances_anomalous)) if fp_distances_anomalous else 0.0,
+        'fn_mean_dist_normal': float(np.mean(fn_distances_normal)) if fn_distances_normal else 0.0,
+        'fn_mean_dist_anomalous': float(np.mean(fn_distances_anomalous)) if fn_distances_anomalous else 0.0,
+        'fp_closer_to_normal': int(fp_closer_to_normal),
+        'fp_closer_to_anomalous': int(fp_closer_to_anomalous),
+        'fn_closer_to_normal': int(fn_closer_to_normal),
+        'fn_closer_to_anomalous': int(fn_closer_to_anomalous),
+        'error_analysis': {
+            'false_positives': {
+                'closer_to_normal': fp_closer_to_normal > fp_closer_to_anomalous,
+                'mean_dist_normal': float(np.mean(fp_distances_normal)) if fp_distances_normal else 0.0,
+                'mean_dist_anomalous': float(np.mean(fp_distances_anomalous)) if fp_distances_anomalous else 0.0
+            },
+            'false_negatives': {
+                'closer_to_normal': fn_closer_to_normal > fn_closer_to_anomalous,
+                'mean_dist_normal': float(np.mean(fn_distances_normal)) if fn_distances_normal else 0.0,
+                'mean_dist_anomalous': float(np.mean(fn_distances_anomalous)) if fn_distances_anomalous else 0.0
+            }
+        }
+    }
+
+
+def plot_distance_distributions(
+    distances_normal_class: np.ndarray,
+    distances_anomalous_class: np.ndarray,
+    save_path: Optional[str] = None
+) -> plt.Figure:
+    """
+    Plot histogram of distance distributions for each true class.
+    
+    Args:
+        distances_normal_class: (N_normal,) array - distances to normal center for normal windows
+        distances_anomalous_class: (N_anomalous,) array - distances to anomalous center for anomalous windows
+        save_path: Optional path to save figure
+    
+    Returns:
+        matplotlib Figure object
+    """
+    sns.set_style("whitegrid")
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # Plot histograms
+    ax.hist(
+        distances_normal_class,
+        bins=30,
+        alpha=0.6,
+        color='blue',
+        label=f'Normal Windows (N={len(distances_normal_class)})',
+        edgecolor='darkblue'
+    )
+    
+    ax.hist(
+        distances_anomalous_class,
+        bins=30,
+        alpha=0.6,
+        color='red',
+        label=f'Anomalous Windows (N={len(distances_anomalous_class)})',
+        edgecolor='darkred'
+    )
+    
+    # Add vertical lines for mean distances
+    mean_normal = np.mean(distances_normal_class) if len(distances_normal_class) > 0 else 0.0
+    mean_anomalous = np.mean(distances_anomalous_class) if len(distances_anomalous_class) > 0 else 0.0
+    
+    ax.axvline(mean_normal, color='blue', linestyle='--', linewidth=2, label=f'Mean Normal: {mean_normal:.3f}')
+    ax.axvline(mean_anomalous, color='red', linestyle='--', linewidth=2, label=f'Mean Anomalous: {mean_anomalous:.3f}')
+    
+    ax.set_xlabel('Distance to Class Center', fontsize=12)
+    ax.set_ylabel('Frequency', fontsize=12)
+    ax.set_title('Distribution of Distances to Class Centers', fontsize=14, fontweight='bold')
+    ax.legend(loc='upper right', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"  ✓ Saved distance distribution plot to {save_path}")
+    
+    return fig

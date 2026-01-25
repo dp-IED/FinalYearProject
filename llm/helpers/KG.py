@@ -9,6 +9,8 @@ import numpy as np
 import networkx as nx
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
+from scipy.spatial.distance import cdist
+from sklearn.metrics.pairwise import cosine_similarity
 
 
 # ============================================================================
@@ -338,6 +340,32 @@ class KnowledgeGraphBuilder:
     
     Processes windows sequentially, builds sensor relationships within each window,
     tracks relationships across consecutive windows, and monitors anomaly propagation.
+    
+    Edge Types:
+    - 'correlates_with': All correlations between sensors (single edge type with rich attributes)
+      Attributes include:
+        - correlation_strength: Absolute value of correlation (0-1)
+        - correlation_direction: 'positive' or 'negative'
+        - domain_expected_type: Domain knowledge expectation type (if exists)
+        - domain_expected_strength: 'strong', 'moderate', or 'weak' (if exists)
+        - violates_domain_expectation: Boolean flag for domain knowledge violations
+        - expected_correlation_gdn: GDN-learned expected correlation
+        - deviation_from_gdn: Difference from GDN expectation
+        - violates_gdn_expectation: Boolean flag for GDN expectation violations
+        - gdn_score_source: GDN anomaly prediction for source sensor
+        - gdn_score_target: GDN anomaly prediction for target sensor
+        - potential_fault_indicator: Boolean flag when violations + high GDN scores
+    
+    - 'correlation_evolution': Temporal edges tracking correlation changes across windows
+      Attributes include:
+        - correlation_change: Change in correlation strength
+        - prev_correlation: Previous window correlation strength
+        - curr_correlation: Current window correlation strength
+        - evolution_type: 'strengthening', 'weakening', or 'stable'
+    
+    - 'temporal_continuation': Connects same sensor across consecutive windows
+    - 'value_change': Tracks significant value changes in sensors
+    - 'anomaly_propagation': Tracks fault propagation based on GDN predictions
     """
     
     def __init__(self, sensor_names: List[str], sensor_embeddings: np.ndarray, 
@@ -364,6 +392,7 @@ class KnowledgeGraphBuilder:
         self.window_stats = {}  # Per-window statistics
         self.temporal_edges = []  # Temporal edges between windows
         self.anomaly_propagation_chains = []  # Fault propagation chains
+        self.window_embeddings = {}  # Per-window embedding data
         
         # Store raw window data for Layer 3 (time-series access)
         self.X_windows = None  # Normalized windows (N, 300, 8)
@@ -388,16 +417,18 @@ class KnowledgeGraphBuilder:
                 fault_injection_eligible=description.get('fault_injection_eligible', False)
             )
     
-    def build_from_gdn_windows(self, X_windows: np.ndarray, sensor_labels: np.ndarray,
-                                window_labels: np.ndarray,
+    def build_from_gdn_windows(self, X_windows: np.ndarray, gdn_predictions: np.ndarray,
                                 X_windows_unnormalized: Optional[np.ndarray] = None) -> nx.MultiDiGraph:
         """
         Main entry point: Build KG by traversing windows temporally.
         
+        Builds knowledge graph from GDN model outputs (predictions), NOT ground truth labels.
+        The KG contains evidence (prediction scores, correlations, statistical features) that
+        the LLM can reason over, not the conclusion (ground truth labels).
+        
         Args:
             X_windows: (num_windows, 300, 8) array - normalized sensor data windows
-            sensor_labels: (num_windows, 8) array - binary fault labels per sensor
-            window_labels: (num_windows,) array - window-level fault labels
+            gdn_predictions: (num_windows, 8) array - GDN anomaly scores (0.0-1.0) per sensor per window
             X_windows_unnormalized: (num_windows, 300, 8) array - unnormalized sensor data windows (optional)
             
         Returns:
@@ -412,51 +443,77 @@ class KnowledgeGraphBuilder:
         # Traverse windows sequentially
         for window_idx in range(num_windows):
             window_data = X_windows[window_idx]  # (300, 8)
-            window_sensor_labels = sensor_labels[window_idx]  # (8,)
-            is_faulty_window = window_labels[window_idx] > 0
+            window_gdn_scores = gdn_predictions[window_idx]  # (8,) - GDN predictions for this window
             
-            # Process this window
-            self._process_window(window_idx, window_data, window_sensor_labels, is_faulty_window)
+            self._process_window(window_idx, window_data, window_gdn_scores)
             
-            # Build temporal edges to previous window
             if window_idx > 0:
                 self._build_temporal_edges(window_idx - 1, window_idx, 
                                          X_windows[window_idx - 1], window_data,
-                                         sensor_labels[window_idx - 1], window_sensor_labels)
+                                         gdn_predictions[window_idx - 1], window_gdn_scores)
         
-        # Track anomaly propagation after processing all windows
-        self._track_anomaly_propagation(sensor_labels)
+        self._track_anomaly_propagation(gdn_predictions)
         
         return self.kg
     
-    def _process_window(self, window_idx: int, window_data: np.ndarray,
-                       sensor_labels: np.ndarray, is_faulty: bool):
+    def store_window_embeddings(
+        self,
+        window_idx: int,
+        embedding: np.ndarray,
+        dist_normal: float,
+        dist_anomalous: float
+    ) -> None:
         """
-        Process a single window:
+        Store window embedding data for a specific window.
+        
+        Args:
+            window_idx: Index of the window
+            embedding: (hidden_dim,) numpy array - window embedding vector
+            dist_normal: Euclidean distance to normal center
+            dist_anomalous: Euclidean distance to anomalous center
+        """
+        # Compute confidence: sigmoid of distance difference
+        # Higher confidence when dist_normal < dist_anomalous (closer to normal)
+        # Lower confidence when dist_normal > dist_anomalous (closer to anomalous)
+        confidence = 1.0 / (1.0 + np.exp(dist_normal - dist_anomalous))
+        
+        self.window_embeddings[window_idx] = {
+            'embedding': embedding.copy(),  # Store copy to avoid reference issues
+            'dist_normal': float(dist_normal),
+            'dist_anomalous': float(dist_anomalous),
+            'confidence': float(confidence)
+        }
+    
+    def _process_window(self, window_idx: int, window_data: np.ndarray,
+                       gdn_scores: np.ndarray):
+        """
+        Process a single window using GDN predictions, not ground truth labels.
+        
         - Compute within-window sensor correlations
         - Compare to expected correlations (from adjacency_matrix)
         - Detect relationship violations
         - Add nodes and edges for this window
+        
+        Args:
+            window_idx: Index of the window
+            window_data: (300, 8) array - normalized sensor data for this window
+            gdn_scores: (8,) array - GDN anomaly prediction scores (0.0-1.0) per sensor
         """
-        # Compute statistical summaries for each sensor in this window
         window_stats = {}
         for sensor_idx, sensor_name in enumerate(self.sensor_names):
             sensor_values = window_data[:, sensor_idx]
             
-            # Compute all statistical properties
             mean_val = float(np.mean(sensor_values))
             std_val = float(np.std(sensor_values))
             variance_val = float(np.var(sensor_values))
             num_zeros_val = int(np.sum(sensor_values == 0))
             
-            # Compute trend (linear regression slope)
             timesteps = np.arange(len(sensor_values))
             if len(sensor_values) > 1 and np.var(timesteps) > 0:
                 trend_val = float(np.polyfit(timesteps, sensor_values, 1)[0])
             else:
                 trend_val = 0.0
             
-            # Compute quartiles
             median_val = float(np.median(sensor_values))
             q25_val = float(np.percentile(sensor_values, 25))
             q75_val = float(np.percentile(sensor_values, 75))
@@ -475,19 +532,18 @@ class KnowledgeGraphBuilder:
                 variation_from_normal=self._compute_variation_from_normal(
                     sensor_name, sensor_values
                 ),
-                anomaly_score=float(sensor_labels[sensor_idx])
+                anomaly_score=float(gdn_scores[sensor_idx])  # GDN prediction, not ground truth
             )
             window_stats[sensor_name] = stats
         
         self.window_stats[window_idx] = window_stats
         
-        # Compute within-window correlation matrix
-        correlation_matrix = np.corrcoef(window_data.T)  # (8, 8)
+        correlation_matrix = np.corrcoef(window_data.T)
         
-        # Build per-window graph
         window_graph = nx.Graph()
         
-        # Add sensor nodes with window-specific attributes
+        # Use prediction threshold (0.5) to determine if sensor is likely anomalous
+        prediction_threshold = 0.5
         for sensor_name, stats in window_stats.items():
             window_graph.add_node(
                 sensor_name,
@@ -497,119 +553,179 @@ class KnowledgeGraphBuilder:
                 min=stats.min,
                 max=stats.max,
                 variation_from_normal=stats.variation_from_normal,
-                is_faulty=bool(stats.anomaly_score > 0)
+                is_faulty=bool(stats.anomaly_score > prediction_threshold)  # Based on GDN prediction threshold
             )
         
-        # Add edges based on correlations and adjacency matrix
         for i, sensor_i in enumerate(self.sensor_names):
             for j, sensor_j in enumerate(self.sensor_names):
                 if i >= j:
                     continue
                 
-                # Get correlation from window data
                 window_corr = correlation_matrix[i, j]
                 
-                # Get expected correlation from GDN adjacency matrix
                 expected_corr = self.adjacency_matrix[i, j]
                 
-                # Infer semantic edge type
                 edge_type, edge_attrs = self._infer_semantic_edge(
                     sensor_i, sensor_j, window_corr, expected_corr, 
                     window_stats[sensor_i], window_stats[sensor_j]
                 )
                 
                 if edge_type:
-                    # Ensure edge_type is in edge_attrs, not duplicated
+                    # Build edge data with new rich attributes
+                    # Preserve 'correlation' for backward compatibility
                     edge_data = {
                         'window_idx': window_idx,
                         'edge_type': edge_type,
-                        'correlation': float(window_corr),
-                        'expected_correlation': float(expected_corr),
-                        'correlation_deviation': float(abs(window_corr - expected_corr)),
-                        **edge_attrs
+                        'correlation': float(window_corr),  # Preserved for backward compatibility
+                        **edge_attrs  # Contains all new rich attributes
                     }
-                    # Remove edge_type from edge_attrs if it's already there
+                    # Ensure edge_type from method takes precedence
                     if 'edge_type' in edge_attrs:
-                        edge_data.pop('edge_type', None)
-                        edge_data['edge_type'] = edge_type  # Use the one we want
+                        edge_data['edge_type'] = edge_attrs['edge_type']
                     
                     window_graph.add_edge(sensor_i, sensor_j, **edge_data)
                     
-                    # Add to main KG with temporal context
                     self.kg.add_edge(sensor_i, sensor_j, **edge_data)
         
         self.window_graphs[window_idx] = window_graph
     
     def _infer_semantic_edge(self, sensor_i: str, sensor_j: str, 
-                            window_corr: float, expected_corr: float,
+                            window_corr: float, expected_corr_gdn: float,
                             stats_i: WindowStats, stats_j: WindowStats) -> Tuple[Optional[str], Dict]:
         """
-        Convert adjacency weights to semantic edge types for a window.
+        Create edges based on observed correlations with semantic labels.
+        
+        Strategy:
+        1. Create edges for ALL significant correlations (baseline: 'correlates_with')
+        2. Add semantic labels from domain knowledge (EXPECTED_CORRELATIONS)
+        3. Flag violations when observed differs from expected (both domain and GDN)
+        
+        This method uses a single edge type ('correlates_with') with rich attributes
+        that capture semantic meaning, rather than multiple edge types. This makes
+        querying simpler and more flexible for LLM reasoning.
+        
+        Args:
+            sensor_i: Name of source sensor
+            sensor_j: Name of target sensor
+            window_corr: Observed correlation coefficient (-1 to 1)
+            expected_corr_gdn: GDN-learned expected correlation from adjacency matrix
+            stats_i: WindowStats for source sensor
+            stats_j: WindowStats for target sensor
         
         Returns:
             (edge_type, edge_attributes) or (None, {}) if no edge should be created
         """
-        # Check if this pair has expected correlation
+        # Filter only invalid/noise correlations
+        if np.isnan(window_corr) or np.isinf(window_corr):
+            return None, {}
+        
+        # Lower threshold to capture more relationships (LLM can reason about significance)
+        corr_threshold = 0.1  # Reduced from 0.2
+        
+        if abs(window_corr) < corr_threshold:
+            return None, {}
+        
+        # Lookup domain knowledge (automotive physics expectations)
         expected_rel = EXPECTED_CORRELATIONS.get((sensor_i, sensor_j)) or \
                        EXPECTED_CORRELATIONS.get((sensor_j, sensor_i))
         
-        # Threshold for considering correlation significant
-        # Based on correlation analysis: captures moderate-to-strong correlations (|r| >= 0.2)
-        # while filtering out weak/noise correlations
-        corr_threshold = 0.2  # Moderate correlation threshold
-        deviation_threshold = 0.2
+        # ===== STEP 1: Determine primary edge type =====
+        # Default: all correlations are 'correlates_with'
+        edge_type = 'correlates_with'
         
-        # Check if correlation is significant (now includes all correlations above threshold)
-        # Filter out NaN, invalid correlations, and correlations that are essentially zero
-        if abs(window_corr) < corr_threshold or np.isnan(window_corr):
-            return None, {}
+        edge_attrs = {
+            'correlation_strength': abs(window_corr),
+            'correlation_direction': 'positive' if window_corr > 0 else 'negative'
+        }
         
-        edge_attrs = {}
-        
-        # Check for relationship violation
+        # ===== STEP 2: Add domain knowledge labels =====
         if expected_rel:
-            expected_type = expected_rel['type']
-            corr_deviation = abs(window_corr - expected_corr)
+            domain_expected_type = expected_rel['type']
+            domain_strength = expected_rel['strength']  # 'strong', 'moderate', 'weak'
             
-            if corr_deviation > deviation_threshold:
-                # Relationship violated
-                edge_type = 'violates_expected_relation'
-                edge_attrs['expected_type'] = expected_type
-                edge_attrs['violation_strength'] = float(corr_deviation)
+            edge_attrs['domain_expected_type'] = domain_expected_type
+            edge_attrs['domain_expected_strength'] = domain_strength
+            
+            # Check if domain expectation is violated
+            # Map strength to threshold
+            strength_thresholds = {
+                'strong': 0.6,    # Strong correlations should be > 0.6
+                'moderate': 0.4,  # Moderate should be > 0.4
+                'weak': 0.2       # Weak should be > 0.2
+            }
+            expected_threshold = strength_thresholds.get(domain_strength, 0.5)
+            
+            # Violation conditions:
+            # 1. Expected positive but observed negative (or vice versa)
+            # 2. Expected strong but observed weak
+            is_sign_mismatch = False
+            if 'increase_with' in domain_expected_type and window_corr < 0:
+                is_sign_mismatch = True
+            
+            is_magnitude_violation = abs(window_corr) < expected_threshold
+            
+            if is_sign_mismatch or is_magnitude_violation:
+                edge_attrs['violates_domain_expectation'] = True
+                edge_attrs['violation_type'] = 'sign_mismatch' if is_sign_mismatch else 'magnitude_too_weak'
             else:
-                # Relationship maintained
-                edge_type = expected_type
-                edge_attrs['expected_type'] = expected_type
+                edge_attrs['violates_domain_expectation'] = False
         else:
-            # General correlation
-            if window_corr > 0:
-                edge_type = 'correlates_with'
-            else:
-                edge_type = 'correlates_with'  # Negative correlation still counts
+            # No domain knowledge for this pair
+            edge_attrs['violates_domain_expectation'] = False
         
-        # Check if edge supports or contradicts fault
-        if stats_i.anomaly_score > 0 or stats_j.anomaly_score > 0:
-            # Check if correlation pattern supports fault hypothesis
-            if expected_rel and abs(window_corr - expected_corr) > deviation_threshold:
-                edge_attrs['supports_fault'] = True
+        # ===== STEP 3: Add GDN model expectation =====
+        deviation_from_gdn = abs(window_corr - expected_corr_gdn)
+        edge_attrs['expected_correlation_gdn'] = float(expected_corr_gdn)
+        edge_attrs['deviation_from_gdn'] = float(deviation_from_gdn)
+        
+        # Flag if GDN expected different pattern
+        gdn_violation_threshold = 0.3
+        if deviation_from_gdn > gdn_violation_threshold:
+            edge_attrs['violates_gdn_expectation'] = True
+        else:
+            edge_attrs['violates_gdn_expectation'] = False
+        
+        # ===== STEP 4: Add GDN anomaly context =====
+        edge_attrs['gdn_score_source'] = float(stats_i.anomaly_score)
+        edge_attrs['gdn_score_target'] = float(stats_j.anomaly_score)
+        
+        # High GDN scores + violation = strong fault evidence (but don't label as "supports_fault")
+        if (edge_attrs.get('violates_domain_expectation', False) or 
+            edge_attrs.get('violates_gdn_expectation', False)):
+            if stats_i.anomaly_score > 0.5 or stats_j.anomaly_score > 0.5:
+                edge_attrs['potential_fault_indicator'] = True
             else:
-                edge_attrs['supports_fault'] = False
+                edge_attrs['potential_fault_indicator'] = False
+        else:
+            edge_attrs['potential_fault_indicator'] = False
         
         edge_attrs['edge_type'] = edge_type
         return edge_type, edge_attrs
     
     def _build_temporal_edges(self, prev_window_idx: int, curr_window_idx: int,
                              prev_window_data: np.ndarray, curr_window_data: np.ndarray,
-                             prev_sensor_labels: np.ndarray, curr_sensor_labels: np.ndarray):
+                             prev_gdn_scores: np.ndarray, curr_gdn_scores: np.ndarray):
         """
-        Build temporal edges connecting consecutive windows:
+        Build temporal edges connecting consecutive windows using GDN predictions.
+        
         - Connect same sensor across windows
         - Track value changes
         - Track relationship evolution
-        - Track anomaly propagation
+        - Track anomaly propagation (based on GDN predictions, not ground truth)
+        
+        Args:
+            prev_window_idx: Index of previous window
+            curr_window_idx: Index of current window
+            prev_window_data: (300, 8) array - previous window data
+            curr_window_data: (300, 8) array - current window data
+            prev_gdn_scores: (8,) array - GDN predictions for previous window
+            curr_gdn_scores: (8,) array - GDN predictions for current window
         """
         prev_stats = self.window_stats[prev_window_idx]
         curr_stats = self.window_stats[curr_window_idx]
+        
+        # Use prediction threshold (0.5) to identify likely anomalous sensors
+        prediction_threshold = 0.5
         
         for sensor_name in self.sensor_names:
             prev_stat = prev_stats[sensor_name]
@@ -639,12 +755,12 @@ class KnowledgeGraphBuilder:
                     target_window=curr_window_idx
                 )
             
-            # Anomaly propagation tracking
-            prev_faulty = prev_stat.anomaly_score > 0
-            curr_faulty = curr_stat.anomaly_score > 0
+            # Anomaly propagation tracking (based on GDN predictions, not ground truth)
+            prev_faulty = prev_stat.anomaly_score > prediction_threshold
+            curr_faulty = curr_stat.anomaly_score > prediction_threshold
             
             if prev_faulty and curr_faulty:
-                # Fault persists
+                # Fault persists (according to GDN predictions)
                 self.kg.add_edge(
                     f"{sensor_name}@window_{prev_window_idx}",
                     f"{sensor_name}@window_{curr_window_idx}",
@@ -655,7 +771,7 @@ class KnowledgeGraphBuilder:
                     target_window=curr_window_idx
                 )
             elif not prev_faulty and curr_faulty:
-                # Fault appears
+                # Fault appears (according to GDN predictions)
                 self.kg.add_edge(
                     f"{sensor_name}@window_{prev_window_idx}",
                     f"{sensor_name}@window_{curr_window_idx}",
@@ -666,7 +782,7 @@ class KnowledgeGraphBuilder:
                     target_window=curr_window_idx
                 )
         
-        # Track relationship evolution between sensors
+        # Track relationship evolution between sensors (correlation changes across windows)
         if prev_window_idx in self.window_graphs and curr_window_idx in self.window_graphs:
             prev_graph = self.window_graphs[prev_window_idx]
             curr_graph = self.window_graphs[curr_window_idx]
@@ -676,21 +792,50 @@ class KnowledgeGraphBuilder:
                     if sensor_i >= sensor_j:
                         continue
                     
+                    # Check if edge exists in both windows
                     if prev_graph.has_edge(sensor_i, sensor_j) and \
                        curr_graph.has_edge(sensor_i, sensor_j):
                         
-                        prev_corr = prev_graph[sensor_i][sensor_j].get('correlation', 0)
-                        curr_corr = curr_graph[sensor_i][sensor_j].get('correlation', 0)
-                        corr_change = curr_corr - prev_corr
+                        # Get correlations from both windows
+                        prev_edge_data = prev_graph[sensor_i][sensor_j]
+                        curr_edge_data = curr_graph[sensor_i][sensor_j]
                         
-                        if abs(corr_change) > 0.1:  # Significant change
+                        # Use correlation_strength if available (new format), otherwise fall back to correlation
+                        prev_corr = prev_edge_data.get('correlation_strength', 
+                                                       prev_edge_data.get('correlation', 0))
+                        curr_corr = curr_edge_data.get('correlation_strength',
+                                                       curr_edge_data.get('correlation', 0))
+                        
+                        # Also get raw correlation values for direction tracking
+                        prev_corr_raw = prev_edge_data.get('correlation', 0)
+                        curr_corr_raw = curr_edge_data.get('correlation', 0)
+                        
+                        corr_change = curr_corr - prev_corr
+                        corr_change_raw = curr_corr_raw - prev_corr_raw
+                        
+                        # Track significant changes (threshold: 0.1)
+                        if abs(corr_change) > 0.1:
+                            # Determine evolution type
+                            if abs(curr_corr) > abs(prev_corr):
+                                evolution_type = 'strengthening'
+                            elif abs(curr_corr) < abs(prev_corr):
+                                evolution_type = 'weakening'
+                            else:
+                                evolution_type = 'stable'
+                            
                             self.kg.add_edge(
                                 f"{sensor_i}@window_{prev_window_idx}",
                                 f"{sensor_j}@window_{curr_window_idx}",
-                                edge_type='relationship_evolution',
+                                edge_type='correlation_evolution',
                                 source_sensor=sensor_i,
                                 target_sensor=sensor_j,
                                 correlation_change=float(corr_change),
+                                correlation_change_raw=float(corr_change_raw),
+                                prev_correlation=float(prev_corr),
+                                prev_correlation_raw=float(prev_corr_raw),
+                                curr_correlation=float(curr_corr),
+                                curr_correlation_raw=float(curr_corr_raw),
+                                evolution_type=evolution_type,
                                 source_window=prev_window_idx,
                                 target_window=curr_window_idx
                             )
@@ -712,22 +857,27 @@ class KnowledgeGraphBuilder:
         variation = abs(mean_value - normal_mean) / normal_span
         return float(variation)
     
-    def _track_anomaly_propagation(self, sensor_labels: np.ndarray):
+    def _track_anomaly_propagation(self, gdn_predictions: np.ndarray, threshold: float = 0.5):
         """
-        Track how faults propagate across windows:
-        - Identify root cause sensors
+        Track how faults propagate across windows using GDN predictions (with threshold).
+        
+        - Identify root cause sensors (first sensor with GDN score > threshold)
         - Track which sensors become affected in subsequent windows
         - Build fault propagation chains
         
         Only tracks sensors that become faulty for the FIRST TIME after the root sensor.
-        """
-        num_windows = len(sensor_labels)
         
-        # Find first occurrence of EACH faulty sensor (for all sensors, not just roots)
+        Args:
+            gdn_predictions: (num_windows, 8) array - GDN anomaly scores per sensor per window
+            threshold: Threshold for considering a sensor anomalous (default: 0.5)
+        """
+        num_windows = len(gdn_predictions)
+        
+        # Find first occurrence of EACH anomalous sensor (based on GDN predictions)
         first_occurrence_all = {}
         for window_idx in range(num_windows):
             for sensor_idx, sensor_name in enumerate(self.sensor_names):
-                if sensor_labels[window_idx, sensor_idx] > 0:
+                if gdn_predictions[window_idx, sensor_idx] > threshold:
                     if sensor_name not in first_occurrence_all:
                         first_occurrence_all[sensor_name] = window_idx
         
@@ -736,6 +886,7 @@ class KnowledgeGraphBuilder:
             chain = {
                 'root_sensor': root_sensor,
                 'root_window': root_window,
+                'gdn_score': float(gdn_predictions[root_window, self.sensor_to_idx[root_sensor]]),
                 'affected_sensors': [],
                 'propagation_timeline': []
             }
@@ -746,7 +897,7 @@ class KnowledgeGraphBuilder:
             
             for window_idx in range(root_window + 1, num_windows):  # Start from root_window + 1
                 for sensor_idx, sensor_name in enumerate(self.sensor_names):
-                    if sensor_labels[window_idx, sensor_idx] > 0:
+                    if gdn_predictions[window_idx, sensor_idx] > threshold:
                         # Only track if this sensor's FIRST occurrence is after root_window
                         if sensor_name in first_occurrence_all:
                             sensor_first_window = first_occurrence_all[sensor_name]
@@ -758,7 +909,8 @@ class KnowledgeGraphBuilder:
                                 affected_first_occurrence[sensor_name] = sensor_first_window
                                 chain['propagation_timeline'].append({
                                     'window': sensor_first_window,
-                                    'affected_sensors': [sensor_name]
+                                    'affected_sensors': [sensor_name],
+                                    'gdn_score': float(gdn_predictions[sensor_first_window, sensor_idx])
                                 })
             
             # Only add chain if there are affected sensors
@@ -857,10 +1009,11 @@ class KnowledgeGraphBuilder:
             
             narrative = f"Window {window_idx}:\n"
             
-            # Describe faulty sensors
-            faulty_sensors = [s for s, stat in stats.items() if stat.anomaly_score > 0]
+            # Describe sensors with high GDN prediction scores (using threshold)
+            prediction_threshold = 0.5
+            faulty_sensors = [s for s, stat in stats.items() if stat.anomaly_score > prediction_threshold]
             if faulty_sensors:
-                narrative += f"  Faulty sensors: {', '.join(faulty_sensors)}\n"
+                narrative += f"  Sensors with high GDN anomaly scores (> {prediction_threshold}): {', '.join(faulty_sensors)}\n"
             
             # Describe relationship violations
             violations = []
@@ -899,3 +1052,73 @@ class KnowledgeGraphBuilder:
                 'total_edges': self.kg.number_of_edges()
             }
         }
+
+
+# ============================================================================
+# Window Similarity Computation
+# ============================================================================
+
+def compute_window_similarity(
+    window_embeddings: Dict[int, Dict[str, Any]],
+    k: int = 5
+) -> List[Tuple[int, int, float, float]]:
+    """
+    Compute window-to-window similarity based on embeddings.
+    
+    For each window, finds k most similar windows (excluding self) using
+    cosine similarity and euclidean distance in embedding space.
+    
+    Args:
+        window_embeddings: Dictionary mapping window_idx -> {
+            'embedding': np.ndarray (hidden_dim,),
+            'dist_normal': float,
+            'dist_anomalous': float,
+            'confidence': float
+        }
+        k: Number of nearest neighbors to find per window
+    
+    Returns:
+        List of tuples: (window_i, window_j, cosine_similarity, euclidean_distance)
+        Sorted by window_i, then by similarity descending
+    """
+    if len(window_embeddings) == 0:
+        return []
+    
+    # Extract embeddings and window indices
+    window_indices = sorted(window_embeddings.keys())
+    embeddings_list = [window_embeddings[idx]['embedding'] for idx in window_indices]
+    embeddings_array = np.array(embeddings_list)  # (N, hidden_dim)
+    
+    N = len(window_indices)
+    if N < 2:
+        return []
+    
+    # Compute cosine similarity matrix (memory efficient: compute per window)
+    similarity_edges = []
+    
+    for i, window_i in enumerate(window_indices):
+        embedding_i = embeddings_array[i:i+1]  # (1, hidden_dim)
+        
+        # Compute cosine similarity with all other windows
+        # Use sklearn's cosine_similarity for efficiency
+        similarities = cosine_similarity(embedding_i, embeddings_array)[0]  # (N,)
+        
+        # Compute euclidean distances
+        distances = cdist(embedding_i, embeddings_array, metric='euclidean')[0]  # (N,)
+        
+        # Find top-k most similar (excluding self)
+        # Set self-similarity to -inf to exclude it
+        similarities[i] = -np.inf
+        
+        # Get top-k indices
+        top_k_indices = np.argsort(similarities)[::-1][:k]
+        
+        # Add edges
+        for j in top_k_indices:
+            if j != i:  # Exclude self
+                window_j = window_indices[j]
+                cosine_sim = float(similarities[j])
+                euclidean_dist = float(distances[j])
+                similarity_edges.append((window_i, window_j, cosine_sim, euclidean_dist))
+    
+    return similarity_edges
