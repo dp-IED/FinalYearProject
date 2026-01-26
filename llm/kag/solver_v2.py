@@ -238,7 +238,13 @@ class KGQueryExecutor:
         self, step: LogicalFormStep, step_results: Dict[int, Any], window_idx: int
     ) -> Any:
         """
-        Execute a Retrieval step.
+        Execute a Retrieval step (KAG Operator 1).
+
+        Implements the Retrieval operator from the KAG paper:
+        Retrieval(s=?, p=predicate, o=?, constraints={...})
+
+        Purpose: Query graph triples using SPO (Subject-Predicate-Object) pattern matching.
+        Supports both SPO format and convenience format with operation parameter.
 
         Args:
             step: LogicalFormStep with operator="Retrieval"
@@ -246,7 +252,7 @@ class KGQueryExecutor:
             window_idx: Current window index
 
         Returns:
-            List of retrieved results
+            List of retrieved results (sensors, violations, similar windows, etc.)
         """
         # Handle both old format (s, p, o, constraints) and new format (operation, subject, object)
         if "operation" in step.params:
@@ -292,12 +298,14 @@ class KGQueryExecutor:
                 # Auto-threshold detection: query all scores first, compute adaptive threshold
                 if anomaly_threshold is None:
                     # Get all scores for auto-threshold detection
-                    all_scores = self.queries.get_all_anomaly_scores(window_idx_constraint)
-                    
+                    all_scores = self.queries.get_all_anomaly_scores(
+                        window_idx_constraint
+                    )
+
                     if all_scores and len(all_scores) > 0:
-                        scores = [s['score'] for s in all_scores]
+                        scores = [s["score"] for s in all_scores]
                         max_score = max(scores)
-                        
+
                         # Only use auto-threshold if max score is meaningful (>0.5)
                         # For normal windows with low scores, use higher threshold (0.5)
                         if max_score > 0.5:
@@ -306,18 +314,18 @@ class KGQueryExecutor:
                             percentile_75 = np.percentile(scores, 75)
                             auto_threshold = min(percentile_75, 0.5)
                             threshold = auto_threshold
-                            
+
                             # Filter by threshold
-                            result = [s for s in all_scores if s['score'] > threshold]
-                            
+                            result = [s for s in all_scores if s["score"] > threshold]
+
                             # Guarantee at least top-1 if max score > 0.5 (conservative)
                             if not result and max_score > 0.5:
                                 result = [all_scores[0]]  # Return top sensor
-                                threshold = all_scores[0]['score']
+                                threshold = all_scores[0]["score"]
                         else:
                             # Low scores - likely normal window, use conservative threshold
                             threshold = 0.5
-                            result = [s for s in all_scores if s['score'] > threshold]
+                            result = [s for s in all_scores if s["score"] > threshold]
                     else:
                         # No sensors found - return empty
                         threshold = 0.5
@@ -328,7 +336,7 @@ class KGQueryExecutor:
                     result = self.queries.get_anomalous_sensors(
                         window_idx_constraint, threshold=threshold
                     )
-                
+
                 # Track tool call
                 if self.tool_tracker:
                     self.tool_tracker.record_tool_call(
@@ -352,18 +360,24 @@ class KGQueryExecutor:
                     if isinstance(obj, dict)
                     else None
                 )
-                
+
                 # Auto-threshold detection for violations
                 if deviation_threshold is None:
                     # Get all deviations for auto-threshold detection
-                    all_deviations = self.queries.get_all_deviations(window_idx_constraint)
-                    
+                    all_deviations = self.queries.get_all_deviations(
+                        window_idx_constraint
+                    )
+
                     if all_deviations and len(all_deviations) > 0:
-                        deviations = [d['deviation'] for d in all_deviations]
+                        deviations = [d["deviation"] for d in all_deviations]
                         # Use 50th percentile (median deviation)
                         deviation_threshold = np.percentile(deviations, 50)
                         # Filter by threshold
-                        result = [d for d in all_deviations if d['deviation'] > deviation_threshold]
+                        result = [
+                            d
+                            for d in all_deviations
+                            if d["deviation"] > deviation_threshold
+                        ]
                     else:
                         # No correlations found - return empty
                         deviation_threshold = 0.3
@@ -418,12 +432,14 @@ class KGQueryExecutor:
                 # Auto-threshold detection: query all scores first, compute adaptive threshold
                 if anomaly_threshold is None:
                     # Get all scores for auto-threshold detection
-                    all_scores = self.queries.get_all_anomaly_scores(window_idx_constraint)
-                    
+                    all_scores = self.queries.get_all_anomaly_scores(
+                        window_idx_constraint
+                    )
+
                     if all_scores and len(all_scores) > 0:
-                        scores = [s['score'] for s in all_scores]
+                        scores = [s["score"] for s in all_scores]
                         max_score = max(scores)
-                        
+
                         # Only use auto-threshold if max score is meaningful (>0.5)
                         # For normal windows with low scores, use higher threshold (0.5)
                         if max_score > 0.5:
@@ -432,18 +448,18 @@ class KGQueryExecutor:
                             percentile_75 = np.percentile(scores, 75)
                             auto_threshold = min(percentile_75, 0.5)
                             threshold = auto_threshold
-                            
+
                             # Filter by threshold
-                            result = [s for s in all_scores if s['score'] > threshold]
-                            
+                            result = [s for s in all_scores if s["score"] > threshold]
+
                             # Guarantee at least top-1 if max score > 0.5 (conservative)
                             if not result and max_score > 0.5:
                                 result = [all_scores[0]]  # Return top sensor
-                                threshold = all_scores[0]['score']
+                                threshold = all_scores[0]["score"]
                         else:
                             # Low scores - likely normal window, use conservative threshold
                             threshold = 0.5
-                            result = [s for s in all_scores if s['score'] > threshold]
+                            result = [s for s in all_scores if s["score"] > threshold]
                     else:
                         # No sensors found - return empty
                         threshold = 0.5
@@ -454,7 +470,7 @@ class KGQueryExecutor:
                     result = self.queries.get_anomalous_sensors(
                         window_idx_constraint, threshold=threshold
                     )
-                
+
                 # Track tool call
                 if self.tool_tracker:
                     self.tool_tracker.record_tool_call(
@@ -472,18 +488,24 @@ class KGQueryExecutor:
             elif predicate == "CORRELATES_WITH":
                 deviation_threshold = constraints.get("deviation_threshold", None)
                 is_violation = constraints.get("is_violation", False)
-                
+
                 # Auto-threshold detection for violations
                 if deviation_threshold is None:
                     # Get all deviations for auto-threshold detection
-                    all_deviations = self.queries.get_all_deviations(window_idx_constraint)
-                    
+                    all_deviations = self.queries.get_all_deviations(
+                        window_idx_constraint
+                    )
+
                     if all_deviations and len(all_deviations) > 0:
-                        deviations = [d['deviation'] for d in all_deviations]
+                        deviations = [d["deviation"] for d in all_deviations]
                         # Use 50th percentile (median deviation)
                         deviation_threshold = np.percentile(deviations, 50)
                         # Filter by threshold
-                        result = [d for d in all_deviations if d['deviation'] > deviation_threshold]
+                        result = [
+                            d
+                            for d in all_deviations
+                            if d["deviation"] > deviation_threshold
+                        ]
                     else:
                         # No correlations found - return empty
                         deviation_threshold = 0.3
@@ -509,41 +531,48 @@ class KGQueryExecutor:
                         operator="Retrieval",
                     )
                 return result
-            
+
             # Handle embedding-based operations
             elif operation == "find_similar_windows":
                 # Find similar windows in embedding space
                 k = step.params.get("k", 5)
                 class_filter = step.params.get("class_filter", None)
-                
+
                 result = self.embedding_retrieval.find_similar_windows(
                     window_idx_constraint, k=k, class_filter=class_filter
                 )
-                
+
                 if self.tool_tracker:
                     self.tool_tracker.record_tool_call(
                         tool_name="EmbeddingRetrieval",
                         query_method="find_similar_windows",
-                        params={"window_idx": window_idx_constraint, "k": k, "class_filter": class_filter},
+                        params={
+                            "window_idx": window_idx_constraint,
+                            "k": k,
+                            "class_filter": class_filter,
+                        },
                         result=result,
                         window_idx=window_idx,
                         operator="Retrieval",
                     )
                 return result
-            
+
             elif operation == "find_anomalous_neighbors":
                 # Find anomalous neighbors in embedding space
                 distance_threshold = step.params.get("distance_threshold", 0.2)
-                
+
                 result = self.anomaly_neighborhood.find_anomalous_neighbors(
                     window_idx_constraint, distance_threshold=distance_threshold
                 )
-                
+
                 if self.tool_tracker:
                     self.tool_tracker.record_tool_call(
                         tool_name="AnomalyNeighborhood",
                         query_method="find_anomalous_neighbors",
-                        params={"window_idx": window_idx_constraint, "distance_threshold": distance_threshold},
+                        params={
+                            "window_idx": window_idx_constraint,
+                            "distance_threshold": distance_threshold,
+                        },
                         result=result,
                         window_idx=window_idx,
                         operator="Retrieval",
@@ -554,14 +583,20 @@ class KGQueryExecutor:
 
     def execute_math(self, step: LogicalFormStep, step_results: Dict[int, Any]) -> Any:
         """
-        Execute a Math step.
+        Execute a Math step (KAG Operator 2).
+
+        Implements the Math operator from the KAG paper:
+        Math(operation, operands)
+
+        Purpose: Numerical computation (count, sum, max, mean) over operands.
+        Operands can reference previous step results using $step<id>_results syntax.
 
         Args:
             step: LogicalFormStep with operator="Math"
             step_results: Dictionary mapping step_id -> results from previous steps
 
         Returns:
-            Math operation result
+            Math operation result (int or float)
         """
         operation = step.params.get("operation", "count")
         operands = step.params.get("operands", [])
@@ -607,14 +642,21 @@ class KGQueryExecutor:
         self, step: LogicalFormStep, step_results: Dict[int, Any]
     ) -> Any:
         """
-        Execute a Deduce step (root cause extraction).
+        Execute a Deduce step (KAG Operator 3).
+
+        Implements the Deduce operator from the KAG paper:
+        Deduce(left, right, comparison)
+
+        Purpose: Logical comparison (>, <, =, contains) or root cause extraction.
+        Supports comparison="extract_root_cause" for identifying root cause sensors
+        from violations and anomalies.
 
         Args:
             step: LogicalFormStep with operator="Deduce"
             step_results: Dictionary mapping step_id -> results from previous steps
 
         Returns:
-            Deduced root cause sensor
+            Deduced result (root cause sensor name, boolean comparison result, etc.)
         """
         left_operand_ref = step.params.get("left_operand", "")
         right_operand_ref = step.params.get("right_operand", "")
@@ -642,19 +684,21 @@ class KGQueryExecutor:
         if comparison == "extract_root_cause":
             # Enhanced root cause selection with temporal onset, centrality, and violations
             window_idx = step.params.get("window_idx", -1)
-            
+
             # Get centrality if window_idx is available
             centrality_map = {}
             if window_idx >= 0:
                 try:
                     centrality = self.queries.compute_sensor_centrality(window_idx)
-                    centrality_map = {c['sensor']: c.get('degree', 1) for c in centrality}
+                    centrality_map = {
+                        c["sensor"]: c.get("degree", 1) for c in centrality
+                    }
                 except Exception:
                     pass  # Fall back to simple selection if centrality unavailable
-            
+
             # Collect candidate sensors from violations and anomalies
             candidate_sensors = {}
-            
+
             # Process violations
             if isinstance(left_data, list) and len(left_data) > 0:
                 if isinstance(left_data[0], dict) and "source" in left_data[0]:
@@ -662,7 +706,7 @@ class KGQueryExecutor:
                         source = v.get("source", "")
                         target = v.get("target", "")
                         deviation = v.get("deviation", 0.0)
-                        
+
                         if source:
                             if source not in candidate_sensors:
                                 candidate_sensors[source] = {
@@ -674,8 +718,10 @@ class KGQueryExecutor:
                                 }
                             candidate_sensors[source]["violation_count"] += 1
                             if deviation > 0.5:
-                                candidate_sensors[source]["violation_severity"] += deviation
-                        
+                                candidate_sensors[source]["violation_severity"] += (
+                                    deviation
+                                )
+
                         if target:
                             if target not in candidate_sensors:
                                 candidate_sensors[target] = {
@@ -687,15 +733,17 @@ class KGQueryExecutor:
                                 }
                             candidate_sensors[target]["violation_count"] += 1
                             if deviation > 0.5:
-                                candidate_sensors[target]["violation_severity"] += deviation
-            
+                                candidate_sensors[target]["violation_severity"] += (
+                                    deviation
+                                )
+
             # Process anomalous sensors
             if isinstance(right_data, list) and len(right_data) > 0:
                 if isinstance(right_data[0], dict) and "sensor" in right_data[0]:
                     for sensor_data in right_data:
                         sensor = sensor_data.get("sensor", "")
                         score = sensor_data.get("score", 0.0)
-                        
+
                         if sensor:
                             if sensor not in candidate_sensors:
                                 candidate_sensors[sensor] = {
@@ -708,13 +756,13 @@ class KGQueryExecutor:
                             candidate_sensors[sensor]["anomaly_score"] = max(
                                 candidate_sensors[sensor]["anomaly_score"], score
                             )
-            
+
             # Enhanced scoring: anomaly_score * onset_score * violation_count * centrality
             # For temporal onset, we need to query previous windows
             # Since we don't have direct access to solver's _find_anomaly_onset here,
             # we'll use a simplified approach: weight by violation_count and anomaly_score
             # Temporal onset can be added later if we pass solver reference
-            
+
             if candidate_sensors:
                 scored_sensors = []
                 for sensor, data in candidate_sensors.items():
@@ -722,25 +770,29 @@ class KGQueryExecutor:
                     violation_count = data["violation_count"]
                     violation_severity = data["violation_severity"]
                     centrality = max(data["centrality"], 1)  # Ensure at least 1
-                    
+
                     # Normalize violation severity (0-1 scale)
-                    violation_severity_norm = min(violation_severity / 2.0, 1.0) if violation_severity > 0 else 0.0
-                    
+                    violation_severity_norm = (
+                        min(violation_severity / 2.0, 1.0)
+                        if violation_severity > 0
+                        else 0.0
+                    )
+
                     # Enhanced score: combine anomaly, violations, and centrality
                     # Formula: anomaly_score * (1 + violation_count) * (1 + violation_severity) * centrality
                     # This rewards sensors with high anomaly scores, many violations, severe violations, and high centrality
                     score = (
-                        anomaly_score * 
-                        (1.0 + violation_count * 0.2) * 
-                        (1.0 + violation_severity_norm * 0.3) * 
-                        centrality
+                        anomaly_score
+                        * (1.0 + violation_count * 0.2)
+                        * (1.0 + violation_severity_norm * 0.3)
+                        * centrality
                     )
                     scored_sensors.append((sensor, score))
-                
+
                 # Sort by score and return highest
                 scored_sensors.sort(key=lambda x: x[1], reverse=True)
                 result = scored_sensors[0][0] if scored_sensors else None
-            
+
             # Fallback to simple selection if enhanced scoring didn't work
             if result is None:
                 if isinstance(left_data, list) and len(left_data) > 0:
@@ -753,7 +805,11 @@ class KGQueryExecutor:
                         if source_counts:
                             result = max(source_counts.items(), key=lambda x: x[1])[0]
 
-                if result is None and isinstance(right_data, list) and len(right_data) > 0:
+                if (
+                    result is None
+                    and isinstance(right_data, list)
+                    and len(right_data) > 0
+                ):
                     if isinstance(right_data[0], dict) and "sensor" in right_data[0]:
                         sorted_sensors = sorted(
                             right_data, key=lambda x: x.get("score", 0), reverse=True
@@ -780,14 +836,20 @@ class KGQueryExecutor:
 
     def execute_sort(self, step: LogicalFormStep, step_results: Dict[int, Any]) -> Any:
         """
-        Execute a Sort step.
+        Execute a Sort step (KAG Operator 4).
+
+        Implements the Sort operator from the KAG paper:
+        Sort(target, key, direction, limit)
+
+        Purpose: Rank and filter results by a specified key.
+        Can sort by anomaly_score, deviation, distance, etc.
 
         Args:
             step: LogicalFormStep with operator="Sort"
             step_results: Dictionary mapping step_id -> results from previous steps
 
         Returns:
-            Sorted list
+            Sorted and optionally limited list of results
         """
         target_ref = step.params.get("target_set", "")
         key = step.params.get("key", "deviation")
@@ -834,30 +896,27 @@ class KGQueryExecutor:
 
 class EmbeddingRetrievalOperator:
     """Operator for retrieving similar windows in embedding space."""
-    
+
     def __init__(self, neo4j_queries: Neo4jKAGQueries):
         """
         Initialize Embedding Retrieval Operator.
-        
+
         Args:
             neo4j_queries: Neo4jKAGQueries instance for graph queries
         """
         self.queries = neo4j_queries
-    
+
     def find_similar_windows(
-        self,
-        window_idx: int,
-        k: int = 5,
-        class_filter: Optional[str] = None
+        self, window_idx: int, k: int = 5, class_filter: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """
         Find k most similar windows to a given window.
-        
+
         Args:
             window_idx: Index of the window to find similar windows for
             k: Number of similar windows to return
             class_filter: Optional filter by predicted_class ("normal" or "anomalous")
-        
+
         Returns:
             List of dicts with keys: window_idx, similarity, distance, dist_normal, dist_anomalous
         """
@@ -866,10 +925,10 @@ class EmbeddingRetrievalOperator:
             query = """
                 MATCH (w1:Window {idx: $window_idx})-[s:SIMILAR_TO]->(w2:Window)
             """
-            
+
             if class_filter:
                 query += " WHERE w2.predicted_class = $class_filter"
-            
+
             query += """
                 OPTIONAL MATCH (w2)-[d1:DISTANCE_TO_CENTER]->(c1:ClassCenter {class: "normal"})
                 OPTIONAL MATCH (w2)-[d2:DISTANCE_TO_CENTER]->(c2:ClassCenter {class: "anomalous"})
@@ -881,49 +940,57 @@ class EmbeddingRetrievalOperator:
                 ORDER BY s.similarity DESC
                 LIMIT $k
             """
-            
+
             params = {"window_idx": window_idx, "k": k}
             if class_filter:
                 params["class_filter"] = class_filter
-            
+
             result = session.run(query, params)
             similar_windows = []
             for record in result:
-                similar_windows.append({
-                    "window_idx": record["window_idx"],
-                    "similarity": float(record["similarity"]) if record["similarity"] is not None else 0.0,
-                    "distance": float(record["distance"]) if record["distance"] is not None else 0.0,
-                    "dist_normal": float(record["dist_normal"]) if record["dist_normal"] is not None else None,
-                    "dist_anomalous": float(record["dist_anomalous"]) if record["dist_anomalous"] is not None else None
-                })
-            
+                similar_windows.append(
+                    {
+                        "window_idx": record["window_idx"],
+                        "similarity": float(record["similarity"])
+                        if record["similarity"] is not None
+                        else 0.0,
+                        "distance": float(record["distance"])
+                        if record["distance"] is not None
+                        else 0.0,
+                        "dist_normal": float(record["dist_normal"])
+                        if record["dist_normal"] is not None
+                        else None,
+                        "dist_anomalous": float(record["dist_anomalous"])
+                        if record["dist_anomalous"] is not None
+                        else None,
+                    }
+                )
+
             return similar_windows
 
 
 class AnomalyNeighborhoodOperator:
     """Operator for finding anomalous neighbors in embedding space."""
-    
+
     def __init__(self, neo4j_queries: Neo4jKAGQueries):
         """
         Initialize Anomaly Neighborhood Operator.
-        
+
         Args:
             neo4j_queries: Neo4jKAGQueries instance for graph queries
         """
         self.queries = neo4j_queries
-    
+
     def find_anomalous_neighbors(
-        self,
-        window_idx: int,
-        distance_threshold: float = 0.2
+        self, window_idx: int, distance_threshold: float = 0.2
     ) -> List[Dict[str, Any]]:
         """
         Find nearby anomalous windows in embedding space.
-        
+
         Args:
             window_idx: Index of the window to find neighbors for
             distance_threshold: Maximum euclidean distance threshold
-        
+
         Returns:
             List of dicts with keys: window_idx, distance, similarity, dist_normal, dist_anomalous
             Sorted by distance ascending
@@ -942,22 +1009,32 @@ class AnomalyNeighborhoodOperator:
                        d2.distance AS dist_anomalous
                 ORDER BY s.distance ASC
             """
-            
-            result = session.run(query, {
-                "window_idx": window_idx,
-                "distance_threshold": distance_threshold
-            })
-            
+
+            result = session.run(
+                query,
+                {"window_idx": window_idx, "distance_threshold": distance_threshold},
+            )
+
             neighbors = []
             for record in result:
-                neighbors.append({
-                    "window_idx": record["window_idx"],
-                    "distance": float(record["distance"]) if record["distance"] is not None else 0.0,
-                    "similarity": float(record["similarity"]) if record["similarity"] is not None else 0.0,
-                    "dist_normal": float(record["dist_normal"]) if record["dist_normal"] is not None else None,
-                    "dist_anomalous": float(record["dist_anomalous"]) if record["dist_anomalous"] is not None else None
-                })
-            
+                neighbors.append(
+                    {
+                        "window_idx": record["window_idx"],
+                        "distance": float(record["distance"])
+                        if record["distance"] is not None
+                        else 0.0,
+                        "similarity": float(record["similarity"])
+                        if record["similarity"] is not None
+                        else 0.0,
+                        "dist_normal": float(record["dist_normal"])
+                        if record["dist_normal"] is not None
+                        else None,
+                        "dist_anomalous": float(record["dist_anomalous"])
+                        if record["dist_anomalous"] is not None
+                        else None,
+                    }
+                )
+
             return neighbors
 
 
@@ -1006,82 +1083,88 @@ class KAGIterativeSolver:
         """
         Get anomaly score for a sensor in a specific window.
         Uses cache to avoid repeated Neo4j queries.
-        
+
         Args:
             sensor: Base sensor name
             window_idx: Window index
-            
+
         Returns:
             Anomaly score (0.0-1.0)
         """
         cache_key = (window_idx, sensor)
         if cache_key in self._anomaly_score_cache:
             return self._anomaly_score_cache[cache_key]
-        
+
         # Query Neo4j for anomaly score
         with self.queries.driver.session() as session:
-            result = session.run("""
+            result = session.run(
+                """
                 MATCH (s:Sensor {base_sensor_name: $sensor, window: $window_idx})
                 RETURN s.anomaly_score AS score
                 LIMIT 1
-            """, sensor=sensor, window_idx=window_idx)
+            """,
+                sensor=sensor,
+                window_idx=window_idx,
+            )
             record = result.single()
-            score = float(record['score']) if record else 0.0
-        
+            score = float(record["score"]) if record else 0.0
+
         self._anomaly_score_cache[cache_key] = score
         return score
 
-    def _find_anomaly_onset(self, sensor: str, window_idx: int, lookback: int = 3) -> int:
+    def _find_anomaly_onset(
+        self, sensor: str, window_idx: int, lookback: int = 3
+    ) -> int:
         """
         Find the earliest window where sensor became anomalous.
-        
+
         Searches backwards from window_idx up to lookback windows to find
         when the sensor first exceeded the anomaly threshold.
-        
+
         Args:
             sensor: Base sensor name
             window_idx: Current window index
             lookback: Maximum number of windows to look back (default: 3)
-            
+
         Returns:
             Earliest window index where anomaly was detected, or window_idx if not found earlier
         """
         earliest = window_idx
         start_window = max(0, window_idx - lookback)
-        
+
         for w in range(start_window, window_idx + 1):
             score = self._get_anomaly_score(sensor, w)
             if score > self.anomaly_threshold:
                 earliest = w
                 break
-        
+
         return earliest
 
     def _violation_severity(self, violations: List[Dict]) -> float:
         """
         Compute violation severity score based on deviation magnitude.
-        
+
         Counts violations with deviation > 0.5 as "severe" and returns
         a normalized score capped at 1.0.
-        
+
         Args:
             violations: List of violation dicts with 'deviation' key
-            
+
         Returns:
             Severity score (0.0-1.0)
         """
         if not violations:
             return 0.0
-        
-        severe = [v for v in violations if v.get('deviation', 0.0) > 0.5]
+
+        severe = [v for v in violations if v.get("deviation", 0.0) > 0.5]
         return min(len(severe) / 3.0, 1.0)
-    
+
     def _assess_evidence_strength(self, exec_results: Dict[int, Any]) -> Dict[str, Any]:
         """
         Assess the strength of evidence from tool execution results.
-        
+
         Returns:
-            dict with keys: max_score, num_anomalous, num_violations, 
+            dict with keys: max_score, num_anomalous, num_violations,
                            level (NONE/WEAK/MODERATE/STRONG), confidence
         """
         # Extract anomalous sensors
@@ -1089,56 +1172,57 @@ class KAGIterativeSolver:
         for step_id, step_results in exec_results.items():
             if isinstance(step_results, list):
                 for item in step_results:
-                    if isinstance(item, dict) and 'score' in item and 'sensor' in item:
+                    if isinstance(item, dict) and "score" in item and "sensor" in item:
                         anomalous_sensors.append(item)
-        
+
         # Extract violations
         violations = []
         for step_id, step_results in exec_results.items():
             if isinstance(step_results, list):
                 for item in step_results:
-                    if isinstance(item, dict) and 'deviation' in item:
+                    if isinstance(item, dict) and "deviation" in item:
                         violations.append(item)
-        
+
         # Calculate metrics
-        max_score = max([s['score'] for s in anomalous_sensors], default=0.0)
-        num_anomalous = len([s for s in anomalous_sensors if s['score'] > 0.5])
-        num_violations = len([v for v in violations if v.get('deviation', 0) > 0.3])
-        
+        max_score = max([s["score"] for s in anomalous_sensors], default=0.0)
+        num_anomalous = len([s for s in anomalous_sensors if s["score"] > 0.5])
+        num_violations = len([v for v in violations if v.get("deviation", 0) > 0.3])
+
         # Determine strength level - conservative for normal windows, but allow high scores
-        # Note: Windows with low GDN scores (<0.5) are classified as WEAK even with violations
-        # This is intentional - if GDN doesn't detect a fault, we rely on GDN's judgment
+        # Note: Based on score distribution analysis, P95 of normal windows is ~0.54,
+        # so threshold of 0.7 for MODERATE is appropriate to minimize false positives
         if max_score < 0.5 and num_violations == 0:
-            level = 'NONE'
+            level = "NONE"
             confidence = 0.1
         elif max_score < 0.5:
             # Low scores even with violations - likely normal window with noise
             # OR faulty window that GDN missed (limitation of GDN model)
-            level = 'WEAK'
+            level = "WEAK"
             confidence = 0.2
         elif max_score >= 0.7 and num_violations >= 3:
-            level = 'STRONG'
+            level = "STRONG"
             confidence = 0.85
-        elif max_score >= 0.5:
-            # Scores >= 0.5 indicate potential fault - allow MODERATE
+        elif max_score >= 0.7:
+            # Scores >= 0.7 indicate potential fault - allow MODERATE
+            # Based on analysis: P95 of normal is 0.54, so 0.7 is safe threshold
             # This catches faulty windows even if violations are few
-            level = 'MODERATE'
+            level = "MODERATE"
             confidence = 0.6
         else:
-            # Should not reach here, but fallback to WEAK
-            level = 'WEAK'
+            # Scores between 0.5 and 0.7 - weak evidence, likely normal
+            level = "WEAK"
             confidence = 0.3
-        
+
         return {
-            'max_score': max_score,
-            'num_anomalous': num_anomalous,
-            'num_violations': num_violations,
-            'level': level,
-            'confidence': confidence,
-            'anomalous_sensors': anomalous_sensors,
-            'violations': violations
+            "max_score": max_score,
+            "num_anomalous": num_anomalous,
+            "num_violations": num_violations,
+            "level": level,
+            "confidence": confidence,
+            "anomalous_sensors": anomalous_sensors,
+            "violations": violations,
         }
-    
+
     def _format_weak_evidence_reasoning(self, evidence: Dict[str, Any]) -> str:
         """Format reasoning string for weak evidence cases."""
         return (
@@ -1147,65 +1231,84 @@ class KAGIterativeSolver:
             f"Correlation violations detected: {evidence['num_violations']} (threshold: 2). "
             f"Evidence insufficient to diagnose fault. System operating normally."
         )
-    
+
     def _extract_valid_sensors(self, exec_results: Dict[int, Any]) -> set:
         """Extract set of sensor names that appeared in tool results."""
         valid_sensors = set()
-        
+
         for step_id, step_results in exec_results.items():
             if isinstance(step_results, list):
                 for item in step_results:
                     if isinstance(item, dict):
-                        if 'sensor' in item:
-                            valid_sensors.add(item['sensor'])
-                        if 'source' in item:
-                            valid_sensors.add(item['source'])
-                        if 'target' in item:
-                            valid_sensors.add(item['target'])
-        
+                        if "sensor" in item:
+                            valid_sensors.add(item["sensor"])
+                        if "source" in item:
+                            valid_sensors.add(item["source"])
+                        if "target" in item:
+                            valid_sensors.add(item["target"])
+
         return valid_sensors
-    
+
     # Fault type mappings constant
     FAULT_TYPE_MAPPINGS = {
-        'VSS_DROPOUT': ['VSS_DROPOUT', 'VSS_DRO', 'VEHICLE_SPEED_DROPOUT', 
-                        'vss_dropout', 'vehicle_speed_dropout'],
-        'MAF_SCALE_LOW': ['MAF_SCALE_LOW', 'MAF_SCA', 'MAF_SCALE', 
-                          'maf_scale_low', 'maf_scale'],
-        'COOLANT_DROPOUT': ['COOLANT_DROPOUT', 'COOLANT', 'coolant_dropout', 
-                            'COOLANT_TEMPERATURE_DROPOUT'],
-        'TPS_STUCK': ['TPS_STU', 'TPS_STUCK', 'THROTTLE_STUCK', 
-                      'tps_stuck', 'throttle_stuck'],
-        'NORMAL': ['NORMAL', 'NO_FAULT', 'NONE', 'normal', 'no_fault']
+        "VSS_DROPOUT": [
+            "VSS_DROPOUT",
+            "VSS_DRO",
+            "VEHICLE_SPEED_DROPOUT",
+            "vss_dropout",
+            "vehicle_speed_dropout",
+        ],
+        "MAF_SCALE_LOW": [
+            "MAF_SCALE_LOW",
+            "MAF_SCA",
+            "MAF_SCALE",
+            "maf_scale_low",
+            "maf_scale",
+        ],
+        "COOLANT_DROPOUT": [
+            "COOLANT_DROPOUT",
+            "COOLANT",
+            "coolant_dropout",
+            "COOLANT_TEMPERATURE_DROPOUT",
+        ],
+        "TPS_STUCK": [
+            "TPS_STU",
+            "TPS_STUCK",
+            "THROTTLE_STUCK",
+            "tps_stuck",
+            "throttle_stuck",
+        ],
+        "NORMAL": ["NORMAL", "NO_FAULT", "NONE", "normal", "no_fault"],
     }
-    
+
     def _normalize_fault_type(self, raw_fault: str) -> str:
         """Map any variant to canonical fault type."""
         if not raw_fault:
-            return 'NORMAL'
-        
+            return "NORMAL"
+
         raw_upper = raw_fault.strip().upper()
-        
+
         for canonical, variants in self.FAULT_TYPE_MAPPINGS.items():
             if raw_upper in [v.upper() for v in variants]:
                 return canonical
-        
+
         # Default to NORMAL if unknown
-        return 'NORMAL'
+        return "NORMAL"
 
     def _hierarchical_diagnosis(self, window_idx: int) -> Dict[int, Any]:
         """
         Multi-stage hierarchical diagnosis pipeline.
-        
+
         Stage 1: High-threshold anomaly detection (0.7) - clear faults
         Stage 2: If Stage 1 finds sensors, check violations for those sensors
         Stage 3: If Stage 1 finds nothing, use lower threshold (0.5) + violations
         Stage 4: Fuse evidence using weighted combination
-        
+
         Returns:
             Dictionary of execution results from all stages
         """
         exec_results = {}
-        
+
         # Stage 1: High-threshold anomaly detection
         stage1_step = LogicalFormStep(
             step_id=1,
@@ -1219,12 +1322,16 @@ class KAGIterativeSolver:
         )
         stage1_results = self.execute_logical_form([stage1_step], window_idx)
         exec_results[1] = stage1_results.get(1, [])
-        
+
         high_conf_anomalies = stage1_results.get(1, [])
         high_conf_sensors = []
         if isinstance(high_conf_anomalies, list) and len(high_conf_anomalies) > 0:
-            high_conf_sensors = [s.get("sensor", "") for s in high_conf_anomalies if isinstance(s, dict) and "sensor" in s]
-        
+            high_conf_sensors = [
+                s.get("sensor", "")
+                for s in high_conf_anomalies
+                if isinstance(s, dict) and "sensor" in s
+            ]
+
         # Stage 2: If Stage 1 found sensors, check violations for those sensors
         if high_conf_sensors:
             stage2_step = LogicalFormStep(
@@ -1267,10 +1374,12 @@ class KAGIterativeSolver:
                 },
                 description="Stage 3b: Check violations",
             )
-            stage3_results = self.execute_logical_form([stage3a_step, stage3b_step], window_idx)
+            stage3_results = self.execute_logical_form(
+                [stage3a_step, stage3b_step], window_idx
+            )
             exec_results[3] = stage3_results.get(3, [])
             exec_results[4] = stage3_results.get(4, [])
-        
+
         return exec_results
 
     def _fuse_evidence(
@@ -1281,96 +1390,122 @@ class KAGIterativeSolver:
     ) -> Dict[str, float]:
         """
         Fuse multiple evidence sources with reliability weights.
-        
+
         Weights based on tool success rates:
         - anomaly_score: 0.5 (get_anomalous_sensors: 5.56% success)
         - violations: 0.3 (get_violations: strong signal when present)
         - temporal onset: 0.1 (earlier onset indicates root cause)
         - centrality: 0.1 (if available)
-        
+
         Args:
             anomalous_sensors: List of dicts with 'sensor' and 'score' keys
             violations: List of dicts with 'source', 'target', 'deviation' keys
             window_idx: Window index
-            
+
         Returns:
             Dictionary mapping sensor_name -> fused fault score
         """
         fault_scores = {}
-        
+
         # Get centrality if available
         centrality_map = {}
         try:
             centrality = self.queries.compute_sensor_centrality(window_idx)
-            centrality_map = {c['sensor']: c.get('degree', 1) for c in centrality}
+            centrality_map = {c["sensor"]: c.get("degree", 1) for c in centrality}
         except Exception:
             pass  # Continue without centrality if unavailable
-        
+
         # Weight 1: Anomaly scores (0.5 weight, reduced from 0.6 to make room for temporal/centrality)
         for sensor_data in anomalous_sensors:
             if isinstance(sensor_data, dict) and "sensor" in sensor_data:
                 sensor_name = sensor_data["sensor"]
                 anomaly_score = sensor_data.get("score", 0.0)
-                fault_scores[sensor_name] = fault_scores.get(sensor_name, 0.0) + 0.5 * anomaly_score
-        
+                fault_scores[sensor_name] = (
+                    fault_scores.get(sensor_name, 0.0) + 0.5 * anomaly_score
+                )
+
         # Weight 2: Violation counts with severity weighting (0.3 weight)
         violation_counts = {}
         violation_deviations = {}
         severe_violation_counts = {}  # Count severe violations (>0.5 deviation)
-        
+
         for violation in violations:
             if isinstance(violation, dict):
                 source = violation.get("source", "")
                 target = violation.get("target", "")
                 deviation = violation.get("deviation", 0.0)
                 is_severe = deviation > 0.5
-                
+
                 if source:
                     violation_counts[source] = violation_counts.get(source, 0) + 1
-                    violation_deviations[source] = violation_deviations.get(source, 0.0) + deviation
+                    violation_deviations[source] = (
+                        violation_deviations.get(source, 0.0) + deviation
+                    )
                     if is_severe:
-                        severe_violation_counts[source] = severe_violation_counts.get(source, 0) + 1
+                        severe_violation_counts[source] = (
+                            severe_violation_counts.get(source, 0) + 1
+                        )
                 if target:
                     violation_counts[target] = violation_counts.get(target, 0) + 1
-                    violation_deviations[target] = violation_deviations.get(target, 0.0) + deviation
+                    violation_deviations[target] = (
+                        violation_deviations.get(target, 0.0) + deviation
+                    )
                     if is_severe:
-                        severe_violation_counts[target] = severe_violation_counts.get(target, 0) + 1
-        
+                        severe_violation_counts[target] = (
+                            severe_violation_counts.get(target, 0) + 1
+                        )
+
         # Normalize violation scores (max deviation = 1.0, count normalized by max count)
-        max_deviation = max(violation_deviations.values()) if violation_deviations else 1.0
+        max_deviation = (
+            max(violation_deviations.values()) if violation_deviations else 1.0
+        )
         max_count = max(violation_counts.values()) if violation_counts else 1
-        max_severe = max(severe_violation_counts.values()) if severe_violation_counts else 1
-        
+        max_severe = (
+            max(severe_violation_counts.values()) if severe_violation_counts else 1
+        )
+
         for sensor_name, count in violation_counts.items():
             deviation_sum = violation_deviations.get(sensor_name, 0.0)
             severe_count = severe_violation_counts.get(sensor_name, 0)
-            
+
             # Combine count, deviation, and severe violations
             # Weight severe violations more heavily
             violation_score = (
-                (count / max_count if max_count > 0 else 0) * 0.3 +
-                (deviation_sum / max_deviation if max_deviation > 0 else 0) * 0.4 +
-                (severe_count / max_severe if max_severe > 0 else 0) * 0.3
+                (count / max_count if max_count > 0 else 0) * 0.3
+                + (deviation_sum / max_deviation if max_deviation > 0 else 0) * 0.4
+                + (severe_count / max_severe if max_severe > 0 else 0) * 0.3
             )
-            fault_scores[sensor_name] = fault_scores.get(sensor_name, 0.0) + 0.3 * violation_score
-        
+            fault_scores[sensor_name] = (
+                fault_scores.get(sensor_name, 0.0) + 0.3 * violation_score
+            )
+
         # Weight 3: Temporal onset (0.1 weight) - earlier onset indicates root cause
         for sensor_name in fault_scores.keys():
             try:
                 onset = self._find_anomaly_onset(sensor_name, window_idx)
                 # Earlier onset -> larger score: (window_idx - onset + 1) normalized
-                onset_score = float(window_idx - onset + 1) / (window_idx + 1) if window_idx >= 0 else 1.0
-                fault_scores[sensor_name] = fault_scores.get(sensor_name, 0.0) + 0.1 * onset_score
+                onset_score = (
+                    float(window_idx - onset + 1) / (window_idx + 1)
+                    if window_idx >= 0
+                    else 1.0
+                )
+                fault_scores[sensor_name] = (
+                    fault_scores.get(sensor_name, 0.0) + 0.1 * onset_score
+                )
             except Exception:
                 pass  # Continue without temporal onset if unavailable
-        
+
         # Weight 4: Centrality (0.1 weight) - well-connected sensors more likely root cause
         max_centrality = max(centrality_map.values()) if centrality_map else 1
         for sensor_name in fault_scores.keys():
             centrality = centrality_map.get(sensor_name, 1)
-            centrality_score = (centrality / max_centrality) if max_centrality > 0 else 0.0
-            fault_scores[sensor_name] = fault_scores.get(sensor_name, 0.0) + 0.1 * centrality_score
-        
+            centrality_score = (
+                (centrality / max_centrality) if max_centrality > 0 else 0.0
+            )
+            fault_scores[sensor_name] = (
+                fault_scores.get(sensor_name, 0.0) + 0.1 * centrality_score
+            )
+
         return fault_scores
 
     def _compute_structured_confidence(
@@ -1381,194 +1516,260 @@ class KAGIterativeSolver:
     ) -> float:
         """
         Compute structured confidence score based on evidence strength.
-        
+
         Formula: 0.3 (anomalies) + 0.4 (violation_severity) + 0.3 (centrality)
         Uses violation severity weighting (>0.5 deviation = severe).
-        
+
         Args:
             anomalous_sensors: List of anomalous sensor dicts
             violations: List of violations
             window_idx: Window index
-            
+
         Returns:
             Confidence score (0.0-1.0)
         """
         score = 0.0
-        
+
         # Anomalous sensors found (0.3 weight)
         if anomalous_sensors:
             score += 0.3
-        
+
         # Violation severity (0.4 weight, weighted by deviation magnitude)
         violation_severity_score = self._violation_severity(violations)
         score += 0.4 * violation_severity_score
-        
+
         # High centrality (0.3 weight) - well-connected sensor indicates root cause
         try:
             centrality = self.queries.compute_sensor_centrality(window_idx)
-            if centrality and centrality[0].get('degree', 0) > 3:
+            if centrality and centrality[0].get("degree", 0) > 3:
                 score += 0.3
         except Exception:
             pass  # Continue without centrality if unavailable
-        
+
         return min(score, 1.0)
 
     def _build_planning_prompt(
         self, question: str, memory: Dict, trace: List[Dict]
     ) -> str:
-        """Build prompt for LLM to generate logical form steps."""
-        schema_block = """
-Knowledge graph schema (per window):
-- Entities:
-  - Sensor(name, subsystem, anomaly_score)
-    * anomaly_score: GDN model prediction (0.0-1.0), highly reliable indicator
-    * Scores > 0.5 indicate likely faults, scores > 0.7 indicate very likely faults
-  - Window(idx, embedding[32], dist_to_normal_center, dist_to_anomalous_center, confidence, label, fault_type)
-    * embedding: 32-dimensional embedding vector from GDN model
-    * dist_to_normal_center: Euclidean distance to learned normal class center
-    * dist_to_anomalous_center: Euclidean distance to learned anomalous class center
-    * confidence: Confidence score based on distance comparison (higher = more likely normal)
-  - ClassCenter(class: "normal" | "anomalous", embedding[32], mean_radius)
-    * Represents learned class centers from center loss training
-- Relations:
-  - HAS_READING(Window -> Sensor) with properties:
-    - anomaly_score (float): GDN prediction - reliable fault indicator
-    - is_faulty (bool): Derived from anomaly_score threshold
-  - CORRELATES_WITH(Sensor -> Sensor) with properties:
-    - correlation (float): Actual correlation value
-    - expected_correlation (float): Expected correlation from training
-    - deviation (float): |actual - expected| - deviations > 0.3 indicate violations
-    - is_violation (bool): True when deviation > threshold (STRONGEST fault signal)
-  - SIMILAR_TO(Window -> Window) with properties:
-    - similarity (float): Cosine similarity between window embeddings
-    - distance (float): Euclidean distance between embeddings
-    - Used to find similar past anomalies for pattern matching
-  - DISTANCE_TO_CENTER(Window -> ClassCenter) with properties:
-    - distance (float): Euclidean distance to class center
-    - z_score (float): Standardized distance score
+        """
+        Build prompt for LLM to generate logical form steps following KAG paper format.
 
-TOOL EFFECTIVENESS GUIDANCE:
-1. **get_violations**: STRONGEST signal - correlation violations are the most reliable fault indicators
-   - Use this tool FIRST when diagnosing faults
+        This implements Stage 1 of the KAG two-stage prompting strategy:
+        - Planning Prompt: Generates structured logical form with symbolic operators
+        - The logical form is then executed to produce structured reasoning results
+        """
+        schema_block = """
+**Knowledge Graph Schema:**
+
+**Entities:**
+- **Sensor** with properties:
+  - name: Sensor identifier (e.g., "VEHICLE_SPEED")
+  - subsystem: Subsystem classification (e.g., "Drivetrain")
+  - anomaly_score: GDN model prediction (0.0-1.0), highly reliable indicator
+    * Scores > 0.5 indicate likely faults
+    * Scores > 0.7 indicate very likely faults
+
+- **Window** with properties:
+  - idx: Window index
+  - embedding[32]: 32-dimensional embedding vector from GDN model
+  - dist_to_normal_center: Euclidean distance to learned normal class center
+  - dist_to_anomalous_center: Euclidean distance to learned anomalous class center
+  - confidence: Confidence score based on distance comparison
+  - label: Ground truth label (if available)
+  - fault_type: Fault type classification (if available)
+
+- **ClassCenter** with properties:
+  - class: "normal" | "anomalous"
+  - embedding[32]: Class center embedding vector
+  - mean_radius: Mean distance radius for this class
+
+**Relations:**
+- **HAS_READING**(Window -> Sensor) with properties:
+  - anomaly_score (float): GDN prediction - reliable fault indicator
+  - is_faulty (bool): Derived from anomaly_score threshold
+
+- **CORRELATES_WITH**(Sensor -> Sensor) with properties:
+  - correlation (float): Actual correlation value
+  - expected_correlation (float): Expected correlation from training
+  - deviation (float): |actual - expected| - deviations > 0.3 indicate violations
+  - is_violation (bool): True when deviation > threshold (STRONGEST fault signal)
+
+- **SIMILAR_TO**(Window -> Window) with properties:
+  - similarity (float): Cosine similarity between window embeddings
+  - distance (float): Euclidean distance between embeddings
+  - Used to find similar past anomalies for pattern matching
+
+- **DISTANCE_TO_CENTER**(Window -> ClassCenter) with properties:
+  - distance (float): Euclidean distance to class center
+  - z_score (float): Standardized distance score
+"""
+
+        operators_block = """
+**Available Logical Operators (KAG Paper Format):**
+
+The following 4 operators are available for traversing the knowledge graph:
+
+1. **Retrieval(s=?, p=predicate, o=?, constraints={{...}})**
+   Purpose: Query graph triples using SPO (Subject-Predicate-Object) pattern matching
+   
+   Parameters:
+   - s: Subject (entity type or variable, e.g., Sensor, Window, or $step1_results)
+   - p: Predicate (relation name, e.g., HAS_READING, CORRELATES_WITH)
+   - o: Object (entity type or variable, or "?" for any)
+   - constraints: Dictionary of constraints (e.g., {{"window_idx": 42, "anomaly_score": {{"operation": "gt", "value": 0.6}}}})
+   
+   Alternative format (for convenience):
+   - operation: Operation type ("has_reading", "correlates_with", "find_similar_windows", "find_anomalous_neighbors")
+   - subject: Subject constraints dict (e.g., {{"window_idx": 42}})
+   - object: Object constraints dict (e.g., {{"anomaly_score": {{"operation": "gt", "value": 0.7}}}})
+   
+   Examples:
+   - Retrieval(operation="has_reading", subject={{"window_idx": 42}}, object={{"anomaly_score": {{"operation": "gt", "value": 0.7}}}})
+     → Find all sensors in window 42 with anomaly score > 0.7
+   - Retrieval(operation="correlates_with", subject={{"window_idx": 42}}, object={{"deviation_threshold": 0.3, "is_violation": true}})
+     → Find correlation violations in window 42 (strongest fault signal)
+   - Retrieval(operation="find_similar_windows", subject={{"window_idx": 42}}, object={{"k": 5, "threshold": 0.2}})
+     → Find 5 most similar windows via embedding distance
+
+2. **Math(operation, operands)**
+   Purpose: Numerical computation over operands
+   
+   Parameters:
+   - operation: Operation type ("count", "sum", "max", "mean")
+   - operands: List of operands (can reference previous steps with $step<id>_results)
+   
+   Examples:
+   - Math(operation="count", operands=["$step1_results"])
+     → Count how many items are in step 1 results
+   - Math(operation="max", operands=["$step2_results", "anomaly_score"])
+     → Find maximum anomaly score from step 2 results
+
+3. **Deduce(left, right, comparison)**
+   Purpose: Logical comparison or root cause extraction
+   
+   Parameters:
+   - left: Left operand (can reference previous steps with $step<id>_results)
+   - right: Right operand (value or step reference)
+   - comparison: Comparison type ("greater", "less", "equal", "contains", "extract_root_cause")
+   
+   Examples:
+   - Deduce(left="$step3_result", right=2, comparison="greater")
+     → Check if step 3 result > 2 (indicates multi-sensor fault)
+   - Deduce(left="$step1_results", right="$step2_results", comparison="extract_root_cause")
+     → Identify root cause sensor from violations (step1) and anomalies (step2)
+
+4. **Sort(target, key, direction, limit)**
+   Purpose: Rank and filter results
+   
+   Parameters:
+   - target: Target set to sort (can reference previous steps with $step<id>_results)
+   - key: Key to sort by (e.g., "anomaly_score", "deviation", "distance")
+   - direction: Sort direction ("asc" or "desc")
+   - limit: Optional limit on number of results to return
+   
+   Examples:
+   - Sort(target="$step1_results", key="anomaly_score", direction="desc", limit=3)
+     → Sort sensors by anomaly_score descending, return top 3
+   - Sort(target="$step2_results", key="deviation", direction="desc", limit=5)
+     → Sort violations by deviation descending, return top 5
+"""
+
+        strategy_guidance = """
+**Diagnostic Strategy Guidance:**
+
+**Tool Effectiveness (use in priority order):**
+1. **Correlation Violations** (STRONGEST signal): Use Retrieval with operation="correlates_with" and is_violation=true
    - Violations indicate broken sensor relationships - strong root cause signal
    - Sensors with the MOST violations are often root causes
-   
-2. **get_anomalous_sensors**: Good signal, but use with violations for best results
+   - Query FIRST when diagnosing faults
+
+2. **Anomalous Sensors**: Use Retrieval with operation="has_reading" and anomaly_score threshold
    - Start with threshold=0.7 (high confidence) to reduce false positives
    - If no results, fall back to threshold=0.5
    - ALWAYS combine with violations when both are available
 
-3. **find_similar_windows**: Embedding-based retrieval - find similar past anomalies
-   - Use to find windows with similar embedding patterns that were anomalous
+3. **Similar Windows**: Use Retrieval with operation="find_similar_windows"
+   - Find windows with similar embedding patterns that were anomalous
    - Helps identify fault types by matching to historical patterns
    - Distance threshold ~0.2 typically finds relevant similar windows
-   
-4. **find_anomalous_neighbors**: Find windows with similar embeddings that were anomalous
+
+4. **Anomalous Neighbors**: Use Retrieval with operation="find_anomalous_neighbors"
+   - Find windows with similar embeddings that were anomalous
    - Useful for pattern matching and fault type identification
-   - Can help validate current window's anomaly status
-   
-5. **Hierarchical Strategy**:
-   - Stage 1: Query violations first (strongest signal)
-   - Stage 2: Query anomalies with threshold=0.7 for sensors with violations
-   - Stage 3: Query similar windows via embeddings to find historical patterns
-   - Stage 4: If Stage 1 finds nothing, query anomalies with threshold=0.5 + violations
-   - Stage 5: Combine evidence - sensors with BOTH high anomaly scores AND violations are very likely faulty
+
+**Recommended Hierarchical Strategy:**
+- Step 1: Query violations FIRST (strongest signal)
+- Step 2: Query anomalies with threshold=0.7 for sensors with violations
+- Step 3: Query similar windows via embeddings to find historical patterns
+- Step 4: If Step 1 finds nothing, query anomalies with threshold=0.5 + violations
+- Step 5: Combine evidence - sensors with BOTH high anomaly scores AND violations are very likely faulty
 """
 
         examples_block = """
-Allowed operators and syntax:
+**Example Logical Form Generation:**
 
-RECOMMENDED STRATEGY (violations-first with centrality):
-- Step 1: Query violations FIRST (strongest signal)
-  Step 1: Retrieval(operation="correlates_with", subject={{"window_idx": 42}}, 
-                   object={{"deviation_threshold": 0.3, "is_violation": true}})
-  Description: Find all correlation violations in window 42 (strongest fault signal)
+**Question:** What is the root cause fault in window 42, and which sensors did it affect?
 
-- Step 2: Query anomalies for sensors with violations
-  Step 2: Retrieval(operation="has_reading", subject={{"window_idx": 42}},
-                   object={{"anomaly_score": {{"operation": "gt", "value": 0.7}}}})
-  Description: Find sensors with high anomaly scores (>0.7) to validate violations
+**Logical Form Steps:**
 
-- Step 3: Query centrality to find most connected sensors
-  Step 3: Retrieval(operation="compute_centrality", subject={{"window_idx": 42}})
-  Description: Find sensors with highest degree centrality (most connections) - indicates root cause
+Step 1: Retrieval(operation="correlates_with", subject={{"window_idx": 42}}, 
+                  object={{"deviation_threshold": 0.3, "is_violation": true}})
+   → Find all correlation violations in window 42 (strongest fault signal)
 
-- Step 4: Query similar windows via embeddings
-  Step 4: Retrieval(operation="find_similar_windows", subject={{"window_idx": 42}},
-                   object={{"k": 5, "threshold": 0.2}})
-  Description: Find 5 most similar windows in embedding space to identify fault patterns
+Step 2: Retrieval(operation="has_reading", subject={{"window_idx": 42}},
+                  object={{"anomaly_score": {{"operation": "gt", "value": 0.7}}}})
+   → Find sensors with high anomaly scores (>0.7) to validate violations
 
-- Step 5: Combine evidence with temporal analysis
-  Step 5: Deduce(left_operand="$step1_results", right_operand="$step2_results",
-                comparison="extract_root_cause")
-  Description: Identify root cause sensor considering violations, anomaly scores, centrality, embedding similarity, and temporal onset
+Step 3: Math(operation="count", operands=["$step1_results"])
+   → Count how many violations were found
 
-ALTERNATIVE STRATEGY (if violations query returns empty):
-- Step 1: Query anomalies with high threshold
-  Step 1: Retrieval(operation="has_reading", subject={{"window_idx": 42}},
-                   object={{"anomaly_score": {{"operation": "gt", "value": 0.7}}}})
-  Description: Find sensors with high anomaly scores (>0.7)
+Step 4: Deduce(left="$step3_result", right=2, comparison="greater")
+   → Check if violation count > 2 (indicates multi-sensor fault)
 
-- Step 2: Query centrality
-  Step 2: Retrieval(operation="compute_centrality", subject={{"window_idx": 42}})
-  Description: Find most connected sensors (high centrality indicates root cause)
+Step 5: Retrieval(operation="find_similar_windows", subject={{"window_idx": 42}},
+                  object={{"k": 5, "threshold": 0.2}})
+   → Find 5 most similar windows in embedding space to identify fault patterns
 
-- Step 3: Query similar anomalous windows
-  Step 3: Retrieval(operation="find_anomalous_neighbors", subject={{"window_idx": 42}},
-                   object={{"distance_threshold": 0.2}})
-  Description: Find windows with similar embeddings that were anomalous for pattern matching
-
-- Step 4: Combine with temporal analysis
-  Step 4: Deduce(left_operand="$step1_results", right_operand="$step2_results",
-                comparison="extract_root_cause")
-  Description: Root cause selection considers anomaly score, centrality, embedding similarity, and temporal onset (earlier onset = root cause)
-
-TEMPORAL ANALYSIS GUIDANCE:
-- Sensors that became anomalous earlier (in previous windows) are more likely root causes
-- Use temporal onset analysis: look back 2-3 windows to find when anomaly started
-- Earlier onset sensors should be weighted more heavily in root cause selection
-
-VIOLATION SEVERITY GUIDANCE:
-- Violations with deviation > 0.5 are "severe" and indicate strong fault signals
-- Severe violations should be weighted more heavily than mild violations
-- Sensors with multiple severe violations are very likely root causes
+Step 6: Deduce(left="$step1_results", right="$step2_results", comparison="extract_root_cause")
+   → Identify root cause sensor considering violations, anomaly scores, and embedding similarity
 """
 
         memory_str = json.dumps(memory, indent=2) if memory else "None"
         trace_brief = json.dumps(trace[-3:], indent=2) if trace else "None"
 
         return f"""
-You are an automotive diagnostic reasoning agent.
+You are a diagnostic reasoning agent. Decompose this question into logical form steps.
 
-Task:
-Decompose the following question into 3-6 logical steps that operate over the sensor knowledge graph.
-
-Question:
-{question}
+**Question:** {question}
 
 {schema_block}
 
-Previous findings (may be empty):
-{memory_str}
+{operators_block}
 
-Previous reasoning trace (last 3 steps):
-{trace_brief}
+{strategy_guidance}
 
 {examples_block}
 
-Constraints:
-- Use only the operators: Retrieval, Math, Deduce, Sort.
-- Each step MUST follow this exact JSON-like format (one per line):
-  Step <id>: <Operator>(operation_params_as_valid_Python_dict)
-  Description: <short natural language description>
+**Previous Findings (may be empty):**
+{memory_str}
 
-- Use integer step ids starting from 1.
-- Use "$step<id>_results" to reference outputs from previous steps.
-- Use constraints keys only from:
-  ["window_idx", "anomaly_score_subject", "anomaly_score_object", "correlation", "is_violation", "deviation_threshold", "k", "threshold", "distance_threshold"].
-- For embedding operations (find_similar_windows, find_anomalous_neighbors), use operation="find_similar_windows" or "find_anomalous_neighbors".
+**Previous Reasoning Trace (last 3 steps):**
+{trace_brief}
 
-Now produce the logical-form steps for this question ONLY. Do not answer the question yet.
+**Output Format:**
+Generate 3-6 logical form steps. Each step MUST follow this exact format:
+
+Step <id>: <Operator>(<parameters_as_dict>)
+   → <short natural language description>
+
+**Constraints:**
+- Use only the operators: Retrieval, Math, Deduce, Sort
+- Use integer step ids starting from 1
+- Use "$step<id>_results" to reference outputs from previous steps
+- For Retrieval operations, use operation="has_reading", "correlates_with", "find_similar_windows", or "find_anomalous_neighbors"
+- Parameters should be valid Python dict syntax (use double braces {{}} for dicts in f-strings)
+
+**Now produce the logical-form steps for this question ONLY. Do not answer the question yet.**
 """
 
     def generate_logical_form(
@@ -1606,29 +1807,61 @@ Now produce the logical-form steps for this question ONLY. Do not answer the que
                     result = None
 
                 step_results[step.step_id] = result
-            except Exception as e:
+            except Exception:
                 # On error, store None for this step
                 step_results[step.step_id] = None
 
         return step_results
 
     def _format_exec_results(self, exec_results: Dict[int, Any]) -> str:
-        """Format execution results for LLM answer synthesis."""
+        """
+        Format execution results for LLM answer synthesis following KAG paper format.
+
+        Structures the output to show step-by-step reasoning results with clear
+        interpretation guidance, matching the KAG paper's structured reasoning format.
+        """
         lines = []
-        lines.append("GDN Model Predictions (Reliable Fault Indicators):")
-        lines.append("=" * 60)
+        lines.append("**Structured Reasoning Results:**")
+        lines.append("")
+        lines.append(
+            "The following results were obtained by executing logical form steps over the knowledge graph:"
+        )
         lines.append("")
 
         for step_id, result in sorted(exec_results.items()):
-            lines.append(f"Step {step_id} results:")
+            # Determine operation type from result structure
+            operation_name = "Unknown Operation"
+            if isinstance(result, list):
+                if len(result) > 0 and isinstance(result[0], dict):
+                    if "score" in result[0] and "sensor" in result[0]:
+                        operation_name = "Anomalous Sensors Found"
+                    elif "deviation" in result[0]:
+                        operation_name = "Correlation Violations Found"
+                    elif "window_idx" in result[0] and "similarity" in result[0]:
+                        operation_name = "Similar Windows Found"
+                    elif "distance" in result[0]:
+                        operation_name = "Anomalous Neighbors Found"
+                elif isinstance(result, (int, float)):
+                    operation_name = "Math Operation Result"
+            elif isinstance(result, (int, float)):
+                operation_name = "Math Operation Result"
+            elif isinstance(result, str):
+                operation_name = "Deduce Operation Result"
+
+            lines.append(f"**Step {step_id} - {operation_name}:**")
+
             if isinstance(result, list):
                 if len(result) > 0 and isinstance(result[0], dict):
                     # Format list of dicts
-                    lines.append(f"  Found {len(result)} items:")
+                    lines.append(f"Found {len(result)} items:")
+                    lines.append("")
 
                     # Add interpretation for anomalous sensors
                     if "score" in result[0] and "sensor" in result[0]:
-                        lines.append("  (Anomaly scores > 0.5 indicate likely faults)")
+                        lines.append(
+                            "*Interpretation: Anomaly scores > 0.5 indicate likely faults, scores > 0.7 indicate very likely faults*"
+                        )
+                        lines.append("")
                         for i, item in enumerate(result[:5]):  # Show first 5
                             score = item.get("score", 0)
                             severity = (
@@ -1641,20 +1874,21 @@ Now produce the logical-form steps for this question ONLY. Do not answer the que
                             sensor_name = item.get("sensor", "UNKNOWN")
                             subsystem = item.get("subsystem", "")
                             lines.append(
-                                f"    {i + 1}. {sensor_name}"
+                                f"- {sensor_name}"
                                 + (f" ({subsystem})" if subsystem else "")
                             )
                             lines.append(
-                                f"       Anomaly Score: {score:.3f} ({severity} severity)"
+                                f"  - Anomaly Score: {score:.3f} ({severity} severity)"
                             )
                         if len(result) > 5:
-                            lines.append(f"    ... and {len(result) - 5} more")
+                            lines.append(f"- ... and {len(result) - 5} more sensors")
 
                     # Add interpretation for violations
                     elif "deviation" in result[0]:
                         lines.append(
-                            "  (Deviations > 0.3 indicate correlation violations - strong fault signals)"
+                            "*Interpretation: Deviations > 0.3 indicate correlation violations - these are STRONG fault signals. Deviations > 0.5 are severe violations.*"
                         )
+                        lines.append("")
                         for i, item in enumerate(result[:5]):
                             deviation = item.get("deviation", 0)
                             severity = (
@@ -1668,58 +1902,141 @@ Now produce the logical-form steps for this question ONLY. Do not answer the que
                             target = item.get("target", "?")
                             actual = item.get("actual", 0)
                             expected = item.get("expected", 0)
-                            lines.append(f"    {i + 1}. {source} -> {target}")
+                            lines.append(f"- {source} ↔ {target}")
+                            lines.append(f"  - Deviation: {deviation:.3f} ({severity})")
                             lines.append(
-                                f"       Deviation: {deviation:.3f} ({severity})"
-                            )
-                            lines.append(
-                                f"       Actual correlation: {actual:.3f}, Expected: {expected:.3f}"
+                                f"  - Actual correlation: {actual:.3f}, Expected: {expected:.3f}"
                             )
                         if len(result) > 5:
-                            lines.append(f"    ... and {len(result) - 5} more")
-                    else:
+                            lines.append(f"- ... and {len(result) - 5} more violations")
+
+                    # Add interpretation for similar windows
+                    elif "window_idx" in result[0] and "similarity" in result[0]:
+                        lines.append(
+                            "*Interpretation: Similar windows help identify fault patterns by matching to historical anomalies*"
+                        )
+                        lines.append("")
                         for i, item in enumerate(result[:5]):
-                            lines.append(f"    {i + 1}. {json.dumps(item, indent=4)}")
+                            window_idx = item.get("window_idx", "?")
+                            similarity = item.get("similarity", 0)
+                            distance = item.get("distance", 0)
+                            lines.append(f"- Window {window_idx}")
+                            lines.append(
+                                f"  - Similarity: {similarity:.3f}, Distance: {distance:.3f}"
+                            )
+                            if (
+                                "dist_normal" in item
+                                and item["dist_normal"] is not None
+                            ):
+                                lines.append(
+                                    f"  - Distance to normal center: {item['dist_normal']:.3f}"
+                                )
+                            if (
+                                "dist_anomalous" in item
+                                and item["dist_anomalous"] is not None
+                            ):
+                                lines.append(
+                                    f"  - Distance to anomalous center: {item['dist_anomalous']:.3f}"
+                                )
                         if len(result) > 5:
-                            lines.append(f"    ... and {len(result) - 5} more")
+                            lines.append(
+                                f"- ... and {len(result) - 5} more similar windows"
+                            )
+
+                    # Add interpretation for anomalous neighbors
+                    elif "distance" in result[0] and "window_idx" in result[0]:
+                        lines.append(
+                            "*Interpretation: Anomalous neighbors validate current window's anomaly status via embedding similarity*"
+                        )
+                        lines.append("")
+                        for i, item in enumerate(result[:5]):
+                            window_idx = item.get("window_idx", "?")
+                            distance = item.get("distance", 0)
+                            similarity = item.get("similarity", 0)
+                            lines.append(f"- Window {window_idx}")
+                            lines.append(
+                                f"  - Distance: {distance:.3f}, Similarity: {similarity:.3f}"
+                            )
+                        if len(result) > 5:
+                            lines.append(f"- ... and {len(result) - 5} more neighbors")
+
+                    else:
+                        # Generic formatting for other result types
+                        for i, item in enumerate(result[:5]):
+                            lines.append(
+                                f"- Item {i + 1}: {json.dumps(item, indent=2)}"
+                            )
+                        if len(result) > 5:
+                            lines.append(f"- ... and {len(result) - 5} more items")
+                elif len(result) == 0:
+                    lines.append("No items found.")
                 else:
-                    lines.append(f"  {result}")
-            elif result is not None:
-                lines.append(f"  {result}")
+                    lines.append(f"Result: {result}")
+            elif isinstance(result, (int, float)):
+                lines.append(f"Result: {result}")
+                if isinstance(result, int):
+                    lines.append(
+                        "*Interpretation: Count or numerical result from Math operation*"
+                    )
+                else:
+                    lines.append(
+                        "*Interpretation: Numerical result from Math operation*"
+                    )
+            elif isinstance(result, str):
+                lines.append(f"Result: {result}")
+                lines.append("*Interpretation: Root cause sensor or deduced result*")
+            elif result is None:
+                lines.append("(no results)")
             else:
-                lines.append("  (no results)")
+                lines.append(f"Result: {result}")
+
             lines.append("")
+
         return "\n".join(lines)
 
     def _generate_answer(
-        self, question: str, exec_results: Dict, memory: Dict, window_idx: Optional[int] = None
+        self,
+        question: str,
+        exec_results: Dict,
+        memory: Dict,
+        window_idx: Optional[int] = None,
     ) -> Tuple[str, float]:
-        """Generate final answer from execution results."""
+        """
+        Generate final answer from execution results following KAG paper format.
+
+        This implements Stage 2 of the KAG two-stage prompting strategy:
+        - Answer Synthesis Prompt: Synthesizes final answer from structured reasoning results
+        - Uses only structured evidence from logical form execution
+        """
         # STEP 1: Assess evidence strength BEFORE LLM call
         evidence_strength = self._assess_evidence_strength(exec_results)
-        
+
         # STEP 2: If evidence is weak, immediately return NORMAL prediction
         # Only filter MODERATE if BOTH score is low AND violations are few
         # This preserves faulty windows that have either high scores OR many violations
-        if (evidence_strength['level'] == 'NONE' or 
-            evidence_strength['level'] == 'WEAK'):
+        if evidence_strength["level"] == "NONE" or evidence_strength["level"] == "WEAK":
             reasoning = self._format_weak_evidence_reasoning(evidence_strength)
-            confidence = evidence_strength['confidence']
+            confidence = evidence_strength["confidence"]
             response = f"Faulty Sensors: []\nFault Type: NORMAL\nReasoning: {reasoning}\nConfidence: {confidence:.3f}"
             return response, confidence
-        
+
         # STEP 3: For MODERATE or STRONG evidence, proceed with LLM
         exec_str = self._format_exec_results(exec_results)
-        
+
         # Add embedding context if available
-        if window_idx is not None and hasattr(self.kg_builder, 'window_embeddings') and window_idx in self.kg_builder.window_embeddings:
+        embedding_section = ""
+        if (
+            window_idx is not None
+            and hasattr(self.kg_builder, "window_embeddings")
+            and window_idx in self.kg_builder.window_embeddings
+        ):
             embedding_data = self.kg_builder.window_embeddings[window_idx]
-            dist_normal = embedding_data.get('dist_normal', 0.0)
-            dist_anomalous = embedding_data.get('dist_anomalous', 0.0)
-            confidence_emb = embedding_data.get('confidence', 0.5)
-            
+            dist_normal = embedding_data.get("dist_normal", 0.0)
+            dist_anomalous = embedding_data.get("dist_anomalous", 0.0)
+            confidence_emb = embedding_data.get("confidence", 0.5)
+
             embedding_section = f"""
-EMBEDDING ANALYSIS:
+**Embedding Analysis:**
 - Distance to normal center: {dist_normal:.4f}
 - Distance to anomalous center: {dist_anomalous:.4f}
 - Embedding confidence: {confidence_emb:.3f}
@@ -1731,10 +2048,9 @@ EMBEDDING ANALYSIS:
             else:
                 embedding_section += "Uncertain/edge case (intermediate distances)"
             embedding_section += "\n"
-            exec_str += embedding_section
-        
+
         mem_str = json.dumps(memory, indent=2) if memory else "None"
-        
+
         # Extract valid sensors for validation
         valid_sensors = self._extract_valid_sensors(exec_results)
 
@@ -1744,78 +2060,90 @@ EMBEDDING ANALYSIS:
             f"- Correlation violations: {evidence_strength['num_violations']}\n"
             f"- Evidence strength: {evidence_strength['level']}"
         )
-        
+
         prompt = f"""
-You are an automotive diagnostics expert.
+You are an automotive diagnostic expert.
 
-Question:
-{question}
+**Original Question:** {question}
 
-IMPORTANT CONTEXT:
-The anomaly scores and correlation violations shown below come from a trained Graph Deviation Network (GDN) model that has been validated on automotive sensor data. These predictions are highly reliable indicators of actual faults:
+**Structured Reasoning Results:**
 
-EVIDENCE SUMMARY:
+The following results were obtained by executing logical form steps over the knowledge graph. Use ONLY this structured evidence to produce your answer.
+
+{exec_str}
+{embedding_section}
+**Evidence Summary:**
 {evidence_summary}
 
-EVIDENCE HIERARCHY (use in order of reliability):
+**Evidence Hierarchy (use in order of reliability):**
 1. **Correlation Violations** (STRONGEST SIGNAL): Deviations > 0.3 indicate broken sensor relationships - these are the MOST reliable fault indicators. Sensors with violations are likely root causes.
 2. **High Anomaly Scores** (>0.7): Very likely faulty sensors
-3. **Medium Anomaly Scores** (>0.5): Possibly faulty, but validate with violations if available
+3. **Medium Anomaly Scores** (0.5-0.7): Possibly faulty, but validate with violations if available
 4. **Low Anomaly Scores** (<0.5): Likely normal, but check violations to confirm
 
-EVIDENCE FUSION STRATEGY:
+**CRITICAL: Missing Violations Indicates Normal Operation**
+- **If violations are missing** (Step 1 returns None/empty), this STRONGLY indicates normal operation even if anomaly scores are elevated
+- **Only predict faults when BOTH violations exist AND scores are high (>0.7)**
+- High scores without violations suggest sensor noise or transient variations, not actual faults
+
+**Evidence Fusion Strategy:**
 - **Combine signals**: A sensor with BOTH high anomaly score (>0.7) AND violations is VERY likely faulty
 - **Root cause identification**: Sensors with the MOST violations are often root causes
 - **Affected sensors**: Sensors connected via violations to root cause are affected sensors
 - **No fault prediction**: If max anomaly score < 0.6 AND violations < 2, predict NORMAL (faulty_sensors: [])
+- **No violations = normal**: If no violations are found, predict NORMAL even if scores are elevated
 
-Structured reasoning results from graph queries:
-{exec_str}
-
-Global memory across iterations:
+**Global Memory (across iterations):**
 {mem_str}
 
-You MUST respond with a valid JSON object in this EXACT format (no other text, no markdown, no code blocks):
+**Answer Format:**
+
+Using only the structured evidence above, produce a JSON object in this EXACT format (no other text, no markdown, no code blocks):
 
 {{
     "faulty_sensors": ["SENSOR_NAME_1", "SENSOR_NAME_2"] or [],
-    "fault_type": "VSS_DROPOUT" | "COOLANT_DROPOUT" | "MAF_SCALE" | "TPS_STUCK" | "gradual_drift" or null,
-    "reasoning": "2-4 sentences explaining why, referring to anomaly scores, violations and correlations",
+    "fault_type": "VSS_DROPOUT" | "COOLANT_DROPOUT" | "MAF_SCALE_LOW" | "TPS_STUCK" | "gradual_drift" or null,
+    "reasoning": "2-4 sentences explaining why, referring to anomaly scores, violations and correlations from the structured results above",
     "confidence": 0.85
 }}
 
-Available sensor names: {', '.join([s.replace(' ()', '') for s in self.sensor_names])}
+**Available Sensor Names:** {", ".join([s.replace(" ()", "") for s in self.sensor_names])}
 
-Example valid JSON responses:
+**Example Valid JSON Responses:**
 
 Example 1 (with fault):
-{{"faulty_sensors": ["VEHICLE_SPEED"], "fault_type": "VSS_DROPOUT", "reasoning": "VEHICLE_SPEED has multiple severe correlation violations (deviations >0.5) with ENGINE_RPM and INTAKE_MANIFOLD_PRESSURE, indicating broken relationships. Combined with high anomaly score (0.85), high centrality (most connected sensor), and early temporal onset (anomaly started 2 windows ago), this strongly indicates VSS dropout fault as root cause.", "confidence": 0.90}}
+{{"faulty_sensors": ["VEHICLE_SPEED"], "fault_type": "VSS_DROPOUT", "reasoning": "VEHICLE_SPEED has multiple severe correlation violations (deviations >0.5) with ENGINE_RPM and INTAKE_MANIFOLD_PRESSURE, indicating broken relationships. Combined with high anomaly score (0.85) from Step 2 results, this strongly indicates VSS dropout fault as root cause.", "confidence": 0.90}}
 
 Example 2 (with fault):
-{{"faulty_sensors": ["COOLANT_TEMPERATURE"], "fault_type": "COOLANT_DROPOUT", "reasoning": "COOLANT_TEMPERATURE shows correlation violations with ENGINE_LOAD (deviation 0.42) and anomaly score of 0.72. The violation pattern suggests coolant sensor dropout affecting engine load correlation. Temporal analysis shows this sensor became anomalous earlier than others, indicating root cause.", "confidence": 0.80}}
+{{"faulty_sensors": ["COOLANT_TEMPERATURE"], "fault_type": "COOLANT_DROPOUT", "reasoning": "COOLANT_TEMPERATURE shows correlation violations with ENGINE_LOAD (deviation 0.42) from Step 1 results and anomaly score of 0.72 from Step 2 results. The violation pattern suggests coolant sensor dropout affecting engine load correlation.", "confidence": 0.80}}
 
 Example 3 (no fault):
-{{"faulty_sensors": [], "fault_type": null, "reasoning": "All sensors show low anomaly scores (<0.5) and NO correlation violations detected. Temporal analysis shows no early-onset anomalies. This indicates normal operation with no faults present.", "confidence": 0.90}}
+{{"faulty_sensors": [], "fault_type": null, "reasoning": "All sensors show low anomaly scores (<0.5) from Step 2 results and NO correlation violations detected in Step 1 results. This indicates normal operation with no faults present.", "confidence": 0.90}}
 
-CRITICAL RULES:
-1. **You can ONLY name sensors that appear in the tool results above** - Do NOT invent sensors
-2. **Prioritize violations**: If violations exist, use them to identify root cause (sensor with most violations)
+Example 4 (no fault, despite high scores):
+{{"faulty_sensors": [], "fault_type": null, "reasoning": "Step 2 results show some sensors with elevated anomaly scores (0.65-0.75), but Step 1 found NO correlation violations. Since correlation violations are the STRONGEST signal and none were detected, this indicates normal operation despite elevated scores. High scores without violations suggest sensor noise or transient variations, not actual faults.", "confidence": 0.85}}
+
+**Critical Rules:**
+1. **You can ONLY name sensors that appear in the structured results above** - Do NOT invent sensors
+2. **Prioritize violations**: If violations exist in Step results, use them to identify root cause (sensor with most violations)
 3. **Combine evidence**: Use BOTH anomaly scores AND violations when both are available
 4. **NORMAL prediction rule**: If max anomaly score < 0.6 AND violations < 2, predict NORMAL (faulty_sensors: [], fault_type: null)
-5. **Temporal analysis**: Sensors that became anomalous earlier (in previous windows) are more likely root causes
-6. **Centrality matters**: Sensors with high degree centrality (many connections) are more likely root causes
-7. **Violation severity**: Severe violations (deviation >0.5) are stronger signals than mild violations
-8. **High confidence for violations**: Violations are strong signals - use them even if anomaly scores are moderate
-9. **Root cause = sensor with most violations + early onset + high centrality**: When multiple sensors have violations, prioritize the one with most violations, earliest onset, and highest centrality
-10. **JSON ONLY**: Output ONLY valid JSON. No markdown code blocks, no explanatory text, just the JSON object.
+5. **Reference structured results**: In your reasoning, refer to specific Step results (e.g., "from Step 1 results", "Step 2 found...")
+6. **Violation severity**: Severe violations (deviation >0.5) are stronger signals than mild violations
+7. **Root cause = sensor with most violations**: When multiple sensors have violations, prioritize the one with most violations
+8. **JSON ONLY**: Output ONLY valid JSON. No markdown code blocks, no explanatory text, just the JSON object.
 
-Available sensor names from tool results: {', '.join(sorted(valid_sensors)) if valid_sensors else 'None'}
+**Available sensor names from tool results:** {", ".join(sorted(valid_sensors)) if valid_sensors else "None"}
 
-Now produce the JSON response for the given question using ONLY the structured results above. Do NOT invent extra sensors or signals.
+Now produce the JSON response using ONLY the structured reasoning results above. Do NOT invent extra sensors or signals.
 """
 
         response = call_llm(
-            prompt, self.model, self.tokenizer, max_tokens=512, temperature=0.3  # Lower temperature for more consistent JSON
+            prompt,
+            self.model,
+            self.tokenizer,
+            max_tokens=512,
+            temperature=0.3,  # Lower temperature for more consistent JSON
         )
 
         # STEP 4: Parse JSON response and validate
@@ -1830,41 +2158,46 @@ Now produce the JSON response for the given question using ONLY the structured r
             if response_clean.endswith("```"):
                 response_clean = response_clean[:-3]
             response_clean = response_clean.strip()
-            
+
             # Extract JSON object using regex (handles cases where there's extra text)
-            json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_clean, re.DOTALL)
+            json_match = re.search(
+                r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", response_clean, re.DOTALL
+            )
             if json_match:
                 result = json.loads(json_match.group(0))
                 confidence = float(result.get("confidence", 0.5))
-                
+
                 # STEP 5: Post-LLM validation - filter hallucinations
                 claimed_sensors = result.get("faulty_sensors", [])
-                validated_sensors = [
-                    s for s in claimed_sensors 
-                    if s in valid_sensors
-                ]
-                
+                validated_sensors = [s for s in claimed_sensors if s in valid_sensors]
+
                 # Remove hallucinations
                 if len(validated_sensors) < len(claimed_sensors):
                     num_removed = len(claimed_sensors) - len(validated_sensors)
                     # Adjust confidence downward if hallucinations detected
                     confidence = max(0.0, confidence - 0.1 * num_removed)
-                
+
                 # Normalize fault type
                 raw_fault_type = result.get("fault_type", None)
-                fault_type = self._normalize_fault_type(raw_fault_type) if raw_fault_type else None
-                
+                fault_type = (
+                    self._normalize_fault_type(raw_fault_type)
+                    if raw_fault_type
+                    else None
+                )
+
                 # If no valid sensors, ensure fault_type is None
                 if not validated_sensors:
                     fault_type = None
-                
+
                 reasoning = result.get("reasoning", "")
                 response = f"Faulty Sensors: {validated_sensors}\nFault Type: {fault_type}\nReasoning: {reasoning}\nConfidence: {confidence:.3f}"
             else:
                 # Fallback: try to extract confidence from text format
                 if "Confidence:" in response:
                     try:
-                        conf_str = response.split("Confidence:")[1].split("\n")[0].strip()
+                        conf_str = (
+                            response.split("Confidence:")[1].split("\n")[0].strip()
+                        )
                         confidence = float(conf_str)
                     except Exception:
                         pass
@@ -1917,10 +2250,12 @@ Follow-up Question: <single new question to the knowledge graph>
 
         return original_question  # fallback
 
-    def _classify_fault_type(self, root_cause: str, affected: List[str], violations: List[Dict]) -> Optional[str]:
+    def _classify_fault_type(
+        self, root_cause: str, affected: List[str], violations: List[Dict]
+    ) -> Optional[str]:
         """
         Map root cause + affected sensors to fault type.
-        
+
         Uses exact fault types from codebase:
         - VSS_DROPOUT for VEHICLE_SPEED faults
         - COOLANT_DROPOUT for COOLANT_TEMPERATURE faults
@@ -1928,37 +2263,37 @@ Follow-up Question: <single new question to the knowledge graph>
         - MAF_SCALE_LOW for INTAKE_MANIFOLD_PRESSURE faults
         - RPM_SPEED_DECOUPLE for RPM+SPEED decoupling
         - gradual_drift as default
-        
+
         Args:
             root_cause: Base sensor name of root cause
             affected: List of affected base sensor names
             violations: List of violation dicts (unused but kept for API consistency)
-            
+
         Returns:
             Fault type string or None if no root cause
         """
         if not root_cause:
             return None
-        
+
         # Check for RPM_SPEED_DECOUPLE (both sensors affected)
         all_faulty = [root_cause] + affected
-        has_rpm = any('ENGINE_RPM' in s for s in all_faulty)
-        has_speed = any('VEHICLE_SPEED' in s for s in all_faulty)
-        
+        has_rpm = any("ENGINE_RPM" in s for s in all_faulty)
+        has_speed = any("VEHICLE_SPEED" in s for s in all_faulty)
+
         if has_rpm and has_speed:
-            return 'RPM_SPEED_DECOUPLE'
-        
+            return "RPM_SPEED_DECOUPLE"
+
         # Check root cause sensor
-        if 'VEHICLE_SPEED' in root_cause:
-            return 'VSS_DROPOUT'
-        elif 'COOLANT_TEMPERATURE' in root_cause:
-            return 'COOLANT_DROPOUT'
-        elif 'THROTTLE' in root_cause:
-            return 'TPS_STUCK'
-        elif 'INTAKE_MANIFOLD_PRESSURE' in root_cause:
-            return 'MAF_SCALE_LOW'
+        if "VEHICLE_SPEED" in root_cause:
+            return "VSS_DROPOUT"
+        elif "COOLANT_TEMPERATURE" in root_cause:
+            return "COOLANT_DROPOUT"
+        elif "THROTTLE" in root_cause:
+            return "TPS_STUCK"
+        elif "INTAKE_MANIFOLD_PRESSURE" in root_cause:
+            return "MAF_SCALE_LOW"
         else:
-            return 'gradual_drift'
+            return "gradual_drift"
 
     def solve(self, window_idx: int) -> Dict:
         """
@@ -1979,7 +2314,7 @@ Follow-up Question: <single new question to the knowledge graph>
         """
         memory = {}
         trace = []
-        question = f"Which sensors are faulty in window {window_idx} and what is the root cause?"
+        question = f"Analyze window {window_idx}: Are there any faulty sensors? If yes, identify which sensors are faulty and determine the root cause."
 
         for iteration in range(self.max_iterations):
             # Generate logical form
@@ -2006,8 +2341,10 @@ Follow-up Question: <single new question to the knowledge graph>
             }
 
             # Generate answer
-            answer, llm_confidence = self._generate_answer(question, exec_results, memory, window_idx=window_idx)
-            
+            answer, llm_confidence = self._generate_answer(
+                question, exec_results, memory, window_idx=window_idx
+            )
+
             # Extract anomalous sensors and violations for structured confidence
             anomalous_sensors = []
             violations = []
@@ -2020,15 +2357,15 @@ Follow-up Question: <single new question to the knowledge graph>
                         elif "source" in result[0] and "deviation" in result[0]:
                             # Violations
                             violations.extend(result)
-            
+
             # Compute structured confidence
             structured_confidence = self._compute_structured_confidence(
                 anomalous_sensors, violations, window_idx
             )
-            
+
             # Hybrid confidence: 0.6 * LLM + 0.4 * structured
             confidence = 0.6 * llm_confidence + 0.4 * structured_confidence
-            
+
             trace[-1]["answer"] = answer[:200]
             trace[-1]["confidence"] = confidence
             trace[-1]["llm_confidence"] = llm_confidence
@@ -2068,8 +2405,10 @@ Follow-up Question: <single new question to the knowledge graph>
                         description="Query correlation violations (strong fault signal)",
                     )
                 ]
-                violation_results = self.execute_logical_form(violation_steps, window_idx)
-                
+                violation_results = self.execute_logical_form(
+                    violation_steps, window_idx
+                )
+
                 # If violations found, query anomalies for those sensors
                 if violation_results.get(100) and len(violation_results[100]) > 0:
                     violations = violation_results[100]
@@ -2080,7 +2419,7 @@ Follow-up Question: <single new question to the knowledge graph>
                             violation_sensors.add(v.get("source", ""))
                             violation_sensors.add(v.get("target", ""))
                     violation_sensors = [s for s in violation_sensors if s]
-                    
+
                     # Query anomalies with lower threshold for violation sensors
                     if violation_sensors:
                         anomaly_steps = [
@@ -2090,20 +2429,29 @@ Follow-up Question: <single new question to the knowledge graph>
                                 params={
                                     "operation": "has_reading",
                                     "subject": {"window_idx": window_idx},
-                                    "object": {"anomaly_score": {"operation": "gt", "value": 0.5}},
+                                    "object": {
+                                        "anomaly_score": {
+                                            "operation": "gt",
+                                            "value": 0.5,
+                                        }
+                                    },
                                 },
                                 description="Query anomalous sensors to validate violations",
                             )
                         ]
-                        anomaly_results = self.execute_logical_form(anomaly_steps, window_idx)
-                        
+                        anomaly_results = self.execute_logical_form(
+                            anomaly_steps, window_idx
+                        )
+
                         # Merge results
                         exec_results[100] = violation_results[100]
                         exec_results[101] = anomaly_results.get(101, [])
-                        
+
                         # Regenerate answer with violation-first evidence
-                        answer, llm_confidence = self._generate_answer(question, exec_results, memory, window_idx=window_idx)
-                        
+                        answer, llm_confidence = self._generate_answer(
+                            question, exec_results, memory, window_idx=window_idx
+                        )
+
                         # Extract anomalous sensors and violations for structured confidence
                         anomalous_sensors_vf = []
                         violations_vf = []
@@ -2112,17 +2460,22 @@ Follow-up Question: <single new question to the knowledge graph>
                                 if isinstance(result[0], dict):
                                     if "sensor" in result[0] and "score" in result[0]:
                                         anomalous_sensors_vf.extend(result)
-                                    elif "source" in result[0] and "deviation" in result[0]:
+                                    elif (
+                                        "source" in result[0]
+                                        and "deviation" in result[0]
+                                    ):
                                         violations_vf.extend(result)
-                        
+
                         # Compute structured confidence
                         structured_confidence_vf = self._compute_structured_confidence(
                             anomalous_sensors_vf, violations_vf, window_idx
                         )
-                        
+
                         # Hybrid confidence: 0.6 * LLM + 0.4 * structured
-                        confidence = 0.6 * llm_confidence + 0.4 * structured_confidence_vf
-                        
+                        confidence = (
+                            0.6 * llm_confidence + 0.4 * structured_confidence_vf
+                        )
+
                         trace[-1]["answer"] = answer[:200]
                         trace[-1]["confidence"] = confidence
                         trace[-1]["llm_confidence"] = llm_confidence
@@ -2137,45 +2490,104 @@ Follow-up Question: <single new question to the knowledge graph>
 
         # Parse final answer
         prediction = parse_llm_response(answer, self.sensor_names)
-        
-        # Fallback: Use execution results if parsing failed or no sensors found
+
+        # Weakened fallback: Only use if LLM explicitly failed to parse OR there's strong contradictory evidence
+        # Do NOT override explicit "no fault" predictions from LLM
         sensor_labels = prediction["sensor_labels"]
-        if np.sum(sensor_labels) == 0:
-            # Try to extract from execution results
-            # Look for anomalous sensors with high scores
-            for step_id, result in exec_results.items():
-                if isinstance(result, list) and len(result) > 0:
-                    # Check if this is anomalous sensors result
-                    if isinstance(result[0], dict) and "sensor" in result[0]:
-                        # Extract sensors with score > 0.7
-                        for item in result:
-                            if isinstance(item, dict):
-                                sensor_name = item.get("sensor", "")
-                                score = item.get("score", 0.0)
-                                if score > 0.7 and sensor_name in self.sensor_names:
-                                    idx = self.sensor_names.index(sensor_name)
-                                    sensor_labels[idx] = 1.0
-                    
-                    # Check if this is violations result
-                    elif isinstance(result[0], dict) and "source" in result[0]:
-                        # Count violations per sensor
-                        violation_counts = {}
-                        for item in result:
-                            if isinstance(item, dict):
-                                source = item.get("source", "")
-                                target = item.get("target", "")
-                                if source and source in self.sensor_names:
-                                    violation_counts[source] = violation_counts.get(source, 0) + 1
-                                if target and target in self.sensor_names:
-                                    violation_counts[target] = violation_counts.get(target, 0) + 1
-                        
-                        # Mark sensors with most violations
-                        if violation_counts:
-                            max_violations = max(violation_counts.values())
-                            for sensor_name, count in violation_counts.items():
-                                if count == max_violations and sensor_name in self.sensor_names:
-                                    idx = self.sensor_names.index(sensor_name)
-                                    sensor_labels[idx] = 1.0
+
+        # Check if LLM explicitly said "no fault" (empty list or explicit text)
+        llm_said_no_fault = (
+            np.sum(sensor_labels) == 0
+            and answer
+            and (
+                "Faulty Sensors: []" in answer
+                or '"faulty_sensors": []' in answer
+                or "no fault" in answer.lower()
+                or "no faulty sensors" in answer.lower()
+            )
+        )
+
+        # Check for strong contradictory evidence (high scores >= 0.8 AND violations exist)
+        has_strong_evidence = False
+        max_score_in_results = 0.0
+        has_violations = False
+
+        for step_id, result in exec_results.items():
+            if isinstance(result, list) and len(result) > 0:
+                if isinstance(result[0], dict):
+                    if "score" in result[0] and "sensor" in result[0]:
+                        # Anomalous sensors
+                        max_score_in_results = max(
+                            max_score_in_results,
+                            max(
+                                [
+                                    item.get("score", 0.0)
+                                    for item in result
+                                    if isinstance(item, dict)
+                                ]
+                            ),
+                        )
+                    elif "source" in result[0] and "deviation" in result[0]:
+                        # Violations
+                        has_violations = True
+
+        # Only consider strong evidence if both high scores AND violations exist
+        has_strong_evidence = max_score_in_results >= 0.8 and has_violations
+
+        # Only use fallback if:
+        # 1. LLM didn't explicitly say "no fault" AND
+        # 2. Either parsing failed (no answer) OR there's strong contradictory evidence
+        if np.sum(sensor_labels) == 0 and not llm_said_no_fault:
+            # Only apply fallback if there's strong contradictory evidence
+            if has_strong_evidence:
+                # Try to extract from execution results (only with strong evidence)
+                for step_id, result in exec_results.items():
+                    if isinstance(result, list) and len(result) > 0:
+                        # Check if this is anomalous sensors result
+                        if isinstance(result[0], dict) and "sensor" in result[0]:
+                            # Extract sensors with very high scores (>= 0.8) only
+                            for item in result:
+                                if isinstance(item, dict):
+                                    sensor_name = item.get("sensor", "")
+                                    score = item.get("score", 0.0)
+                                    if (
+                                        score >= 0.8
+                                        and sensor_name in self.sensor_names
+                                    ):
+                                        idx = self.sensor_names.index(sensor_name)
+                                        sensor_labels[idx] = 1.0
+
+                        # Check if this is violations result (only use if we also have high scores)
+                        elif (
+                            isinstance(result[0], dict)
+                            and "source" in result[0]
+                            and max_score_in_results >= 0.8
+                        ):
+                            # Count violations per sensor
+                            violation_counts = {}
+                            for item in result:
+                                if isinstance(item, dict):
+                                    source = item.get("source", "")
+                                    target = item.get("target", "")
+                                    if source and source in self.sensor_names:
+                                        violation_counts[source] = (
+                                            violation_counts.get(source, 0) + 1
+                                        )
+                                    if target and target in self.sensor_names:
+                                        violation_counts[target] = (
+                                            violation_counts.get(target, 0) + 1
+                                        )
+
+                            # Mark sensors with most violations (only if we have strong evidence)
+                            if violation_counts:
+                                max_violations = max(violation_counts.values())
+                                for sensor_name, count in violation_counts.items():
+                                    if (
+                                        count == max_violations
+                                        and sensor_name in self.sensor_names
+                                    ):
+                                        idx = self.sensor_names.index(sensor_name)
+                                        sensor_labels[idx] = 1.0
 
         # Extract root cause and affected sensors
         faulty_indices = np.where(sensor_labels > 0)[0]
@@ -2186,11 +2598,13 @@ Follow-up Question: <single new question to the knowledge graph>
             root_cause_idx = faulty_indices[0]
             root_cause_sensor = self.sensor_names[root_cause_idx]
             affected_sensors = [self.sensor_names[i] for i in faulty_indices[1:]]
-            
+
             # Classify fault_type if LLM didn't provide one but we have faulty sensors
             fault_type = prediction.get("fault_type", None)
             if fault_type is None:
-                fault_type = self._classify_fault_type(root_cause_sensor, affected_sensors, [])
+                fault_type = self._classify_fault_type(
+                    root_cause_sensor, affected_sensors, []
+                )
         else:
             # No fault - fault_type should be None
             fault_type = None
