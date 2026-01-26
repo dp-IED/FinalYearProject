@@ -74,7 +74,7 @@ def test_on_sample_windows(
     
     # Load LLM model
     if model_repo is None:
-        model_repo = "mlx-community/granite-4.0-h-micro-4bit"
+        model_repo = "granite-4.0-h-micro-GGUF"
     
     print("\nLoading LLM model...")
     try:
