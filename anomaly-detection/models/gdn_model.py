@@ -48,22 +48,22 @@ class MultiLabelGDN(nn.Module):
             add_self_loops=False,
         )
 
-        # Per-sensor anomaly classifier
+        # Per-sensor anomaly classifier (returns logits, no sigmoid for numerical stability)
         self.sensor_classifier = nn.Sequential(
             nn.Linear(hidden_dim, 32),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(32, 1),
-            nn.Sigmoid(),
+            # No sigmoid - use BCEWithLogitsLoss instead
         )
 
-        # Global window classifier (auxiliary)
+        # Global window classifier (auxiliary, returns logits)
         self.global_classifier = nn.Sequential(
             nn.Linear(num_nodes * hidden_dim, 64),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(64, 1),
-            nn.Sigmoid(),
+            # No sigmoid - use BCEWithLogitsLoss instead
         )
 
     def build_graph_from_embeddings(self):
@@ -88,11 +88,11 @@ class MultiLabelGDN(nn.Module):
 
         Args:
             x: (B, W, N) input tensor where B=batch_size, W=window_size, N=num_sensors
-            return_global: If True, also return global window anomaly probability
+            return_global: If True, also return global window anomaly logits
 
         Returns:
-            - sensor_probs: (B, N) probability each sensor is anomalous
-            - global_prob: (B,) probability window has any anomaly (optional, if return_global=True)
+            - sensor_logits: (B, N) logits for each sensor being anomalous
+            - global_logits: (B,) logits for window having any anomaly (optional, if return_global=True)
         """
         B, W, N = x.shape
 
@@ -111,16 +111,16 @@ class MultiLabelGDN(nn.Module):
 
         h_graph = torch.stack(h_graph_list, dim=0)  # (B, N, hidden_dim)
 
-        # Per-sensor anomaly probability
-        sensor_probs = self.sensor_classifier(h_graph).squeeze(-1)  # (B, N)
+        # Per-sensor anomaly logits (no sigmoid - use BCEWithLogitsLoss)
+        sensor_logits = self.sensor_classifier(h_graph).squeeze(-1)  # (B, N)
 
         if return_global:
-            # Global window anomaly probability
+            # Global window anomaly logits
             h_flat = h_graph.flatten(1)  # (B, N * hidden_dim)
-            global_prob = self.global_classifier(h_flat).squeeze(-1)  # (B,)
-            return sensor_probs, global_prob
+            global_logits = self.global_classifier(h_flat).squeeze(-1)  # (B,)
+            return sensor_logits, global_logits
 
-        return sensor_probs
+        return sensor_logits
 
     def get_embeddings(self, x):
         """
@@ -202,6 +202,213 @@ class CenterLoss(nn.Module):
     def get_center_separation(self):
         """L2 distance between normal and anomalous centers."""
         return torch.norm(self.centers[0] - self.centers[1]).item()
+
+
+class TripletCenterLoss(nn.Module):
+    """
+    Triplet-Center Loss: Combines center pull with triplet margin.
+    Superior to standard center loss by explicitly pushing opposite classes apart.
+    
+    Reference:
+    He et al. "Triplet-Center Loss for Multi-View 3D Object Retrieval" (CVPR 2018)
+    """
+    
+    def __init__(self, embed_dim, num_classes=2, margin=1.0, lambda_c=0.5):
+        super().__init__()
+        self.centers = nn.Parameter(torch.randn(num_classes, embed_dim))
+        nn.init.xavier_uniform_(self.centers)
+        self.margin = margin
+        self.lambda_c = lambda_c
+        
+    def forward(self, embeddings, labels):
+        """
+        Compute triplet-center loss with enhanced numerical stability.
+        
+        Args:
+            embeddings: (B, D) normalized embeddings from model
+            labels: (B,) binary labels (0=normal, 1=anomalous)
+        
+        Returns:
+            loss: scalar tensor
+        """
+        batch_size = embeddings.size(0)
+        device = embeddings.device
+        eps = 1e-8
+        
+        # Input validation
+        if torch.isnan(embeddings).any() or torch.isinf(embeddings).any():
+            return torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # Center loss component: pull embeddings toward their class center
+        centers_batch = self.centers[labels.long()]
+        center_loss = (embeddings - centers_batch).pow(2).sum(dim=1)
+        center_loss = torch.clamp(center_loss, min=0.0, max=100.0)  # Clamp distances
+        center_loss = center_loss.mean()
+        
+        # Triplet margin component: push opposite class away
+        dist_to_own = torch.norm(embeddings - self.centers[labels.long()], dim=1)
+        dist_to_other = torch.norm(embeddings - self.centers[1 - labels.long()], dim=1)
+        
+        # Clamp distances to prevent overflow
+        dist_to_own = torch.clamp(dist_to_own, min=eps, max=50.0)
+        dist_to_other = torch.clamp(dist_to_other, min=eps, max=50.0)
+        
+        triplet_loss = torch.clamp(dist_to_own - dist_to_other + self.margin, min=0.0, max=100.0)
+        triplet_loss = triplet_loss.mean()
+        
+        total_loss = center_loss + self.lambda_c * triplet_loss
+        
+        # Final clamp to prevent NaN/Inf
+        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
+        
+        return total_loss
+    
+    def get_center_separation(self):
+        """L2 distance between normal and anomalous centers."""
+        return torch.norm(self.centers[0] - self.centers[1]).item()
+
+
+class CenterLossWithRepulsion(nn.Module):
+    """
+    Center Loss with explicit repulsion between centers.
+    Forces centers apart explicitly to prevent collapse.
+    
+    Reference:
+    Various metric learning papers on center repulsion
+    """
+    
+    def __init__(self, embed_dim, num_classes=2, alpha=0.5, beta=1.0):
+        super().__init__()
+        self.centers = nn.Parameter(torch.randn(num_classes, embed_dim))
+        self.alpha = alpha
+        self.beta = beta  # Repulsion weight
+        nn.init.xavier_uniform_(self.centers)
+        
+    def forward(self, embeddings, labels):
+        """
+        Compute center loss with repulsion and enhanced numerical stability.
+        
+        Args:
+            embeddings: (B, D) normalized embeddings from model
+            labels: (B,) binary labels (0=normal, 1=anomalous)
+        
+        Returns:
+            loss: scalar tensor
+        """
+        device = embeddings.device
+        eps = 1e-8
+        
+        # Input validation
+        if torch.isnan(embeddings).any() or torch.isinf(embeddings).any():
+            return torch.tensor(0.0, device=device, requires_grad=True)
+        
+        centers_batch = self.centers[labels.long()]
+        pull_loss = (embeddings - centers_batch).pow(2).sum(dim=1)
+        pull_loss = torch.clamp(pull_loss, min=0.0, max=100.0)  # Clamp distances
+        pull_loss = pull_loss.mean()
+        
+        # Explicit repulsion between centers: target distance = 4.0
+        center_dist = torch.norm(self.centers[0] - self.centers[1])
+        center_dist = torch.clamp(center_dist, min=eps, max=50.0)  # Prevent overflow
+        repulsion_loss = torch.clamp(4.0 - center_dist, min=0.0, max=100.0)
+        
+        total_loss = pull_loss + self.beta * repulsion_loss
+        
+        # Final clamp to prevent NaN/Inf
+        total_loss = torch.clamp(total_loss, min=0.0, max=100.0)
+        
+        return total_loss
+    
+    def get_center_separation(self):
+        """L2 distance between normal and anomalous centers."""
+        return torch.norm(self.centers[0] - self.centers[1]).item()
+
+
+class SupervisedContrastiveLoss(nn.Module):
+    """
+    Supervised Contrastive Loss for robust metric learning.
+    More robust than center loss for anomaly detection.
+    
+    Reference:
+    Khosla et al. "Supervised Contrastive Learning" (NeurIPS 2020)
+    """
+    
+    def __init__(self, temperature=0.5):
+        super().__init__()
+        self.temperature = max(temperature, 0.1)  # Minimum temperature for stability
+        self.eps = 1e-8  # Numerical stability epsilon
+        
+    def forward(self, embeddings, labels):
+        """
+        Compute supervised contrastive loss with enhanced numerical stability.
+        
+        Args:
+            embeddings: (B, D) embeddings from model (will be normalized)
+            labels: (B,) binary labels (0=normal, 1=anomalous)
+        
+        Returns:
+            loss: scalar tensor
+        """
+        device = embeddings.device
+        B = embeddings.size(0)
+        
+        # Normalize embeddings
+        embeddings = F.normalize(embeddings, dim=1, p=2, eps=self.eps)
+        
+        # Input validation
+        if torch.isnan(embeddings).any() or torch.isinf(embeddings).any():
+            return torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # Compute similarity matrix
+        sim_matrix = torch.matmul(embeddings, embeddings.T) / self.temperature
+        
+        # Create masks for positive pairs (same class)
+        labels_expanded = labels.unsqueeze(1)
+        mask_pos = (labels_expanded == labels_expanded.T).float()
+        mask_pos.fill_diagonal_(0)  # Exclude self
+        
+        # Check if any positive pairs exist
+        if mask_pos.sum() == 0:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+        
+        # Enhanced numerical stability: subtract max
+        max_sim = sim_matrix.max(dim=1, keepdim=True)[0].detach()
+        sim_matrix_stable = sim_matrix - max_sim
+        
+        # Clamp to prevent overflow BEFORE exp
+        sim_matrix_stable = torch.clamp(sim_matrix_stable, min=-50.0, max=50.0)
+        
+        # Mask diagonal during softmax
+        diag_mask = torch.eye(B, device=device)
+        sim_matrix_stable = sim_matrix_stable - diag_mask * 1e10
+        
+        # Compute exp and probabilities
+        exp_sim = torch.exp(sim_matrix_stable)
+        pos_sim = (exp_sim * mask_pos).sum(dim=1)
+        all_sim = exp_sim.sum(dim=1)
+        
+        # Add epsilon for log stability
+        pt = torch.clamp(pos_sim / (all_sim + self.eps), min=self.eps, max=1.0 - self.eps)
+        
+        # Compute loss only for samples with positive pairs
+        has_pos = mask_pos.sum(dim=1) > 0
+        if has_pos.sum() == 0:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+        
+        loss_per_sample = -torch.log(pt[has_pos] + self.eps)
+        loss_per_sample = torch.clamp(loss_per_sample, min=0.0, max=100.0)
+        
+        # Check for NaN/Inf
+        loss_per_sample = torch.where(
+            torch.isfinite(loss_per_sample),
+            loss_per_sample,
+            torch.zeros_like(loss_per_sample)
+        )
+        
+        if len(loss_per_sample) == 0 or loss_per_sample.sum() == 0:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+        
+        return loss_per_sample.mean()
 
 
 class FocalLoss(nn.Module):
