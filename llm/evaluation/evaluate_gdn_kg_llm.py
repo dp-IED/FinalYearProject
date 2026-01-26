@@ -623,13 +623,16 @@ def evaluate_gdn_kg_llm(
     
     # Load LLM model
     if model_repo is None:
-        model_repo = "mlx-community/granite-4.0-h-micro-4bit"
+        model_repo = "granite-4.0-h-micro-GGUF"
     
     try:
         model, tokenizer = load_llm_model(model_repo)
         print()
     except Exception as e:
-        raise RuntimeError(f"Failed to load LLM model: {e}. Please ensure mlx-lm is installed.")
+        raise RuntimeError(
+            f"Failed to connect to LM Studio: {e}. "
+            f"Please ensure LM Studio is running with the HTTP server enabled."
+        )
     
     # Load dataset
     print("Loading dataset...")

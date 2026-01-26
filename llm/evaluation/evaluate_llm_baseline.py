@@ -18,13 +18,7 @@ import time
 import re
 from tqdm import tqdm
 
-try:
-    from mlx_lm import load, stream_generate
-except ImportError:
-    print("Warning: mlx_lm not available. Install with: pip install mlx-lm")
-    stream_generate = None
-    load = None
-
+from llm.inference import LMInference, load_llm_model as load_lm_studio_model
 from llm.evaluation.metrics import compute_all_metrics, format_metrics_report
 
 
@@ -387,7 +381,7 @@ def parse_llm_response(response: str, sensor_names: List[str]) -> Dict[str, any]
 def call_llm(
     prompt: str,
     model,
-    tokenizer,
+    tokenizer=None,
     max_tokens: Optional[int] = None,
     temperature: float = 0.7,
     repetition_penalty: float = 1.2,
@@ -398,76 +392,65 @@ def call_llm(
 
     Args:
         prompt: Input prompt text
-        model: Loaded MLX model
-        tokenizer: Loaded tokenizer
+        model: LMInference instance (or MLX model for backward compatibility)
+        tokenizer: Tokenizer (ignored if model is LMInference, kept for compatibility)
         max_tokens: Maximum tokens to generate (None = no limit)
         temperature: Sampling temperature
         repetition_penalty: Penalty for repetition (1.0 = no penalty, >1.0 = penalize repetition)
-        repetition_context_size: Context window size for repetition penalty
+        repetition_context_size: Context window size for repetition penalty (ignored for LM Studio)
 
     Returns:
         Generated response text
     """
-    if model is None or tokenizer is None:
+    if model is None:
         raise RuntimeError("Model not loaded. Call load_llm_model() first.")
 
-    messages = [{"role": "user", "content": prompt}]
-    formatted_prompt = tokenizer.apply_chat_template(
-        messages, add_generation_prompt=True
-    )
-
-    response_parts = []
-    try:
-        kwargs = {
-            "temperature": temperature,
-            "repetition_penalty": repetition_penalty,
-            "repetition_context_size": repetition_context_size,
-        }
-        if max_tokens is not None:
-            kwargs["max_tokens"] = max_tokens
-        for response in stream_generate(model, tokenizer, formatted_prompt, **kwargs):
-            response_parts.append(response.text)
-    except TypeError as e:
-        try:
-            kwargs = {"temperature": temperature}
-            if max_tokens is not None:
-                kwargs["max_tokens"] = max_tokens
-            for response in stream_generate(
-                model, tokenizer, formatted_prompt, **kwargs
-            ):
-                response_parts.append(response.text)
-        except TypeError:
-            if max_tokens is not None:
-                for response in stream_generate(
-                    model, tokenizer, formatted_prompt, max_tokens=max_tokens
-                ):
-                    response_parts.append(response.text)
-            else:
-                for response in stream_generate(
-                    model, tokenizer, formatted_prompt
-                ):
-                    response_parts.append(response.text)
-
-    return "".join(response_parts)
+    # Check if model is LMInference instance
+    if isinstance(model, LMInference):
+        # Use LM Studio HTTP API
+        messages = [{"role": "user", "content": prompt}]
+        return model.chat_completions(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            repetition_penalty=repetition_penalty,
+        )
+    else:
+        # Fallback for MLX (if still needed)
+        raise RuntimeError(
+            "MLX is no longer supported. Please use LM Studio with LMInference."
+        )
 
 
-def load_llm_model(model_repo: str = "mlx-community/granite-4.0-h-micro-4bit"):
+def load_llm_model(
+    model_repo: str = "granite-4.0-h-micro-GGUF",
+    base_url: str = "http://localhost:1234/v1",
+):
     """
-    Load LLM model and tokenizer.
+    Load LLM model via LM Studio HTTP server.
 
     Args:
-        model_repo: Model repository identifier
+        model_repo: Model name in LM Studio (default: granite-4.0-h-micro-GGUF)
+        base_url: Base URL for LM Studio HTTP server
 
     Returns:
-        Tuple of (model, tokenizer)
+        Tuple of (model, tokenizer) where both are the same LMInference instance
+        for backward compatibility with code expecting (model, tokenizer) tuple
     """
-    if load is None:
-        raise ImportError("mlx_lm not available. Install with: pip install mlx-lm")
+    # Convert old MLX model repo format to LM Studio model name if needed
+    if model_repo.startswith("mlx-community/"):
+        # Extract model name from MLX format
+        model_name = model_repo.replace("mlx-community/", "").replace("-8bit", "").replace("-4bit", "")
+        model_name = f"{model_name}-GGUF"
+    else:
+        model_name = model_repo
 
-    print(f"Loading LLM model: {model_repo}")
-    model, tokenizer = load(model_repo)
-    print("✓ Model loaded successfully")
-    return model, tokenizer
+    print(f"Connecting to LM Studio for model: {model_name}")
+    inference = load_lm_studio_model(model_name=model_name, base_url=base_url)
+    
+    # Return as tuple for backward compatibility
+    # Both model and tokenizer are the same LMInference instance
+    return inference, inference
 
 
 def evaluate_llm_baseline(
@@ -503,14 +486,15 @@ def evaluate_llm_baseline(
 
     # Load LLM model
     if model_repo is None:
-        model_repo = "mlx-community/granite-4.0-h-micro-4bit"
+        model_repo = "granite-4.0-h-micro-GGUF"
 
     try:
         model, tokenizer = load_llm_model(model_repo)
         print()
     except Exception as e:
         raise RuntimeError(
-            f"Failed to load LLM model: {e}. Please ensure mlx-lm is installed."
+            f"Failed to connect to LM Studio: {e}. "
+            f"Please ensure LM Studio is running with the HTTP server enabled."
         )
 
     # Load dataset
@@ -712,8 +696,8 @@ def main():
     parser.add_argument(
         "--model-repo",
         type=str,
-        default="mlx-community/granite-4.0-h-micro-4bit",
-        help="Model repository identifier for MLX LM",
+        default="granite-4.0-h-micro-GGUF",
+        help="Model name in LM Studio (default: granite-4.0-h-micro-GGUF)",
     )
     parser.add_argument(
         "--max-tokens", type=int, default=512, help="Maximum tokens to generate"
