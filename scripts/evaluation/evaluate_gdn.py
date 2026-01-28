@@ -16,6 +16,7 @@ matplotlib.use("Agg")  # Non-interactive backend
 import matplotlib.pyplot as plt
 from pathlib import Path
 import torch
+import torch.nn.functional as F
 import json
 from sklearn.metrics import (
     accuracy_score,
@@ -29,7 +30,7 @@ from sklearn.metrics import (
 )
 
 # Add project root to path
-project_root = Path(__file__).parent
+project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 # Add evaluation directory for metrics
@@ -121,20 +122,75 @@ def compute_classification_metrics(y_true, scores, threshold=None):
     return metrics
 
 
-def get_embeddings_and_distances(predictor, normalized_windows, batch_size=32):
+def test_time_adapt_center(
+    model, test_windows, training_center, alpha=0.05, normal_mask=None
+):
+    """
+    Adapt center to test distribution using exponential moving average.
+
+    Args:
+        model: GDN model
+        test_windows: Test window data (numpy array)
+        training_center: Training-learned normal center (numpy array)
+        alpha: Adaptation rate (0 = no adaptation, 1 = full replacement)
+        normal_mask: Optional boolean mask for known normal windows
+
+    Returns:
+        adapted_center: Center adjusted for test distribution
+    """
+    # If normal_mask provided, use only those windows
+    if normal_mask is not None:
+        adaptation_windows = test_windows[normal_mask]
+        if len(adaptation_windows) == 0:
+            return training_center
+    else:
+        # Use first 50% of windows as pseudo-normals (assume most are normal)
+        adaptation_windows = test_windows[: len(test_windows) // 2]
+
+    # Get embeddings for adaptation windows
+    X_tensor = torch.from_numpy(adaptation_windows).float()
+    model.eval()
+    adaptation_embeddings = []
+
+    with torch.no_grad():
+        for i in range(0, len(X_tensor), 32):
+            batch = X_tensor[i : i + 32]
+            embeddings = model.get_embeddings(batch)
+            adaptation_embeddings.append(embeddings.cpu().numpy())
+
+    adaptation_embeddings = np.concatenate(adaptation_embeddings, axis=0)
+    test_center = np.mean(adaptation_embeddings, axis=0)
+
+    # Exponential moving average
+    adapted_center = (1 - alpha) * training_center + alpha * test_center
+
+    return adapted_center
+
+
+def get_embeddings_and_distances(
+    predictor,
+    normalized_windows,
+    batch_size=32,
+    use_tta=False,
+    tta_alpha=0.05,
+    normal_mask=None,
+):
     """
     Extract embeddings and compute distances to normal center.
 
     Returns:
-        embeddings: (N, embed_dim) array
-        distances: (N,) array of distances to normal center
+        embeddings: (N, embed_dim) array - window-level embeddings
+        distances: (N,) array of distances to normal center - window-level
         normal_center: (embed_dim,) array or None
+        sensor_embeddings: (N, num_sensors, hidden_dim) array - NEW
+        sensor_distances: (N, num_sensors) array - NEW
     """
     X_tensor = torch.from_numpy(normalized_windows).float()
     num_windows = len(X_tensor)
 
     predictor.model.eval()
     all_embeddings = []
+    all_sensor_embeddings = []  # NEW
 
     with torch.no_grad():
         for i in range(0, num_windows, batch_size):
@@ -142,11 +198,19 @@ def get_embeddings_and_distances(predictor, normalized_windows, batch_size=32):
             embeddings = predictor.model.get_embeddings(batch)
             all_embeddings.append(embeddings.cpu().numpy())
 
+            # NEW: Extract sensor embeddings
+            sensor_emb = predictor.model.get_sensor_embeddings(batch)
+            all_sensor_embeddings.append(sensor_emb.cpu().numpy())
+
     all_embeddings = np.concatenate(all_embeddings, axis=0)  # (num_windows, embed_dim)
+    all_sensor_embeddings = np.concatenate(
+        all_sensor_embeddings, axis=0
+    )  # (num_windows, 8, hidden_dim)
 
     # Try to get normal center
     normal_center = None
     distances = None
+    sensor_centers_normal = None  # For multi-level centers
 
     # Method 1: Check if predictor has normal_center
     if hasattr(predictor, "normal_center") and predictor.normal_center is not None:
@@ -157,32 +221,101 @@ def get_embeddings_and_distances(predictor, normalized_windows, batch_size=32):
         )
         distances = np.linalg.norm(all_embeddings - normal_center, axis=1)
 
-    # Method 2: Try loading from checkpoint
+    # Method 2: Try loading training centers directly from checkpoint
     elif predictor.model_path.exists():
         try:
-            checkpoint = torch.load(predictor.model_path, map_location="cpu")
-            if "center_loss_state_dict" in checkpoint:
-                # Import CenterLoss
-                import importlib.util
+            checkpoint = torch.load(
+                predictor.model_path, map_location="cpu", weights_only=False
+            )
 
-                train_script_path = (
-                    project_root / "anomaly-detection" / "train_gdn_separation.py"
-                )
-                if train_script_path.exists():
-                    spec = importlib.util.spec_from_file_location(
-                        "train_gdn_separation", train_script_path
-                    )
-                    train_module = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(train_module)
-                    CenterLoss = train_module.CenterLoss
+            # Check for multi-level centers first (new format)
+            if "window_centers" in checkpoint and "sensor_centers" in checkpoint:
+                # Multi-level center loss checkpoint
+                window_centers = checkpoint["window_centers"]
+                sensor_centers = checkpoint[
+                    "sensor_centers"
+                ]  # (num_sensors, 2, hidden_dim)
 
-                    center_loss = CenterLoss(
-                        embed_dim=all_embeddings.shape[1], num_classes=2
+                # Use class-0 (normal) center for window-level
+                if hasattr(window_centers, "detach"):
+                    normal_center = window_centers[0].detach().cpu().numpy()
+                else:
+                    normal_center = np.asarray(window_centers[0])
+
+                # Extract sensor-specific normal centers (class 0 for each sensor)
+                if hasattr(sensor_centers, "detach"):
+                    sensor_centers_normal = (
+                        sensor_centers[:, 0, :].detach().cpu().numpy()
+                    )  # (num_sensors, hidden_dim)
+                else:
+                    sensor_centers_normal = np.asarray(sensor_centers[:, 0, :])
+
+                print("   ✓ Loaded multi-level centers (window + sensor)")
+
+                # Apply test-time adaptation if requested (only to window center)
+                if use_tta:
+                    print(
+                        f"   Applying test-time adaptation to window center (alpha={tta_alpha})..."
                     )
-                    center_loss.load_state_dict(checkpoint["center_loss_state_dict"])
-                    normal_center = center_loss.centers[0].detach().cpu().numpy()
-                    distances = np.linalg.norm(all_embeddings - normal_center, axis=1)
-        except Exception:
+                    normal_center = test_time_adapt_center(
+                        predictor.model,
+                        normalized_windows,
+                        normal_center,
+                        alpha=tta_alpha,
+                        normal_mask=normal_mask,
+                    )
+                    print(f"   ✓ Using adapted window center (95% training, 5% test)")
+                else:
+                    print(
+                        f"   ✓ Using training-learned multi-level centers from checkpoint"
+                    )
+
+                distances = np.linalg.norm(all_embeddings - normal_center, axis=1)
+
+            else:
+                # Fallback: Check for single-level center loss (old format)
+                center_state = checkpoint.get("center_loss_state_dict", None)
+                if center_state is None:
+                    center_state = checkpoint.get(
+                        "triplet_center_loss_state_dict", None
+                    )
+
+                if center_state is not None:
+                    centers = center_state.get("centers", None)
+                    if centers is not None:
+                        # Use class-0 (normal) center learned during training
+                        if hasattr(centers, "detach"):
+                            normal_center = centers[0].detach().cpu().numpy()
+                        else:
+                            normal_center = np.asarray(centers[0])
+
+                        # Apply test-time adaptation if requested
+                        if use_tta:
+                            print(
+                                f"   Applying test-time adaptation (alpha={tta_alpha})..."
+                            )
+                            normal_center = test_time_adapt_center(
+                                predictor.model,
+                                normalized_windows,
+                                normal_center,
+                                alpha=tta_alpha,
+                                normal_mask=normal_mask,
+                            )
+                            print(f"   ✓ Using adapted center (95% training, 5% test)")
+                        else:
+                            print(
+                                f"   ✓ Using training-learned normal center from checkpoint"
+                            )
+
+                        distances = np.linalg.norm(
+                            all_embeddings - normal_center, axis=1
+                        )
+                        print(
+                            "   ⚠ Using window-level center for sensors (single-level checkpoint)"
+                        )
+        except Exception as e:
+            # Fall back to computing center from data if anything goes wrong
+            print(f"   ⚠️  Could not load training centers: {e}")
             pass
 
     # Method 3: Fallback - use mean of normal embeddings as center
@@ -191,7 +324,174 @@ def get_embeddings_and_distances(predictor, normalized_windows, batch_size=32):
         normal_center = None
         distances = None
 
-    return all_embeddings, distances, normal_center
+    # Compute sensor-level distances
+    sensor_distances = None
+    if normal_center is not None:
+        if sensor_centers_normal is not None:
+            # Use sensor-specific normal centers (multi-level)
+            # sensor_centers_normal: (num_sensors, hidden_dim)
+            # all_sensor_embeddings: (num_windows, num_sensors, hidden_dim)
+            # Compute distances per sensor
+            sensor_distances = np.zeros(
+                (len(all_sensor_embeddings), sensor_centers_normal.shape[0])
+            )
+            for sensor_idx in range(sensor_centers_normal.shape[0]):
+                sensor_center = sensor_centers_normal[sensor_idx]  # (hidden_dim,)
+                sensor_emb = all_sensor_embeddings[
+                    :, sensor_idx, :
+                ]  # (num_windows, hidden_dim)
+                sensor_distances[:, sensor_idx] = np.linalg.norm(
+                    sensor_emb - sensor_center, axis=1
+                )
+            print(f"   ✓ Computed sensor distances using sensor-specific centers")
+        else:
+            # Fallback: use window center for all sensors (single-level)
+            normal_center_expanded = normal_center.reshape(
+                1, 1, -1
+            )  # (1, 1, hidden_dim)
+            sensor_distances = np.linalg.norm(
+                all_sensor_embeddings - normal_center_expanded, axis=2
+            )  # (num_windows, 8)
+            print(
+                f"   ⚠ Using window-level center for all sensors (single-level checkpoint)"
+            )
+
+    return (
+        all_embeddings,
+        distances,
+        normal_center,
+        all_sensor_embeddings,
+        sensor_distances,
+    )
+
+
+def evaluate_sensor_attribution(sensor_scores, sensor_labels_true, sensor_names):
+    """
+    Evaluate sensor-level fault identification using per-sensor scores.
+
+    Args:
+        sensor_scores: (num_windows, num_sensors) array of anomaly scores (distances or predictions)
+        sensor_labels_true: (num_windows, num_sensors) ground truth sensor labels
+        sensor_names: List of sensor names
+
+    Returns:
+        Dictionary with sensor-level metrics
+    """
+    from sklearn.metrics import (
+        precision_score,
+        recall_score,
+        f1_score,
+        roc_auc_score,
+        precision_recall_curve,
+    )
+
+    # Only evaluate on windows that have at least one faulty sensor
+    faulty_windows = sensor_labels_true.sum(axis=1) > 0
+
+    if faulty_windows.sum() == 0:
+        return None
+
+    # Extract faulty windows
+    sensor_scores = sensor_scores[faulty_windows]  # (num_faulty, 8)
+    sensor_labels = sensor_labels_true[faulty_windows]  # (num_faulty, 8)
+
+    # Per-sensor metrics
+    per_sensor_metrics = {}
+
+    for sensor_idx, sensor_name in enumerate(sensor_names):
+        sensor_score_col = sensor_scores[:, sensor_idx]
+        sensor_label_col = sensor_labels[:, sensor_idx]
+
+        # Skip if this sensor is never faulty
+        if sensor_label_col.sum() == 0:
+            per_sensor_metrics[sensor_name] = {
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "roc_auc": 0.0,
+                "optimal_threshold": 0.0,
+                "num_faulty": 0,
+            }
+            continue
+
+        # Find optimal threshold for this sensor using precision-recall curve
+        precisions, recalls, thresholds = precision_recall_curve(
+            sensor_label_col, sensor_score_col
+        )
+        f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-8)
+        best_idx = np.argmax(f1_scores)
+        best_threshold = (
+            thresholds[best_idx]
+            if best_idx < len(thresholds)
+            else sensor_score_col.mean()
+        )
+
+        # Compute metrics at optimal threshold
+        predictions = (sensor_score_col > best_threshold).astype(int)
+        precision = precision_score(sensor_label_col, predictions, zero_division=0)
+        recall = recall_score(sensor_label_col, predictions, zero_division=0)
+        f1 = f1_score(sensor_label_col, predictions, zero_division=0)
+
+        # ROC-AUC
+        try:
+            auc = (
+                roc_auc_score(sensor_label_col, sensor_score_col)
+                if len(np.unique(sensor_label_col)) > 1
+                else 0.0
+            )
+        except:
+            auc = 0.0
+
+        per_sensor_metrics[sensor_name] = {
+            "precision": float(precision),
+            "recall": float(recall),
+            "f1": float(f1),
+            "roc_auc": float(auc),
+            "optimal_threshold": float(best_threshold),
+            "num_faulty": int(sensor_label_col.sum()),
+        }
+
+    # Overall metrics (macro-average)
+    all_f1s = [m["f1"] for m in per_sensor_metrics.values() if m["num_faulty"] > 0]
+    all_aucs = [
+        m["roc_auc"]
+        for m in per_sensor_metrics.values()
+        if m["roc_auc"] > 0 and m["num_faulty"] > 0
+    ]
+
+    # Flattened metrics (all sensors, all windows)
+    y_true_flat = sensor_labels.flatten()
+    y_scores_flat = sensor_scores.flatten()
+
+    # Overall optimal threshold
+    precisions, recalls, thresholds = precision_recall_curve(y_true_flat, y_scores_flat)
+    f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-8)
+    best_idx = np.argmax(f1_scores)
+    best_threshold = (
+        thresholds[best_idx] if best_idx < len(thresholds) else y_scores_flat.mean()
+    )
+
+    y_pred_flat = (y_scores_flat > best_threshold).astype(int)
+
+    overall_metrics = {
+        "precision": float(precision_score(y_true_flat, y_pred_flat, zero_division=0)),
+        "recall": float(recall_score(y_true_flat, y_pred_flat, zero_division=0)),
+        "f1_score": float(f1_score(y_true_flat, y_pred_flat, zero_division=0)),
+        "roc_auc": float(
+            roc_auc_score(y_true_flat, y_scores_flat)
+            if len(np.unique(y_true_flat)) > 1
+            else 0.0
+        ),
+        "optimal_threshold": float(best_threshold),
+        "num_faulty_windows": int(faulty_windows.sum()),
+    }
+
+    return {
+        "per_sensor": per_sensor_metrics,
+        **overall_metrics,
+        "overall_f1_macro": float(np.mean(all_f1s)) if all_f1s else 0.0,
+        "overall_auc_macro": float(np.mean(all_aucs)) if all_aucs else 0.0,
+    }
 
 
 def compute_embedding_distances(embeddings, normal_mask):
@@ -262,6 +562,8 @@ def evaluate_gdn(
     gdn_model_path: str = "anomaly-detection/best_multilabel_gdn.pt",
     output_dir: str = "results",
     limit: int = None,
+    use_tta: bool = False,
+    tta_alpha: float = 0.05,
 ):
     """
     Comprehensive GDN model evaluation.
@@ -355,17 +657,113 @@ def evaluate_gdn(
     print(f"   GDN predictions shape: {gdn_predictions.shape}")
     print()
 
+    # Identify normal vs faulty windows (needed for TTA)
+    is_faulty_window = sensor_labels_true.sum(axis=1) > 0
+    normal_mask = ~is_faulty_window
+
     # Get embeddings and distances
     print("4. Extracting embeddings and computing distances...")
-    embeddings, distances, normal_center = get_embeddings_and_distances(
-        predictor, normalized_windows
+    embeddings, distances, normal_center, sensor_embeddings, sensor_distances = (
+        get_embeddings_and_distances(
+            predictor,
+            normalized_windows,
+            batch_size=32,
+            use_tta=use_tta,
+            tta_alpha=tta_alpha,
+            normal_mask=normal_mask,
+        )
     )
+
+    # DIAGNOSTIC: Embedding Statistics
+    print("\n" + "=" * 60)
+    print("DIAGNOSTIC: Embedding Statistics")
+    print("=" * 60)
+
+    # Get a small sample for testing
+    sample_size = min(10, len(normalized_windows))
+    X_sample = torch.from_numpy(normalized_windows[:sample_size]).float()
+    predictor.model.eval()
+
+    with torch.no_grad():
+        window_emb = predictor.model.get_embeddings(X_sample)
+        sensor_emb = predictor.model.get_sensor_embeddings(X_sample)
+
+    print(f"Window embeddings shape: {window_emb.shape}")
+    print(f"  Mean: {window_emb.mean():.6f}")
+    print(f"  Std: {window_emb.std():.6f}")
+    print(f"  Min: {window_emb.min():.6f}, Max: {window_emb.max():.6f}")
+    print(f"  L2 norm (first window): {torch.norm(window_emb[0]).item():.6f}")
+
+    print(f"\nSensor embeddings shape: {sensor_emb.shape}")
+    print(f"  Mean: {sensor_emb.mean():.6f}")
+    print(f"  Std: {sensor_emb.std():.6f}")
+    print(f"  Min: {sensor_emb.min():.6f}, Max: {sensor_emb.max():.6f}")
+    print(
+        f"  L2 norm (first window, first sensor): {torch.norm(sensor_emb[0, 0]).item():.6f}"
+    )
+
+    # Check if sensor embeddings are just copies
+    sensor_0 = sensor_emb[0, 0, :]
+    sensor_1 = sensor_emb[0, 1, :]
+    cosine_sim = (sensor_0 @ sensor_1) / (torch.norm(sensor_0) * torch.norm(sensor_1))
+    print(f"\nCosine similarity between sensor 0 and 1 (same window): {cosine_sim:.6f}")
+    print("  (Should be < 0.95 if sensors are different)")
+
+    # Check window vs sensor relationship
+    window_reconstructed = sensor_emb[0].mean(dim=0)
+    # Normalize the reconstructed window to match window_emb
+    window_reconstructed_norm = F.normalize(
+        window_reconstructed.unsqueeze(0), p=2, dim=1
+    ).squeeze(0)
+    cosine_window = (window_emb[0] @ window_reconstructed_norm) / (
+        torch.norm(window_emb[0]) * torch.norm(window_reconstructed_norm)
+    )
+    print(
+        f"\nCosine similarity window vs. normalize(mean(sensors)): {cosine_window:.6f}"
+    )
+    print("  (Should be ~1.0 if sensor_emb is correct)")
+
+    # Check center
+    if normal_center is not None:
+        normal_center_tensor = torch.from_numpy(normal_center).float()
+        print(f"\nNormal center shape: {normal_center_tensor.shape}")
+        print(f"  Mean: {normal_center_tensor.mean():.6f}")
+        print(f"  Std: {normal_center_tensor.std():.6f}")
+        print(f"  L2 norm: {torch.norm(normal_center_tensor).item():.6f}")
+
+        # Distance check
+        dist_window = torch.norm(window_emb[0] - normal_center_tensor).item()
+        dist_sensor = torch.norm(sensor_emb[0, 0, :] - normal_center_tensor).item()
+        print(f"\nDistance to center:")
+        print(f"  Window embedding: {dist_window:.6f}")
+        print(f"  Sensor 0 embedding (raw): {dist_sensor:.6f}")
+
+        # Check mean distance comparison
+        window_mean_dist = (
+            torch.norm(window_emb - normal_center_tensor.unsqueeze(0), dim=1)
+            .mean()
+            .item()
+        )
+        sensor_mean_dist = (
+            torch.norm(
+                sensor_emb - normal_center_tensor.unsqueeze(0).unsqueeze(0), dim=2
+            )
+            .mean()
+            .item()
+        )
+        print(f"\nMean distances:")
+        print(f"  Window mean dist: {window_mean_dist:.6f}")
+        print(f"  Sensor mean dist: {sensor_mean_dist:.6f}")
+        print(f"  Ratio: {sensor_mean_dist / window_mean_dist:.2f}")
+        print("  (Ratio should be 0.8-1.2, not 0.16)")
+
+    print("=" * 60 + "\n")
 
     # If distances not available, compute from normal samples
     if distances is None:
-        print("   Computing normal center from training data...")
-        is_faulty_window = sensor_labels_true.sum(axis=1) > 0
-        normal_mask = ~is_faulty_window
+        print("   ⚠️  WARNING: No training centers found in checkpoint!")
+        print("   Computing normal center from TEST data (methodologically incorrect)")
+        print("   This checkpoint should be re-trained with proper center saving.")
 
         if np.sum(normal_mask) > 0:
             # Use mean of normal embeddings as center
@@ -373,21 +771,34 @@ def evaluate_gdn(
             normal_center = np.mean(normal_embeddings, axis=0)
             distances = np.linalg.norm(embeddings - normal_center, axis=1)
             print(
-                f"   ✓ Computed distances using normal center (mean: {np.mean(distances):.4f})"
+                f"   ✓ Computed distances using TEST-based normal center (mean: {np.mean(distances):.4f})"
             )
+
+            # Also compute sensor-level distances if sensor embeddings are available
+            if sensor_embeddings is not None:
+                normal_center_expanded = normal_center.reshape(1, 1, -1)
+                sensor_distances = np.linalg.norm(
+                    sensor_embeddings - normal_center_expanded, axis=2
+                )
+                print(
+                    f"   ✓ Computed sensor-level distances using TEST-based normal center"
+                )
         else:
             # Fallback: use max probability as distance proxy
             distances = np.max(gdn_predictions, axis=1)
             normal_center = None
+            sensor_distances = None
             print("   ⚠️  No normal samples found, using max probability as proxy")
     else:
-        print(f"   ✓ Computed distances (mean: {np.mean(distances):.4f})")
+        print(
+            f"   ✓ Computed distances using TRAINING-learned center (mean: {np.mean(distances):.4f})"
+        )
+        if sensor_distances is not None:
+            print(f"   ✓ Computed sensor-level distances using TRAINING-learned center")
     print()
 
     # Identify normal vs faulty windows
     print("5. Analyzing separation...")
-    is_faulty_window = sensor_labels_true.sum(axis=1) > 0
-    normal_mask = ~is_faulty_window
     faulty_mask = is_faulty_window
 
     num_normal = np.sum(normal_mask)
@@ -415,6 +826,65 @@ def evaluate_gdn(
     print(f"   PR-AUC:    {metrics.get('pr_auc', 0.0):.4f}")
     print(f"   Threshold: {metrics['threshold']:.4f}")
     print()
+
+    # Compute sensor-level attribution metrics
+    print("6b. Computing sensor-level attribution metrics...")
+    if sensor_distances is None:
+        print("   ⚠️  Sensor distances not available, using raw predictions")
+        sensor_metrics = evaluate_sensor_attribution(
+            gdn_predictions, sensor_labels_true, sensor_names
+        )
+    else:
+        print("   ✓ Using sensor-level embeddings for attribution")
+        sensor_metrics = evaluate_sensor_attribution(
+            sensor_distances, sensor_labels_true, sensor_names
+        )
+
+    if sensor_metrics:
+        print()
+        print("=" * 80)
+        print("SENSOR-LEVEL ATTRIBUTION METRICS")
+        print("=" * 80)
+        print()
+        print(f"Overall (on {sensor_metrics['num_faulty_windows']} faulty windows):")
+        print(f"   Precision: {sensor_metrics['precision']:.4f}")
+        print(f"   Recall:    {sensor_metrics['recall']:.4f}")
+        print(f"   F1 Score:  {sensor_metrics['f1_score']:.4f}")
+        print(f"   ROC-AUC:   {sensor_metrics.get('roc_auc', 0.0):.4f}")
+        print()
+        print("Per-sensor breakdown (sorted by F1 score):")
+        print("-" * 80)
+
+        # Sort sensors by F1 score (descending)
+        sorted_sensors = sorted(
+            sensor_metrics["per_sensor"].items(), key=lambda x: x[1]["f1"], reverse=True
+        )
+
+        for sensor_name, sensor_metrics_dict in sorted_sensors:
+            num_faulty = sensor_metrics_dict.get("num_faulty", 0)
+            if num_faulty > 0:
+                f1 = sensor_metrics_dict["f1"]
+                precision = sensor_metrics_dict["precision"]
+                recall = sensor_metrics_dict["recall"]
+                roc_auc = sensor_metrics_dict.get("roc_auc", 0.0)
+
+                # Status indicator
+                if f1 >= 0.6:
+                    status = "✓ GOOD"
+                elif f1 >= 0.4:
+                    status = "~ MODERATE"
+                else:
+                    status = "✗ POOR"
+
+                print(f"  {status} {sensor_name}:")
+                print(
+                    f"    Faults: {num_faulty:2d} | F1: {f1:.3f} | Precision: {precision:.3f} | Recall: {recall:.3f} | ROC-AUC: {roc_auc:.3f}"
+                )
+            else:
+                print(f"  - {sensor_name}: No faults in test set (cannot evaluate)")
+        print()
+        print("=" * 80)
+        print()
 
     # Compute embedding space distances
     print("7. Computing embedding space distances...")
@@ -466,6 +936,7 @@ def evaluate_gdn(
         sensor_names,
         gdn_predictions,
         output_path / "gdn_evaluation.png",
+        sensor_metrics=sensor_metrics,
     )
     print(f"   ✓ Plots saved to: {output_path / 'gdn_evaluation.png'}")
     print()
@@ -473,6 +944,7 @@ def evaluate_gdn(
     # Save results
     results = {
         "classification_metrics": metrics,
+        "sensor_attribution_metrics": sensor_metrics if sensor_metrics else None,
         "distance_statistics": {
             "normal_mean": float(normal_mean_dist),
             "normal_std": float(np.std(normal_distances)),
@@ -513,6 +985,7 @@ def create_evaluation_plots(
     sensor_names,
     gdn_predictions,
     output_path,
+    sensor_metrics=None,
 ):
     """Create comprehensive evaluation plots."""
     fig = plt.figure(figsize=(20, 14))
@@ -756,32 +1229,90 @@ def create_evaluation_plots(
 
     plt.colorbar(im, ax=ax7)
 
-    # Plot 8: Separation by sensor (if available)
+    # Plot 8: Per-sensor F1 scores (if available)
     ax8 = plt.subplot(3, 3, 8)
-    normal_max_scores = np.max(gdn_predictions[normal_mask], axis=1)
-    faulty_max_scores = np.max(gdn_predictions[faulty_mask], axis=1)
+    if sensor_metrics and sensor_metrics.get("per_sensor"):
+        # Get sensors with faults and sort by F1
+        sensors_with_faults = [
+            (name, metrics_dict)
+            for name, metrics_dict in sensor_metrics["per_sensor"].items()
+            if metrics_dict.get("num_faulty", 0) > 0
+        ]
+        sensors_with_faults.sort(key=lambda x: x[1]["f1"], reverse=True)
 
-    ax8.hist(
-        normal_max_scores,
-        bins=30,
-        alpha=0.6,
-        label="Normal",
-        density=True,
-        color="green",
-    )
-    ax8.hist(
-        faulty_max_scores,
-        bins=30,
-        alpha=0.6,
-        label="Anomalous",
-        density=True,
-        color="red",
-    )
-    ax8.set_xlabel("Max Sensor Score", fontsize=12, fontweight="bold")
-    ax8.set_ylabel("Density", fontsize=12, fontweight="bold")
-    ax8.set_title("Window-Level Scores (Max Sensor)", fontsize=13, fontweight="bold")
-    ax8.legend(fontsize=10)
-    ax8.grid(True, alpha=0.3)
+        if sensors_with_faults:
+            sensor_names_plot = [
+                name.replace(" ()", "")[:20] for name, _ in sensors_with_faults
+            ]
+            f1_scores = [m["f1"] for _, m in sensors_with_faults]
+            num_faults = [m["num_faulty"] for _, m in sensors_with_faults]
+
+            # Color bars by F1 score
+            colors = [
+                "green" if f1 >= 0.6 else "orange" if f1 >= 0.4 else "red"
+                for f1 in f1_scores
+            ]
+
+            bars = ax8.barh(
+                sensor_names_plot,
+                f1_scores,
+                color=colors,
+                alpha=0.7,
+                edgecolor="black",
+                linewidth=1,
+            )
+            ax8.set_xlabel("F1 Score", fontsize=12, fontweight="bold")
+            ax8.set_title(
+                "Per-Sensor F1 Scores (Faulty Windows Only)",
+                fontsize=13,
+                fontweight="bold",
+            )
+            ax8.set_xlim([0, 1.1])
+            ax8.axvline(
+                x=0.6, color="green", linestyle="--", alpha=0.5, label="Good (≥0.6)"
+            )
+            ax8.axvline(
+                x=0.4,
+                color="orange",
+                linestyle="--",
+                alpha=0.5,
+                label="Moderate (≥0.4)",
+            )
+            ax8.grid(True, alpha=0.3, axis="x")
+            ax8.legend(fontsize=9)
+
+            # Add value labels and fault counts
+            for i, (bar, f1, n_fault) in enumerate(zip(bars, f1_scores, num_faults)):
+                width = bar.get_width()
+                ax8.text(
+                    width + 0.02,
+                    bar.get_y() + bar.get_height() / 2,
+                    f"{f1:.3f} (n={n_fault})",
+                    va="center",
+                    fontsize=9,
+                    fontweight="bold",
+                )
+        else:
+            ax8.text(
+                0.5,
+                0.5,
+                "No sensors with faults\nin test set",
+                ha="center",
+                va="center",
+                fontsize=12,
+            )
+            ax8.set_title("Per-Sensor F1 Scores", fontsize=13, fontweight="bold")
+    else:
+        ax8.text(
+            0.5,
+            0.5,
+            "Sensor-level metrics\nnot available",
+            ha="center",
+            va="center",
+            fontsize=12,
+        )
+        ax8.set_title("Per-Sensor F1 Scores", fontsize=13, fontweight="bold")
+    ax8.axis("on")
 
     # Plot 9: Summary statistics text
     ax9 = plt.subplot(3, 3, 9)
@@ -815,6 +1346,15 @@ def create_evaluation_plots(
     ├─ Centroid distance: {embedding_distances["centroid_distance"]:.4f}
     ├─ Separation ratio:  {embedding_distances["separation_ratio"]:.2f}x
     └─ Pairwise distance: {embedding_distances["mean_pairwise_distance"]:.4f}
+    """
+
+    if sensor_metrics:
+        stats_text += f"""
+    Sensor-Level Attribution:
+    ├─ Overall F1:  {sensor_metrics.get("f1_score", 0.0):.4f}
+    ├─ Precision:    {sensor_metrics.get("precision", 0.0):.4f}
+    ├─ Recall:      {sensor_metrics.get("recall", 0.0):.4f}
+    └─ Faulty windows: {sensor_metrics.get("num_faulty_windows", 0)}
     """
 
     ax9.text(
@@ -857,7 +1397,25 @@ if __name__ == "__main__":
     parser.add_argument(
         "--limit", type=int, default=None, help="Limit number of windows to evaluate"
     )
+    parser.add_argument(
+        "--use-tta",
+        action="store_true",
+        help="Use test-time adaptation to adjust center for test distribution",
+    )
+    parser.add_argument(
+        "--tta-alpha",
+        type=float,
+        default=0.05,
+        help="Test-time adaptation rate (0-1, default: 0.05 = 5%% adaptation)",
+    )
 
     args = parser.parse_args()
 
-    evaluate_gdn(args.dataset, args.model, args.output, args.limit)
+    evaluate_gdn(
+        args.dataset,
+        args.model,
+        args.output,
+        args.limit,
+        use_tta=args.use_tta,
+        tta_alpha=args.tta_alpha,
+    )
