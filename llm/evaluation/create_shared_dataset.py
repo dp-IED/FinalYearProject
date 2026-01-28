@@ -66,13 +66,16 @@ from train_gdn_center_loss import (
     filter_long_drives,
     add_cross_channel_features,
     build_clean_windows,
-    inject_faults_with_sensor_labels,
     SENSOR_COLS,
     ID_COL,
     TIME_COL,
     WINDOW_SIZE,
     FORECAST_HORIZON,
 )
+
+# Import shared fault injection with stratified distribution
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts" / "training"))
+from fault_injection import inject_faults_with_sensor_labels
 
 # Add paths for GDN and KG imports
 project_root = Path(__file__).parent.parent.parent
@@ -282,6 +285,7 @@ def create_shared_evaluation_dataset(
             SENSOR_COLS_AVAILABLE,
             fault_percentage=fault_percentage,
             random_state=random_state,
+            use_stratified=True,  # Use stratified distribution for even sensor coverage
         )
 
         X_normalized = X_faulty.numpy()

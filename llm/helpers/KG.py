@@ -369,7 +369,7 @@ class KnowledgeGraphBuilder:
     """
     
     def __init__(self, sensor_names: List[str], sensor_embeddings: np.ndarray, 
-                 adjacency_matrix: np.ndarray):
+                 adjacency_matrix: np.ndarray, sensor_centers: Optional[np.ndarray] = None):
         """
         Initialize the Knowledge Graph Builder.
         
@@ -377,10 +377,13 @@ class KnowledgeGraphBuilder:
             sensor_names: List of sensor names (must match order in data)
             sensor_embeddings: Learned sensor embeddings from GDN (num_sensors, embed_dim)
             adjacency_matrix: Adjacency matrix from GDN (num_sensors, num_sensors)
+            sensor_centers: Optional (num_sensors, 2, hidden_dim) array - sensor-specific centers
+                          from multi-level center loss. If None, uses window-level center for all sensors.
         """
         self.sensor_names = sensor_names
         self.sensor_embeddings = sensor_embeddings
         self.adjacency_matrix = adjacency_matrix
+        self.sensor_centers = sensor_centers  # (num_sensors, 2, hidden_dim) or None
         self.num_sensors = len(sensor_names)
         
         # Create sensor name to index mapping
