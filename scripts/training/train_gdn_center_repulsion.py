@@ -70,7 +70,7 @@ REPULSION_ALPHA = 0.5
 REPULSION_BETA = 1.0  # Repulsion weight
 
 # Warmup epochs (train with only BCE before adding metric losses)
-WARMUP_EPOCHS = 0
+WARMUP_EPOCHS = 30
 
 # ============================================================================
 # Data Preprocessing Functions (same as train_gdn_center_loss.py)

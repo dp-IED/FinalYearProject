@@ -73,17 +73,21 @@ HIDDEN_DIM = 128  # Increased from 32
 # Triplet-Center Loss parameters
 TCL_MARGIN = 2.0
 TCL_LAMBDA_C = 1.5
-SCL_TEMPERATURE = 0.5  # Increased from 0.05 for numerical stability (0.5-0.7 is safe range)
+SCL_TEMPERATURE = (
+    0.5  # Increased from 0.05 for numerical stability (0.5-0.7 is safe range)
+)
 
 # Warmup epochs (train with only BCE before adding metric losses)
-WARMUP_EPOCHS = 10
+WARMUP_EPOCHS = 30
 
 # ============================================================================
 # Data Preprocessing Functions (same as train_gdn_center_loss.py)
 # ============================================================================
 
 
-def remove_zero_variance_columns(df: pd.DataFrame, exclude_cols: list[str] = None) -> pd.DataFrame:
+def remove_zero_variance_columns(
+    df: pd.DataFrame, exclude_cols: list[str] = None
+) -> pd.DataFrame:
     """Remove columns with zero variance."""
     if exclude_cols is None:
         exclude_cols = []
@@ -172,7 +176,9 @@ def add_cross_channel_features(data):
     return data
 
 
-def build_clean_windows(df, sensor_cols, id_col, time_col, window_size, horizon=1, scaler=None):
+def build_clean_windows(
+    df, sensor_cols, id_col, time_col, window_size, horizon=1, scaler=None
+):
     """Build windows from CLEAN data only. Returns normalized windows."""
     df = df.copy().sort_values([id_col, time_col])
     df_sensors = df[[id_col, time_col] + sensor_cols].copy()
@@ -222,7 +228,13 @@ def inject_faults_with_sensor_labels(
         win = X_faulty[idx].numpy()
 
         fault_type = np.random.choice(
-            ["vss_dropout", "maf_scale_low", "coolant_dropout", "tps_stuck", "rpm_speed_decouple"],
+            [
+                "vss_dropout",
+                "maf_scale_low",
+                "coolant_dropout",
+                "tps_stuck",
+                "rpm_speed_decouple",
+            ],
             p=[0.20, 0.20, 0.20, 0.20, 0.20],
         )
 
@@ -255,7 +267,9 @@ def inject_faults_with_sensor_labels(
                 for _ in range(n_dropouts):
                     drop_start = np.random.randint(0, W - 60)
                     drop_len = np.random.randint(30, 60)
-                    win[drop_start : drop_start + drop_len, cool_i] = np.random.uniform(0.05, 0.15)
+                    win[drop_start : drop_start + drop_len, cool_i] = np.random.uniform(
+                        0.05, 0.15
+                    )
                 affected_sensors.append(cool_i)
 
         elif fault_type == "tps_stuck" and "THROTTLE ()" in pid_idx:
@@ -273,7 +287,9 @@ def inject_faults_with_sensor_labels(
                 if win[:, speed_i].mean() > 0.20 and win[:, rpm_i].mean() > 0.30:
                     start = int(W * 0.25)
                     end = int(W * 0.75)
-                    win[start:end, speed_i] = win[start:end, speed_i] * np.random.uniform(0.3, 0.5)
+                    win[start:end, speed_i] = win[
+                        start:end, speed_i
+                    ] * np.random.uniform(0.3, 0.5)
                     affected_sensors.append(speed_i)
 
         if len(affected_sensors) > 0:
@@ -306,7 +322,7 @@ def train_model(
 ):
     """
     Train MultiLabelGDN with Triplet-Center Loss and Supervised Contrastive Loss.
-    
+
     Returns:
         model: Trained model
         triplet_center_loss: Trained TripletCenterLoss module
@@ -337,7 +353,9 @@ def train_model(
         triplet_center_loss.centers[1] = F.normalize(-torch.ones(HIDDEN_DIM), dim=0)
 
     # Separate optimizers
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+    )
     optimizer_center = torch.optim.SGD(
         triplet_center_loss.parameters(), lr=0.1
     )  # Reduced from 5.0 to 0.1 for stability
@@ -347,21 +365,30 @@ def train_model(
     global_criterion = nn.BCEWithLogitsLoss()
 
     # Learning rate schedulers
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, patience=7, factor=0.5, verbose=True
+    )
     scheduler_center = torch.optim.lr_scheduler.StepLR(
         optimizer_center, step_size=10, gamma=0.5
     )
 
-    best_val_loss = float("inf")
+    best_val_clf_loss = float("inf")  # Track ONLY classification loss
+    best_center_dist = 0.0
+    patience_counter = 0
+    max_patience = 15  # Custom early stopping
 
-    print(f"\n{'='*80}")
-    print("Training Multi-Label GDN with Triplet-Center Loss + Supervised Contrastive Loss")
-    print(f"{'='*80}")
+    print(f"\n{'=' * 80}")
+    print(
+        "Training Multi-Label GDN with Triplet-Center Loss + Supervised Contrastive Loss"
+    )
+    print(f"{'=' * 80}")
     print(f"Embedding dim: {EMBED_DIM}, Hidden dim: {HIDDEN_DIM}")
-    print(f"Lambda_global: {lambda_global}, Lambda_center: {lambda_center}, Lambda_scl: {lambda_scl}")
+    print(
+        f"Lambda_global: {lambda_global}, Lambda_center: {lambda_center}, Lambda_scl: {lambda_scl}"
+    )
     print(f"TCL margin: {TCL_MARGIN}, TCL lambda_c: {TCL_LAMBDA_C}")
     print(f"SCL temperature: {SCL_TEMPERATURE}")
-    print(f"Warmup epochs: {WARMUP_EPOCHS}")
+    print(f"Warmup epochs: 15 (gentle ramp-up over epochs 15-35)")
     print(f"Device: {device}\n")
 
     for epoch in range(num_epochs):
@@ -373,31 +400,29 @@ def train_model(
         train_loss_tcl = 0.0
         train_loss_scl = 0.0
 
-        # Progressive loss weighting
-        def get_loss_weights(epoch, total_epochs):
-            """Progressive loss weight ramping for stability"""
-            if epoch < WARMUP_EPOCHS:
+        # Progressive loss weighting with smoother ramp-up
+        def get_loss_weights_smooth(epoch, total_epochs=150):
+            """Smoother ramping to avoid validation spikes"""
+            if epoch < 15:  # Extended warmup
                 return {"global": lambda_global, "center": 0.0, "scl": 0.0}
-            elif epoch < WARMUP_EPOCHS + 10:
-                # Gradual introduction over 10 epochs
-                progress = (epoch - WARMUP_EPOCHS) / 10.0
+            elif epoch < 35:  # Gradual ramp over 20 epochs (not 10)
+                progress = (epoch - 15) / 20.0
+                # Use exponential ramp instead of linear
+                exp_progress = (np.exp(progress * 2) - 1) / (np.exp(2) - 1)
                 return {
                     "global": lambda_global,
-                    "center": lambda_center * progress,
-                    "scl": lambda_scl * progress,
+                    "center": 0.5 * exp_progress,  # Slow start, faster end
+                    "scl": 0.3 * exp_progress,
                 }
             else:
-                # Full weights after warmup + ramp
-                return {
-                    "global": lambda_global,
-                    "center": lambda_center * 0.625,  # Reduced from 0.8 to 0.5
-                    "scl": lambda_scl * 0.6,  # Reduced from 0.5 to 0.3
-                }
+                return {"global": lambda_global, "center": 0.5, "scl": 0.3}
 
-        weights = get_loss_weights(epoch, num_epochs)
+        weights = get_loss_weights_smooth(epoch, num_epochs)
         use_metric_losses = weights["center"] > 0 or weights["scl"] > 0
 
-        with tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False) as pbar:
+        with tqdm(
+            train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}", leave=False
+        ) as pbar:
             for X_batch, _, sensor_labels_batch, window_labels_batch in pbar:
                 X_batch = X_batch.to(device)
                 sensor_labels_batch = sensor_labels_batch.to(device)
@@ -417,21 +442,29 @@ def train_model(
                     or torch.isnan(embeddings).any()
                     or torch.isnan(global_logits).any()
                 ):
-                    print(f"NaN detected in forward pass at epoch {epoch+1}, skipping batch")
+                    print(
+                        f"NaN detected in forward pass at epoch {epoch + 1}, skipping batch"
+                    )
                     continue
 
                 # Classification losses (logits input - no clamping needed)
-                loss_sensor = sensor_criterion(sensor_logits, sensor_labels_batch).mean()
-                loss_global = global_criterion(global_logits, window_labels_batch.float())
+                loss_sensor = sensor_criterion(
+                    sensor_logits, sensor_labels_batch
+                ).mean()
+                loss_global = global_criterion(
+                    global_logits, window_labels_batch.float()
+                )
 
                 # Metric learning losses (with stability checks)
                 if use_metric_losses:
                     loss_tcl = triplet_center_loss(embeddings, window_labels_batch)
                     loss_scl = scl_loss(embeddings, window_labels_batch)
-                    
+
                     # Check for NaN in metric losses
                     if torch.isnan(loss_tcl) or torch.isnan(loss_scl):
-                        print(f"NaN in metric losses at epoch {epoch+1}, skipping batch")
+                        print(
+                            f"NaN in metric losses at epoch {epoch + 1}, skipping batch"
+                        )
                         continue
                 else:
                     loss_tcl = torch.tensor(0.0, device=device)
@@ -447,7 +480,7 @@ def train_model(
 
                 # Check for NaN in total loss
                 if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"NaN/Inf in total loss at epoch {epoch+1}, skipping batch")
+                    print(f"NaN/Inf in total loss at epoch {epoch + 1}, skipping batch")
                     continue
 
                 loss.backward()
@@ -476,10 +509,13 @@ def train_model(
             train_loss_tcl /= len(train_loader.dataset)
             train_loss_scl /= len(train_loader.dataset)
 
-        # Validation
+        # Validation - compute ALL metrics separately
         model.eval()
         triplet_center_loss.eval()
-        val_loss = 0.0
+        val_loss_sensor = 0.0
+        val_loss_global = 0.0
+        val_loss_tcl = 0.0
+        val_loss_scl = 0.0
 
         with torch.no_grad():
             for X_batch, _, sensor_labels_batch, window_labels_batch in val_loader:
@@ -490,8 +526,12 @@ def train_model(
                 sensor_logits, global_logits = model(X_batch, return_global=True)
                 embeddings = model.get_embeddings(X_batch)
 
-                loss_sensor = sensor_criterion(sensor_logits, sensor_labels_batch).mean()
-                loss_global = global_criterion(global_logits, window_labels_batch.float())
+                loss_sensor = sensor_criterion(
+                    sensor_logits, sensor_labels_batch
+                ).mean()
+                loss_global = global_criterion(
+                    global_logits, window_labels_batch.float()
+                )
 
                 if use_metric_losses:
                     loss_tcl = triplet_center_loss(embeddings, window_labels_batch)
@@ -500,16 +540,29 @@ def train_model(
                     loss_tcl = torch.tensor(0.0, device=device)
                     loss_scl = torch.tensor(0.0, device=device)
 
-                loss = (
-                    loss_sensor
-                    + weights["global"] * loss_global
-                    + weights["center"] * loss_tcl
-                    + weights["scl"] * loss_scl
-                )
-                val_loss += loss.item() * X_batch.size(0)
+                val_loss_sensor += loss_sensor.item() * X_batch.size(0)
+                val_loss_global += loss_global.item() * X_batch.size(0)
+                val_loss_tcl += loss_tcl.item() * X_batch.size(0)
+                val_loss_scl += loss_scl.item() * X_batch.size(0)
 
-        val_loss /= len(val_loader.dataset)
-        scheduler.step(val_loss)
+        val_loss_sensor /= len(val_loader.dataset)
+        val_loss_global /= len(val_loader.dataset)
+        val_loss_tcl /= len(val_loader.dataset)
+        val_loss_scl /= len(val_loader.dataset)
+
+        # CRITICAL: Compute classification-only loss for model selection
+        val_clf_loss = val_loss_sensor + lambda_global * val_loss_global
+
+        # Compute total loss for monitoring
+        val_total_loss = (
+            val_loss_sensor
+            + weights["global"] * val_loss_global
+            + weights["center"] * val_loss_tcl
+            + weights["scl"] * val_loss_scl
+        )
+
+        # Update scheduler based on classification loss
+        scheduler.step(val_clf_loss)
         if use_metric_losses:
             scheduler_center.step()
 
@@ -534,27 +587,38 @@ def train_model(
             normal_distances = all_distances[all_labels == 0]
             anomalous_distances = all_distances[all_labels == 1]
 
-            normal_mean = normal_distances.mean().item() if len(normal_distances) > 0 else 0.0
+            normal_mean = (
+                normal_distances.mean().item() if len(normal_distances) > 0 else 0.0
+            )
             anomalous_mean = (
-                anomalous_distances.mean().item() if len(anomalous_distances) > 0 else 0.0
+                anomalous_distances.mean().item()
+                if len(anomalous_distances) > 0
+                else 0.0
             )
 
         phase_str = "[WARMUP]" if not use_metric_losses else ""
         print(
-            f"Epoch {epoch+1}/{num_epochs} {phase_str} | "
+            f"Epoch {epoch + 1}/{num_epochs} {phase_str} | "
             f"Sensor: {train_loss_sensor:.4f} | "
             f"Global: {train_loss_global:.4f} | "
             f"TCL: {train_loss_tcl:.4f} | "
             f"SCL: {train_loss_scl:.4f} | "
-            f"Val: {val_loss:.4f} | "
+            f"Val CLF: {val_clf_loss:.4f} | "
+            f"Val Total: {val_total_loss:.4f} | "
             f"Center_dist: {center_separation:.4f} | "
             f"Normal_mean: {normal_mean:.4f} | "
             f"Anomalous_mean: {anomalous_mean:.4f}"
         )
 
-        # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # Track best center separation separately
+        if center_separation > best_center_dist:
+            best_center_dist = center_separation
+
+        # SOLUTION 1: Save based on classification loss ONLY
+        if val_clf_loss < best_val_clf_loss:
+            best_val_clf_loss = val_clf_loss
+            patience_counter = 0
+
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
@@ -572,21 +636,76 @@ def train_model(
                     "normal_mean_distance": normal_mean,
                     "anomalous_mean_distance": anomalous_mean,
                     "epoch": epoch + 1,
-                    "best_val_loss": best_val_loss,
+                    "best_val_loss": val_total_loss,  # Keep for backward compatibility
+                    "best_val_clf_loss": val_clf_loss,  # New: classification loss
+                    "val_total_loss": val_total_loss,  # New: total loss for monitoring
                 },
                 model_save_path,
             )
-            print(f"  ✓ Best model saved (center_separation: {center_separation:.4f})")
+            print(f"  ✓ Best CLF model saved (Val CLF: {val_clf_loss:.4f})")
+        else:
+            patience_counter += 1
+
+        # SOLUTION 2: Also save best center separation after warmup
+        if epoch >= 15 and center_separation >= best_center_dist:
+            best_center_dist = center_separation
+            # Save to a separate file for best separation
+            separation_path = model_save_path.replace(".pt", "_separation.pt")
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "triplet_center_loss_state_dict": triplet_center_loss.state_dict(),
+                    "sensor_names": SENSOR_COLS,
+                    "window_size": window_size,
+                    "embed_dim": EMBED_DIM,
+                    "top_k": TOP_K,
+                    "hidden_dim": HIDDEN_DIM,
+                    "sensor_embeddings": model.sensor_embeddings.data.cpu(),
+                    "lambda_center": lambda_center,
+                    "lambda_global": lambda_global,
+                    "lambda_scl": lambda_scl,
+                    "center_separation": center_separation,
+                    "normal_mean_distance": normal_mean,
+                    "anomalous_mean_distance": anomalous_mean,
+                    "epoch": epoch + 1,
+                    "best_val_clf_loss": val_clf_loss,
+                    "val_total_loss": val_total_loss,
+                },
+                separation_path,
+            )
+            print(
+                f"  ✓ Best separation model saved (Center dist: {center_separation:.4f})"
+            )
+
+        # Early stopping based on classification loss
+        if patience_counter >= max_patience:
+            print(
+                f"\nEarly stopping at epoch {epoch + 1} (no improvement for {max_patience} epochs)"
+            )
+            break
 
     # Load best checkpoint
     checkpoint = torch.load(model_save_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
     triplet_center_loss.load_state_dict(checkpoint["triplet_center_loss_state_dict"])
 
-    print(f"\n✓ Training complete. Best model saved to: {model_save_path}")
-    print(f"  Final center separation: {checkpoint['center_separation']:.4f}")
-    print(f"  Normal mean distance: {checkpoint['normal_mean_distance']:.4f}")
-    print(f"  Anomalous mean distance: {checkpoint['anomalous_mean_distance']:.4f}\n")
+    print(f"\n{'=' * 80}")
+    print(f"Training complete!")
+    best_clf = checkpoint.get(
+        "best_val_clf_loss", checkpoint.get("best_val_loss", None)
+    )
+    if best_clf is not None:
+        print(
+            f"Best validation CLF loss: {best_clf:.4f} at epoch {checkpoint['epoch']}"
+        )
+    else:
+        print(f"Best validation loss: N/A at epoch {checkpoint['epoch']}")
+    if "val_total_loss" in checkpoint:
+        print(f"Validation total loss: {checkpoint['val_total_loss']:.4f}")
+    print(f"Center distance: {checkpoint['center_separation']:.4f}")
+    print(f"Normal mean distance: {checkpoint['normal_mean_distance']:.4f}")
+    print(f"Anomalous mean distance: {checkpoint['anomalous_mean_distance']:.4f}")
+    print(f"{'=' * 80}\n")
 
     return model, triplet_center_loss
 
@@ -600,18 +719,29 @@ def main():
     parser = argparse.ArgumentParser(
         description="Train MultiLabelGDN with Triplet-Center Loss + Supervised Contrastive Loss"
     )
-    parser.add_argument("--data_path", type=str, default=DATA_PATH, help="Path to data directory")
-    parser.add_argument("--epochs", type=int, default=NUM_EPOCHS, help="Number of epochs")
+    parser.add_argument(
+        "--data_path", type=str, default=DATA_PATH, help="Path to data directory"
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=NUM_EPOCHS, help="Number of epochs"
+    )
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE, help="Batch size")
     parser.add_argument("--lr", type=float, default=LEARNING_RATE, help="Learning rate")
     parser.add_argument(
         "--lambda_center", type=float, default=LAMBDA_CENTER, help="Center loss weight"
     )
-    parser.add_argument("--lambda_global", type=float, default=LAMBDA_GLOBAL, help="Global loss weight")
-    parser.add_argument("--lambda_scl", type=float, default=LAMBDA_SCL, help="SCL loss weight")
+    parser.add_argument(
+        "--lambda_global", type=float, default=LAMBDA_GLOBAL, help="Global loss weight"
+    )
+    parser.add_argument(
+        "--lambda_scl", type=float, default=LAMBDA_SCL, help="SCL loss weight"
+    )
     parser.add_argument("--device", type=str, default=None, help="Device (cpu/cuda)")
     parser.add_argument(
-        "--output", type=str, default="best_multilabel_gdn_triplet_center.pt", help="Output checkpoint path"
+        "--output",
+        type=str,
+        default="best_multilabel_gdn_triplet_center.pt",
+        help="Output checkpoint path",
     )
     args = parser.parse_args()
 
@@ -642,14 +772,21 @@ def main():
     # Preprocessing
     print("\nPreprocessing data...")
     data = data.drop(
-        columns=["WARM_UPS_SINCE_CODES_CLEARED ()", "TIME_SINCE_TROUBLE_CODES_CLEARED ()"]
+        columns=[
+            "WARM_UPS_SINCE_CODES_CLEARED ()",
+            "TIME_SINCE_TROUBLE_CODES_CLEARED ()",
+        ]
     )
     data = mean_fill_missing_timestamps_and_remove_duplicates(
         data, time_col=TIME_COL, id_cols=[ID_COL]
     )
     data = remove_zero_variance_columns(data, exclude_cols=[ID_COL])
-    data = downsample(data, time_col=TIME_COL, source_file_col=ID_COL, downsample_factor=1)
-    data = filter_long_drives(data, id_col=ID_COL, min_length=WINDOW_SIZE + FORECAST_HORIZON)
+    data = downsample(
+        data, time_col=TIME_COL, source_file_col=ID_COL, downsample_factor=1
+    )
+    data = filter_long_drives(
+        data, id_col=ID_COL, min_length=WINDOW_SIZE + FORECAST_HORIZON
+    )
     data = add_cross_channel_features(data)
     print("Added cross-channel features")
 
@@ -665,13 +802,17 @@ def main():
     val_drives = unique_drives[int(0.70 * n_drives) : int(0.85 * n_drives)]
     test_drives = unique_drives[int(0.85 * n_drives) :]
 
-    print(f"Train drives: {len(train_drives)}, Val drives: {len(val_drives)}, Test drives: {len(test_drives)}")
+    print(
+        f"Train drives: {len(train_drives)}, Val drives: {len(val_drives)}, Test drives: {len(test_drives)}"
+    )
 
     train_data = data[data[ID_COL].isin(train_drives)].copy()
     val_data = data[data[ID_COL].isin(val_drives)].copy()
     test_data = data[data[ID_COL].isin(test_drives)].copy()
 
-    print(f"Train shape: {train_data.shape}, Val shape: {val_data.shape}, Test shape: {test_data.shape}")
+    print(
+        f"Train shape: {train_data.shape}, Val shape: {val_data.shape}, Test shape: {test_data.shape}"
+    )
 
     # Build clean windows
     print("\nBuilding clean windows...")
@@ -691,14 +832,24 @@ def main():
 
     # Inject faults with sensor-level labels
     print("\nInjecting faults with sensor-level labels (balanced distribution)...")
-    X_train_sensor, _, train_sensor_labels, train_window_labels = inject_faults_with_sensor_labels(
-        X_train, y_train, SENSOR_COLS, fault_percentage=0.15, random_state=42
+    X_train_sensor, _, train_sensor_labels, train_window_labels = (
+        inject_faults_with_sensor_labels(
+            X_train, y_train, SENSOR_COLS, fault_percentage=0.15, random_state=42
+        )
     )
-    X_val_sensor, _, val_sensor_labels, val_window_labels = inject_faults_with_sensor_labels(
-        X_val, y_val, SENSOR_COLS, fault_percentage=0.15, random_state=43
+    X_val_sensor, _, val_sensor_labels, val_window_labels = (
+        inject_faults_with_sensor_labels(
+            X_val, y_val, SENSOR_COLS, fault_percentage=0.15, random_state=43
+        )
     )
-    X_test_sensor, _, test_sensor_labels, test_window_labels = inject_faults_with_sensor_labels(
-        X_test_clean, y_test_clean, SENSOR_COLS, fault_percentage=0.30, random_state=44
+    X_test_sensor, _, test_sensor_labels, test_window_labels = (
+        inject_faults_with_sensor_labels(
+            X_test_clean,
+            y_test_clean,
+            SENSOR_COLS,
+            fault_percentage=0.30,
+            random_state=44,
+        )
     )
 
     # Statistics
@@ -707,16 +858,26 @@ def main():
     test_faulty = (test_sensor_labels.sum(dim=1) > 0).sum().item()
 
     print(f"\nTrain: {train_faulty}/{len(X_train_sensor)} faulty windows")
-    print(f"  Avg sensors per fault: {train_sensor_labels[train_sensor_labels.sum(dim=1) > 0].sum(dim=1).mean():.2f}")
+    print(
+        f"  Avg sensors per fault: {train_sensor_labels[train_sensor_labels.sum(dim=1) > 0].sum(dim=1).mean():.2f}"
+    )
     print(f"Val:   {val_faulty}/{len(X_val_sensor)} faulty windows")
-    print(f"  Avg sensors per fault: {val_sensor_labels[val_sensor_labels.sum(dim=1) > 0].sum(dim=1).mean():.2f}")
+    print(
+        f"  Avg sensors per fault: {val_sensor_labels[val_sensor_labels.sum(dim=1) > 0].sum(dim=1).mean():.2f}"
+    )
     print(f"Test:  {test_faulty}/{len(X_test_sensor)} faulty windows")
-    print(f"  Avg sensors per fault: {test_sensor_labels[test_sensor_labels.sum(dim=1) > 0].sum(dim=1).mean():.2f}")
+    print(
+        f"  Avg sensors per fault: {test_sensor_labels[test_sensor_labels.sum(dim=1) > 0].sum(dim=1).mean():.2f}"
+    )
 
     # Create dataloaders
-    train_ds = TensorDataset(X_train_sensor, y_train, train_sensor_labels, train_window_labels)
+    train_ds = TensorDataset(
+        X_train_sensor, y_train, train_sensor_labels, train_window_labels
+    )
     val_ds = TensorDataset(X_val_sensor, y_val, val_sensor_labels, val_window_labels)
-    test_ds = TensorDataset(X_test_sensor, y_test_clean, test_sensor_labels, test_window_labels)
+    test_ds = TensorDataset(
+        X_test_sensor, y_test_clean, test_sensor_labels, test_window_labels
+    )
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
