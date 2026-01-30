@@ -84,19 +84,25 @@ class GDNWithForecasting(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(hidden_dim, num_horizons * num_nodes),  # Predict num_horizons * num_sensors
+            nn.Linear(
+                hidden_dim, num_horizons * num_nodes
+            ),  # Predict num_horizons * num_sensors
         )
-        
+
         # Reconstruction head: reconstructs full window from sensor embeddings
-        self.reconstruction_head = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(0.2),
-                nn.Linear(hidden_dim, window_size),  # Reconstruct full window for each sensor
-            )
-            for _ in range(num_nodes)
-        ])
+        self.reconstruction_head = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.ReLU(),
+                    nn.Dropout(0.2),
+                    nn.Linear(
+                        hidden_dim, window_size
+                    ),  # Reconstruct full window for each sensor
+                )
+                for _ in range(num_nodes)
+            ]
+        )
 
     def forward(self, x, return_forecast=False, return_reconstruction=False):
         """
@@ -114,29 +120,39 @@ class GDNWithForecasting(nn.Module):
         """
         # Get embeddings from base model
         embeddings = self.base_model.get_embeddings(x)  # (B, hidden_dim)
-        
+
         # Get sensor embeddings for reconstruction
-        sensor_embeddings = self.base_model.get_sensor_embeddings(x)  # (B, N, hidden_dim)
+        sensor_embeddings = self.base_model.get_sensor_embeddings(
+            x
+        )  # (B, N, hidden_dim)
 
         # Get base model outputs
         sensor_logits = self.base_model(x)
-        
+
         outputs = [sensor_logits]
 
         if return_forecast:
             # Predict multiple horizons
-            forecast_flat = self.forecasting_head(embeddings)  # (B, num_horizons * num_nodes)
-            forecast = forecast_flat.reshape(-1, self.num_horizons, self.base_model.num_nodes)  # (B, num_horizons, N)
+            forecast_flat = self.forecasting_head(
+                embeddings
+            )  # (B, num_horizons * num_nodes)
+            forecast = forecast_flat.reshape(
+                -1, self.num_horizons, self.base_model.num_nodes
+            )  # (B, num_horizons, N)
             outputs.append(forecast)
-        
+
         if return_reconstruction:
             # Reconstruct each sensor's time series
             reconstructions = []
             for i in range(self.base_model.num_nodes):
-                recon = self.reconstruction_head[i](sensor_embeddings[:, i, :])  # (B, window_size)
+                recon = self.reconstruction_head[i](
+                    sensor_embeddings[:, i, :]
+                )  # (B, window_size)
                 reconstructions.append(recon)
             # Stack along sensor dimension: (B, window_size, N)
-            reconstruction = torch.stack(reconstructions, dim=2)  # (B, window_size, num_nodes)
+            reconstruction = torch.stack(
+                reconstructions, dim=2
+            )  # (B, window_size, num_nodes)
             # This matches input format (B, W, N) where W=window_size, N=num_nodes
             outputs.append(reconstruction)
 
@@ -252,10 +268,10 @@ def build_forecast_windows(
     """
     Build windows for multi-horizon forecasting: window[t] predicts window[t+h] for h in horizons.
     Returns consecutive windows for self-supervised learning with drive IDs.
-    
+
     Args:
         horizons: List of forecast horizons (e.g., [1, 5, 10] means predict t+1, t+5, t+10)
-    
+
     Returns:
         X: (N, window_size, num_sensors) input windows
         y_forecast: (N, num_horizons, num_sensors) multi-horizon targets
@@ -283,20 +299,24 @@ def build_forecast_windows(
         # Create consecutive windows: window[t] predicts multiple future timesteps
         for t in range(T_ - window_size - max_horizon):
             X_window = values[t : t + window_size]  # Current window
-            
+
             # Multiple targets for different horizons
             y_targets = []
             for h in horizons:
-                y_targets.append(values[t + window_size + h - 1])  # Target at t+window_size+h-1
-            
+                y_targets.append(
+                    values[t + window_size + h - 1]
+                )  # Target at t+window_size+h-1
+
             X_list.append(X_window)
             y_forecast_list.append(np.stack(y_targets))  # (num_horizons, num_sensors)
             drive_id_list.append(drive_id)
 
     X = torch.tensor(np.stack(X_list), dtype=torch.float32)
-    y_forecast = torch.tensor(np.stack(y_forecast_list), dtype=torch.float32)  # (N, num_horizons, num_sensors)
+    y_forecast = torch.tensor(
+        np.stack(y_forecast_list), dtype=torch.float32
+    )  # (N, num_horizons, num_sensors)
     drive_ids = np.array(drive_id_list)
-    
+
     return X, y_forecast, drive_ids, scaler
 
 
@@ -311,10 +331,11 @@ class TemporalContrastiveLoss(nn.Module):
     embeddings from different drives should be dissimilar.
     Implements InfoNCE loss for temporal contrastive learning.
     """
+
     def __init__(self, temperature=0.5):
         super().__init__()
         self.temperature = temperature
-    
+
     def forward(self, embeddings, drive_ids):
         """
         Args:
@@ -323,43 +344,45 @@ class TemporalContrastiveLoss(nn.Module):
         """
         device = embeddings.device
         B = embeddings.size(0)
-        
+
         # Normalize embeddings
         embeddings = F.normalize(embeddings, p=2, dim=1)
-        
+
         # Ensure drive_ids is a tensor on the correct device
         if not isinstance(drive_ids, torch.Tensor):
             drive_ids = torch.tensor(drive_ids, device=device, dtype=torch.long)
         else:
             drive_ids = drive_ids.to(device).long()
-        
+
         drive_ids_tensor = drive_ids
-        
+
         # Similarity matrix
         similarity = torch.mm(embeddings, embeddings.t()) / self.temperature
-        
+
         # Positive pairs: same drive
-        positive_mask = (drive_ids_tensor.unsqueeze(0) == drive_ids_tensor.unsqueeze(1)).float()
+        positive_mask = (
+            drive_ids_tensor.unsqueeze(0) == drive_ids_tensor.unsqueeze(1)
+        ).float()
         positive_mask.fill_diagonal_(0)  # Exclude self
-        
+
         # Negative pairs: different drives
         negative_mask = 1 - positive_mask
         negative_mask.fill_diagonal_(0)
-        
+
         # InfoNCE loss
         exp_sim = torch.exp(similarity)
-        
+
         # For each sample, pull positives close, push negatives away
         pos_sim = (exp_sim * positive_mask).sum(dim=1)
         all_sim = (exp_sim * (positive_mask + negative_mask)).sum(dim=1)
-        
+
         # Handle case where no positive pairs exist
         has_pos = positive_mask.sum(dim=1) > 0
         if has_pos.sum() == 0:
             return torch.tensor(0.0, device=device, requires_grad=True)
-        
+
         loss = -torch.log((pos_sim[has_pos] / (all_sim[has_pos] + 1e-8)) + 1e-8).mean()
-        
+
         return loss
 
 
@@ -383,6 +406,8 @@ def train_stage1(
     gradient_accumulation_steps=1,
     use_amp=False,
     model_type="enhanced",
+    resume_from_checkpoint=None,
+    focus_on_contrastive=False,
 ):
     """
     Train GDN with forecasting loss only (self-supervised).
@@ -416,9 +441,9 @@ def train_stage1(
     # Wrap with forecasting head (with multi-horizon support)
     num_horizons = len(FORECAST_HORIZONS)
     model = GDNWithForecasting(base_model, num_horizons=num_horizons).to(device)
-    
+
     # Apply torch.compile() if requested (PyTorch 2.0+)
-    if use_compile and hasattr(torch, 'compile'):
+    if use_compile and hasattr(torch, "compile"):
         print(f"\nCompiling model with mode='{compile_mode}'...")
         print("  Note: First epoch will be slower due to compilation")
         model = torch.compile(model, mode=compile_mode)
@@ -430,7 +455,7 @@ def train_stage1(
     optimizer = torch.optim.Adam(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay
     )
-    
+
     # Mixed precision training (AMP) - only for CUDA
     scaler = None
     if use_amp and device.startswith("cuda"):
@@ -450,9 +475,64 @@ def train_stage1(
         optimizer, patience=10, factor=0.5, verbose=True
     )
 
+    # Initialize training state
+    start_epoch = 0
     best_val_loss = float("inf")
+    best_contrastive_loss = float("inf")
     patience_counter = 0
-    max_patience = 20
+    max_patience = (
+        20 if not focus_on_contrastive else 999999
+    )  # Disable early stopping if focusing on contrastive
+
+    # Resume from checkpoint if provided
+    if resume_from_checkpoint and os.path.exists(resume_from_checkpoint):
+        print(f"\nResuming training from checkpoint: {resume_from_checkpoint}")
+        checkpoint = torch.load(resume_from_checkpoint, map_location=device)
+
+        # Load model state
+        model.load_state_dict(checkpoint["model_state_dict"])
+
+        # Load optimizer state if available
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            print("  ✓ Loaded optimizer state")
+
+        # Load scaler state if available
+        if (
+            scaler is not None
+            and "scaler_state_dict" in checkpoint
+            and checkpoint.get("scaler_state_dict") is not None
+        ):
+            scaler.load_state_dict(checkpoint["scaler_state_dict"])
+            print("  ✓ Loaded scaler state")
+
+        # Resume from saved epoch
+        if "epoch" in checkpoint:
+            start_epoch = checkpoint["epoch"]
+            print(f"  ✓ Resuming from epoch {start_epoch + 1}")
+
+        # Resume best validation loss
+        if "best_val_loss" in checkpoint:
+            best_val_loss = checkpoint["best_val_loss"]
+            print(f"  ✓ Resumed best validation loss: {best_val_loss:.6f}")
+
+        # Resume best contrastive loss if available
+        if "best_contrastive_loss" in checkpoint:
+            best_contrastive_loss = checkpoint["best_contrastive_loss"]
+            print(f"  ✓ Resumed best contrastive loss: {best_contrastive_loss:.6f}")
+
+        # Detect model type from checkpoint if not specified
+        if "model_type" in checkpoint and checkpoint["model_type"] != model_type:
+            print(
+                f"  ⚠ Warning: Checkpoint model_type ({checkpoint['model_type']}) differs from specified ({model_type})"
+            )
+            print(f"     Using checkpoint model_type: {checkpoint['model_type']}")
+            model_type = checkpoint["model_type"]
+
+        print("  ✓ Checkpoint loaded successfully")
+    elif resume_from_checkpoint:
+        print(f"\n⚠ Warning: Checkpoint file not found: {resume_from_checkpoint}")
+        print("  Starting training from scratch")
 
     # Create checkpoint directory
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -470,7 +550,7 @@ def train_stage1(
     print(f"Mixed precision (AMP): {use_amp}")
     print(f"Model compilation: {use_compile}\n")
 
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         model.train()
         train_loss = 0.0
         train_loss_forecast = 0.0
@@ -482,11 +562,11 @@ def train_stage1(
         ) as pbar:
             # Zero gradients at start of epoch (for gradient accumulation)
             optimizer.zero_grad()
-            
+
             for batch_idx, batch in enumerate(pbar):
                 # Batch format: (X, y_forecast, drive_ids)
                 X_batch, y_forecast_batch, drive_ids_batch = batch
-                
+
                 X_batch = X_batch.to(device)
                 y_forecast_batch = y_forecast_batch.to(device)
                 drive_ids_batch = drive_ids_batch.to(device)
@@ -494,7 +574,9 @@ def train_stage1(
                 # Forward pass with optional AMP
                 if use_amp and scaler is not None:
                     with autocast():
-                        _, forecast, reconstruction = model(X_batch, return_forecast=True, return_reconstruction=True)
+                        _, forecast, reconstruction = model(
+                            X_batch, return_forecast=True, return_reconstruction=True
+                        )
 
                         # Multi-horizon forecasting loss (averaged across horizons)
                         loss_forecast = forecast_criterion(forecast, y_forecast_batch)
@@ -504,13 +586,19 @@ def train_stage1(
 
                         # Contrastive loss
                         window_embeddings = model.base_model.get_embeddings(X_batch)
-                        loss_contrastive = contrastive_loss_fn(window_embeddings, drive_ids_batch)
+                        loss_contrastive = contrastive_loss_fn(
+                            window_embeddings, drive_ids_batch
+                        )
 
                         # Combined loss (scale by accumulation steps)
-                        loss = (loss_forecast + 0.5 * loss_recon + 0.3 * loss_contrastive) / gradient_accumulation_steps
+                        loss = (
+                            loss_forecast + 0.5 * loss_recon + 0.3 * loss_contrastive
+                        ) / gradient_accumulation_steps
                 else:
                     # Forward pass: get forecast and reconstruction
-                    _, forecast, reconstruction = model(X_batch, return_forecast=True, return_reconstruction=True)
+                    _, forecast, reconstruction = model(
+                        X_batch, return_forecast=True, return_reconstruction=True
+                    )
 
                     # Multi-horizon forecasting loss (averaged across horizons)
                     loss_forecast = forecast_criterion(forecast, y_forecast_batch)
@@ -520,10 +608,14 @@ def train_stage1(
 
                     # Contrastive loss
                     window_embeddings = model.base_model.get_embeddings(X_batch)
-                    loss_contrastive = contrastive_loss_fn(window_embeddings, drive_ids_batch)
+                    loss_contrastive = contrastive_loss_fn(
+                        window_embeddings, drive_ids_batch
+                    )
 
                     # Combined loss (scale by accumulation steps)
-                    loss = (loss_forecast + 0.5 * loss_recon + 0.3 * loss_contrastive) / gradient_accumulation_steps
+                    loss = (
+                        loss_forecast + 0.5 * loss_recon + 0.3 * loss_contrastive
+                    ) / gradient_accumulation_steps
 
                 # Backward pass with optional AMP
                 if use_amp and scaler is not None:
@@ -536,7 +628,7 @@ def train_stage1(
                     # Gradient clipping
                     if use_amp and scaler is not None:
                         scaler.unscale_(optimizer)
-                    
+
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
                     # Update optimizer
@@ -545,14 +637,24 @@ def train_stage1(
                         scaler.update()
                     else:
                         optimizer.step()
-                    
+
                     # Zero gradients for next accumulation
                     optimizer.zero_grad()
 
-                train_loss += loss.item() * X_batch.size(0) * gradient_accumulation_steps
-                train_loss_forecast += loss_forecast.item() * X_batch.size(0) * gradient_accumulation_steps
-                train_loss_recon += loss_recon.item() * X_batch.size(0) * gradient_accumulation_steps
-                train_loss_contrastive += loss_contrastive.item() * X_batch.size(0) * gradient_accumulation_steps
+                train_loss += (
+                    loss.item() * X_batch.size(0) * gradient_accumulation_steps
+                )
+                train_loss_forecast += (
+                    loss_forecast.item() * X_batch.size(0) * gradient_accumulation_steps
+                )
+                train_loss_recon += (
+                    loss_recon.item() * X_batch.size(0) * gradient_accumulation_steps
+                )
+                train_loss_contrastive += (
+                    loss_contrastive.item()
+                    * X_batch.size(0)
+                    * gradient_accumulation_steps
+                )
 
         train_loss /= len(train_loader.dataset)
         train_loss_forecast /= len(train_loader.dataset)
@@ -570,19 +672,23 @@ def train_stage1(
             for batch in val_loader:
                 # Handle batch format: (X, y_forecast, drive_ids)
                 X_batch, y_forecast_batch, drive_ids_batch = batch
-                
+
                 X_batch = X_batch.to(device)
                 y_forecast_batch = y_forecast_batch.to(device)
                 drive_ids_batch = drive_ids_batch.to(device)
 
-                _, forecast, reconstruction = model(X_batch, return_forecast=True, return_reconstruction=True)
+                _, forecast, reconstruction = model(
+                    X_batch, return_forecast=True, return_reconstruction=True
+                )
 
                 loss_forecast = forecast_criterion(forecast, y_forecast_batch)
                 loss_recon = recon_criterion(reconstruction, X_batch)
-                
+
                 window_embeddings = model.base_model.get_embeddings(X_batch)
-                loss_contrastive = contrastive_loss_fn(window_embeddings, drive_ids_batch)
-                
+                loss_contrastive = contrastive_loss_fn(
+                    window_embeddings, drive_ids_batch
+                )
+
                 loss = loss_forecast + 0.5 * loss_recon + 0.3 * loss_contrastive
 
                 val_loss += loss.item() * X_batch.size(0)
@@ -605,38 +711,74 @@ def train_stage1(
             f"Recon: {train_loss_recon:.6f} | "
             f"Contrastive: {train_loss_contrastive:.6f} | "
             f"Val Loss: {val_loss:.6f} | "
-            f"Val Forecast: {val_loss_forecast:.6f}"
+            f"Val Forecast: {val_loss_forecast:.6f} | "
+            f"Val Contrastive: {val_loss_contrastive:.6f}"
         )
 
-        # Save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            patience_counter = 0
+        # Track best contrastive loss if focusing on it
+        if focus_on_contrastive:
+            if val_loss_contrastive < best_contrastive_loss:
+                best_contrastive_loss = val_loss_contrastive
+                patience_counter = 0
+                print(f"  ✓ New best contrastive loss: {best_contrastive_loss:.6f}")
 
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "base_model_state_dict": base_model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "sensor_names": SENSOR_COLS,
-                    "window_size": window_size,
-                    "embed_dim": EMBED_DIM,
-                    "top_k": TOP_K,
-                    "hidden_dim": HIDDEN_DIM,
-                    "sensor_embeddings": base_model.sensor_embeddings.data.cpu(),
-                    "epoch": epoch + 1,
-                    "best_val_loss": val_loss,
-                    "stage": 1,
-                    "model_type": model_type,
-                },
-                best_checkpoint_path,
-            )
-            print(f"  ✓ Best model saved: {best_checkpoint_path} (Val Loss: {val_loss:.6f})")
+                # Save checkpoint if contrastive loss improved
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "base_model_state_dict": base_model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scaler_state_dict": scaler.state_dict() if scaler else None,
+                        "sensor_names": SENSOR_COLS,
+                        "window_size": window_size,
+                        "embed_dim": EMBED_DIM,
+                        "top_k": TOP_K,
+                        "hidden_dim": HIDDEN_DIM,
+                        "sensor_embeddings": base_model.sensor_embeddings.data.cpu(),
+                        "epoch": epoch + 1,
+                        "best_val_loss": val_loss,
+                        "best_contrastive_loss": val_loss_contrastive,
+                        "stage": 1,
+                        "model_type": model_type,
+                    },
+                    best_checkpoint_path,
+                )
+                print(
+                    f"  ✓ Checkpoint saved: {best_checkpoint_path} (Contrastive Loss: {val_loss_contrastive:.6f})"
+                )
         else:
-            patience_counter += 1
+            # Standard: save best model based on total validation loss
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
 
-        # Early stopping
-        if patience_counter >= max_patience:
+                torch.save(
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "base_model_state_dict": base_model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scaler_state_dict": scaler.state_dict() if scaler else None,
+                        "sensor_names": SENSOR_COLS,
+                        "window_size": window_size,
+                        "embed_dim": EMBED_DIM,
+                        "top_k": TOP_K,
+                        "hidden_dim": HIDDEN_DIM,
+                        "sensor_embeddings": base_model.sensor_embeddings.data.cpu(),
+                        "epoch": epoch + 1,
+                        "best_val_loss": val_loss,
+                        "stage": 1,
+                        "model_type": model_type,
+                    },
+                    best_checkpoint_path,
+                )
+                print(
+                    f"  ✓ Best model saved: {best_checkpoint_path} (Val Loss: {val_loss:.6f})"
+                )
+            else:
+                patience_counter += 1
+
+        # Early stopping (disabled if focusing on contrastive)
+        if patience_counter >= max_patience and not focus_on_contrastive:
             print(
                 f"\nEarly stopping at epoch {epoch + 1} "
                 f"(no improvement for {max_patience} epochs)"
@@ -721,6 +863,17 @@ def main():
         choices=["enhanced", "kag_optimized"],
         help="Model type: 'enhanced' (full features) or 'kag_optimized' (fast baseline with essential fixes)",
     )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to checkpoint file to resume training from",
+    )
+    parser.add_argument(
+        "--focus_on_contrastive",
+        action="store_true",
+        help="Focus on minimizing contrastive loss instead of total validation loss (disables early stopping)",
+    )
     args = parser.parse_args()
 
     # Device detection (CUDA or CPU only - MPS not supported due to PyTorch Geometric incompatibility)
@@ -730,7 +883,9 @@ def main():
     elif args.device is not None:
         device = args.device
         if device == "mps":
-            print("Warning: MPS not supported (PyTorch Geometric incompatibility). Falling back to CPU.")
+            print(
+                "Warning: MPS not supported (PyTorch Geometric incompatibility). Falling back to CPU."
+            )
             device = "cpu"
         print(f"Using device: {device} (specified via --device)")
     else:
@@ -806,10 +961,22 @@ def main():
     # Build forecast windows (self-supervised, no labels needed)
     print("\nBuilding forecast windows...")
     X_train, y_train_forecast, drive_ids_train, scaler_train = build_forecast_windows(
-        train_data, SENSOR_COLS, ID_COL, TIME_COL, WINDOW_SIZE, horizons=FORECAST_HORIZONS, scaler=None
+        train_data,
+        SENSOR_COLS,
+        ID_COL,
+        TIME_COL,
+        WINDOW_SIZE,
+        horizons=FORECAST_HORIZONS,
+        scaler=None,
     )
     X_val, y_val_forecast, drive_ids_val, _ = build_forecast_windows(
-        val_data, SENSOR_COLS, ID_COL, TIME_COL, WINDOW_SIZE, horizons=FORECAST_HORIZONS, scaler=scaler_train
+        val_data,
+        SENSOR_COLS,
+        ID_COL,
+        TIME_COL,
+        WINDOW_SIZE,
+        horizons=FORECAST_HORIZONS,
+        scaler=scaler_train,
     )
 
     print(f"Train windows: {len(X_train)}")
@@ -821,12 +988,16 @@ def main():
     all_drive_ids = np.concatenate([drive_ids_train, drive_ids_val])
     unique_drives = np.unique(all_drive_ids)
     drive_to_idx = {drive: idx for idx, drive in enumerate(unique_drives)}
-    
+
     drive_ids_train_idx = np.array([drive_to_idx[drive] for drive in drive_ids_train])
     drive_ids_val_idx = np.array([drive_to_idx[drive] for drive in drive_ids_val])
-    
-    train_ds = TensorDataset(X_train, y_train_forecast, torch.tensor(drive_ids_train_idx, dtype=torch.long))
-    val_ds = TensorDataset(X_val, y_val_forecast, torch.tensor(drive_ids_val_idx, dtype=torch.long))
+
+    train_ds = TensorDataset(
+        X_train, y_train_forecast, torch.tensor(drive_ids_train_idx, dtype=torch.long)
+    )
+    val_ds = TensorDataset(
+        X_val, y_val_forecast, torch.tensor(drive_ids_val_idx, dtype=torch.long)
+    )
 
     # Optimized DataLoader configuration
     pin_memory = device.startswith("cuda")  # Only pin memory for CUDA
@@ -868,6 +1039,8 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         use_amp=args.use_amp,
         model_type=args.model,
+        resume_from_checkpoint=args.resume,
+        focus_on_contrastive=args.focus_on_contrastive,
     )
 
     print("✓ Stage 1 training complete!")
