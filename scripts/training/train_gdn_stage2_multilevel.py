@@ -28,7 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "anomaly-detection"))
 from models.gdn_model import MultiLabelGDN, KAGOptimizedGDN
-from models.multi_level_center_loss import MultiLevelCenterLoss
+from models.multi_level_center_loss import SensorOnlyCenterLoss
 
 torch.set_default_dtype(torch.float32)
 
@@ -53,11 +53,11 @@ WINDOW_SIZE = 300
 FORECAST_HORIZON = 1
 
 # Training hyperparameters
-NUM_EPOCHS = 50  # Default: 40-50 epochs
+NUM_EPOCHS = 40  # Reduced from 50 (will converge faster with good Stage 1)
 BATCH_SIZE = 32
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 5e-4  # Reduced from 1e-3 (fine-tuning, not training from scratch)
 WEIGHT_DECAY = 1e-4
-LAMBDA_CENTER = 1.2  # Increased from 0.8 to emphasize separation
+LAMBDA_CENTER = 0.5  # Reduced for sensor-only approach (better stability)
 LAMBDA_GLOBAL = 0.3
 
 # Model architecture (must match Stage 1)
@@ -67,7 +67,7 @@ HIDDEN_DIM = 64
 
 # Multi-Level Center Loss parameters
 MLC_MARGIN = 2.0
-MLC_LAMBDA_INTRA = 1.0  # Reduced from 1.5 to allow more natural clustering
+MLC_LAMBDA_INTRA = 1.5  # Increased from 1.0 (tighter clusters, target < 0.30)
 MLC_LAMBDA_SENSOR = 0.8  # Increased from 0.5 to push sensor-specific separation
 
 # ============================================================================
@@ -317,7 +317,7 @@ def train_stage2_multilevel(
                 if not (k.startswith('gat.') and 'weight' in k and v.shape[0] == 4 * HIDDEN_DIM)
             }
         
-        model.load_state_dict(filtered_state, strict=False)
+        model.load_state_dict(filtered_state, strict=True)
         print(f"  ✓ Loaded model state (model_type: {final_model_type})")
     elif "model_state_dict" in stage1_checkpoint:
         # Direct model state
@@ -332,40 +332,75 @@ def train_stage2_multilevel(
         else:
             filtered_state = base_state
         
-        model.load_state_dict(filtered_state, strict=False)
+        model.load_state_dict(filtered_state, strict=True)
         print(f"  ✓ Loaded model state (model_type: {final_model_type})")
 
-    # CRITICAL: Freeze sensor embeddings and graph structure
-    print("\nFreezing sensor embeddings and graph structure...")
-    model.sensor_embeddings.requires_grad = False
-    print(f"  Sensor embeddings frozen: {not model.sensor_embeddings.requires_grad}")
+    # CRITICAL: Unfreeze sensor embeddings with reduced LR for fine-tuning
+    print("\nUnfreezing sensor embeddings with reduced learning rate...")
+    model.sensor_embeddings.requires_grad = True
+    
+    # Create separate parameter groups: embeddings at reduced LR, others at full LR
+    embedding_params = [model.sensor_embeddings]
+    other_params = [p for p in model.parameters() if p is not model.sensor_embeddings and p.requires_grad]
+    
+    optimizer = torch.optim.Adam([
+        {'params': other_params, 'lr': learning_rate, 'weight_decay': weight_decay},
+        {'params': embedding_params, 'lr': learning_rate * 0.1, 'weight_decay': weight_decay}
+    ])
+    print(f"  Sensor embeddings unfrozen with reduced LR: {learning_rate * 0.1:.6f}")
+    
+    # Define trainable_params for gradient clipping (all model parameters including embeddings)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
 
-    # Initialize multi-level center loss
-    center_loss = MultiLevelCenterLoss(
+    # Initialize sensor-only center loss
+    center_loss = SensorOnlyCenterLoss(
         embed_dim=HIDDEN_DIM,
         num_sensors=num_sensors,
         num_classes=2,
         margin=MLC_MARGIN,
         lambda_intra=MLC_LAMBDA_INTRA,
-        lambda_sensor=MLC_LAMBDA_SENSOR,
     ).to(device)
 
-    # Initialize centers at opposite ends of hypersphere
+    # Initialize sensor centers at 120° angle (NOT 180°!)
+    print("\nInitializing sensor centers at 120° angle (controlled separation)...")
+    print(f"  Sensor centers: {num_sensors} sensors × 2 classes = {num_sensors * 2} centers")
+    
     with torch.no_grad():
-        # Window-level centers
-        center_loss.window_centers[0] = F.normalize(torch.ones(HIDDEN_DIM), dim=0)
-        center_loss.window_centers[1] = F.normalize(-torch.ones(HIDDEN_DIM), dim=0)
+        # Target: dot product = -0.5 (120° angle, separation ~1.73)
+        target_dot = -0.5
         
-        # Sensor-level centers (initialize all sensors similarly)
+        # Sensor centers (same approach for each sensor)
+        sensor_dots = []
+        sensor_seps = []
         for sensor_idx in range(num_sensors):
-            center_loss.sensor_centers[sensor_idx, 0] = F.normalize(torch.ones(HIDDEN_DIM), dim=0)
-            center_loss.sensor_centers[sensor_idx, 1] = F.normalize(-torch.ones(HIDDEN_DIM), dim=0)
-
-    # Optimizers: only for trainable parameters
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.Adam(
-        trainable_params, lr=learning_rate, weight_decay=weight_decay
-    )
+            s_c0 = torch.randn(HIDDEN_DIM, device=device)
+            s_c1 = torch.randn(HIDDEN_DIM, device=device)
+            
+            s_c0 = F.normalize(s_c0, p=2, dim=0)
+            s_c1 = F.normalize(s_c1, p=2, dim=0)
+            
+            # Perpendicular component
+            s_c1_perp = s_c1 - (s_c1 @ s_c0) * s_c0
+            s_c1_perp = F.normalize(s_c1_perp, p=2, dim=0)
+            
+            # 120° angle
+            s_c1_new = target_dot * s_c0 + torch.sqrt(torch.tensor(1 - target_dot**2, device=device)) * s_c1_perp
+            s_c1_new = F.normalize(s_c1_new, p=2, dim=0)
+            
+            center_loss.sensor_centers[sensor_idx, 0].copy_(s_c0)
+            center_loss.sensor_centers[sensor_idx, 1].copy_(s_c1_new)
+            
+            # Track metrics
+            dot = (s_c0 @ s_c1_new).item()
+            sep = torch.norm(s_c0 - s_c1_new, p=2).item()
+            sensor_dots.append(dot)
+            sensor_seps.append(sep)
+    
+    avg_dot = sum(sensor_dots) / len(sensor_dots)
+    avg_sep = sum(sensor_seps) / len(sensor_seps)
+    print(f"  Average dot product: {avg_dot:.4f}")
+    print(f"  Average separation: {avg_sep:.4f}")
+    print(f"  ✓ All sensor centers initialized at 120° (separation ~1.73)")
     # Use Adam for center updates (more stable than SGD)
     optimizer_center = torch.optim.Adam(center_loss.parameters(), lr=0.01)
     
@@ -384,7 +419,7 @@ def train_stage2_multilevel(
 
     # Learning rate schedulers
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, patience=7, factor=0.5
+        optimizer, patience=10, factor=0.5  # Increased from 7 (more exploration time)
     )
     scheduler_center = torch.optim.lr_scheduler.StepLR(
         optimizer_center, step_size=10, gamma=0.5
@@ -396,15 +431,18 @@ def train_stage2_multilevel(
 
     # Create checkpoint directory
     os.makedirs(checkpoint_dir, exist_ok=True)
-    best_checkpoint_path = os.path.join(checkpoint_dir, "stage2_multilevel.pt")
+    # Use unique sensor-only checkpoint name to avoid overriding any existing checkpoints
+    from datetime import datetime
+    timestamp = datetime.now().strftime("%m%d_%H%M%S")
+    best_checkpoint_path = os.path.join(checkpoint_dir, f"stage2_sensor_only_{timestamp}.pt")
 
     print(f"\n{'=' * 80}")
-    print("Stage 2: Multi-Level Center Loss Training")
+    print("Stage 2: Sensor-Only Center Loss Training")
     print(f"{'=' * 80}")
     print(f"Embedding dim: {EMBED_DIM}, Hidden dim: {HIDDEN_DIM}")
     print(f"Lambda_center: {lambda_center}, Lambda_global: {lambda_global}")
-    print(f"MLC margin: {MLC_MARGIN}, MLC lambda_intra: {MLC_LAMBDA_INTRA}, MLC lambda_sensor: {MLC_LAMBDA_SENSOR}")
-    print(f"Frozen parameters: sensor_embeddings (graph structure)")
+    print(f"MLC margin: {MLC_MARGIN}, MLC lambda_intra: {MLC_LAMBDA_INTRA}")
+    print(f"Trainable parameters: all (sensor_embeddings with reduced LR: {learning_rate * 0.1:.6f})")
     print(f"Device: {device}")
     print(f"Model type: {final_model_type}")
     print(f"Gradient accumulation steps: {gradient_accumulation_steps}")
@@ -439,9 +477,6 @@ def train_stage2_multilevel(
                             return_global=True,
                             return_sensor_embeddings=True
                         )
-                        
-                        # Window-level embedding (for window center)
-                        window_embeddings = model.get_embeddings(X_batch)
 
                         # Classification losses
                         loss_sensor_clf = sensor_criterion(
@@ -451,11 +486,12 @@ def train_stage2_multilevel(
                             global_logits, window_labels_batch.float()
                         )
 
-                        # Multi-level center loss
+                        # Normalize sensor embeddings before passing to center loss
+                        sensor_embeddings = F.normalize(sensor_embeddings, p=2, dim=2)
+
+                        # Sensor-only center loss
                         loss_center = center_loss(
-                            window_embeddings=window_embeddings,
                             sensor_embeddings=sensor_embeddings,
-                            window_labels=window_labels_batch,
                             sensor_labels=sensor_labels_batch.long(),  # Use ground-truth sensor labels
                         )
 
@@ -466,15 +502,12 @@ def train_stage2_multilevel(
                             lambda_center * loss_center
                         ) / gradient_accumulation_steps
                 else:
-                    # Forward pass (get both embeddings)
+                    # Forward pass (get sensor embeddings)
                     sensor_logits, global_logits, sensor_embeddings = model(
                         X_batch, 
                         return_global=True,
                         return_sensor_embeddings=True
                     )
-                    
-                    # Window-level embedding (for window center)
-                    window_embeddings = model.get_embeddings(X_batch)
 
                     # Classification losses
                     loss_sensor_clf = sensor_criterion(
@@ -484,11 +517,12 @@ def train_stage2_multilevel(
                         global_logits, window_labels_batch.float()
                     )
 
-                    # Multi-level center loss
+                    # Normalize sensor embeddings before passing to center loss
+                    sensor_embeddings = F.normalize(sensor_embeddings, p=2, dim=2)
+
+                    # Sensor-only center loss
                     loss_center = center_loss(
-                        window_embeddings=window_embeddings,
                         sensor_embeddings=sensor_embeddings,
-                        window_labels=window_labels_batch,
                         sensor_labels=sensor_labels_batch.long(),  # Use ground-truth sensor labels
                     )
 
@@ -539,6 +573,26 @@ def train_stage2_multilevel(
                 train_loss_global += loss_global_clf.item() * X_batch.size(0) * gradient_accumulation_steps
                 train_loss_center += loss_center.item() * X_batch.size(0) * gradient_accumulation_steps
 
+        # Update for any remaining accumulated gradients (if batch count not divisible by accumulation steps)
+        if (batch_idx + 1) % gradient_accumulation_steps != 0:
+            if use_amp and scaler is not None:
+                scaler.unscale_(optimizer)
+                scaler.unscale_(optimizer_center)
+            
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(center_loss.parameters(), max_norm=0.5)
+            
+            if use_amp and scaler is not None:
+                scaler.step(optimizer)
+                scaler.step(optimizer_center)
+                scaler.update()
+            else:
+                optimizer.step()
+                optimizer_center.step()
+            
+            optimizer.zero_grad()
+            optimizer_center.zero_grad()
+
         train_loss_sensor /= len(train_loader.dataset)
         train_loss_global /= len(train_loader.dataset)
         train_loss_center /= len(train_loader.dataset)
@@ -561,7 +615,6 @@ def train_stage2_multilevel(
                     return_global=True,
                     return_sensor_embeddings=True
                 )
-                window_embeddings = model.get_embeddings(X_batch)
 
                 loss_sensor = sensor_criterion(
                     sensor_logits, sensor_labels_batch
@@ -569,10 +622,12 @@ def train_stage2_multilevel(
                 loss_global = global_criterion(
                     global_logits, window_labels_batch.float()
                 )
+                
+                # Normalize sensor embeddings before passing to center loss
+                sensor_embeddings = F.normalize(sensor_embeddings, p=2, dim=2)
+                
                 loss_center_val = center_loss(
-                    window_embeddings=window_embeddings,
                     sensor_embeddings=sensor_embeddings,
-                    window_labels=window_labels_batch,
                     sensor_labels=sensor_labels_batch.long(),
                 )
 
@@ -598,53 +653,79 @@ def train_stage2_multilevel(
         # Get separation metrics
         separations = center_loss.get_separations()
         
-        # Compute compactness metrics every 5 epochs
+        # Compute compactness metrics every 5 epochs (sensor-only)
         compactness_normal = None
         compactness_anomaly = None
         separation_ratio = None
         
         if epoch % 5 == 0 or epoch == num_epochs - 1:
             with torch.no_grad():
-                # Collect all validation embeddings
-                all_window_embs = []
-                all_window_labels = []
+                # Collect all validation sensor embeddings
+                all_sensor_embs = []
+                all_sensor_labels = []
                 
-                for X_batch, _, _, window_labels_batch in val_loader:
+                for X_batch, _, sensor_labels_batch, _ in val_loader:
                     X_batch = X_batch.to(device)
-                    window_labels_batch = window_labels_batch.long().to(device)
-                    window_embs = model.get_embeddings(X_batch)
-                    window_embs = F.normalize(window_embs, p=2, dim=1)
+                    sensor_labels_batch = sensor_labels_batch.long().to(device)
+                    _, _, sensor_embs = model(
+                        X_batch,
+                        return_global=True,
+                        return_sensor_embeddings=True
+                    )
+                    sensor_embs = F.normalize(sensor_embs, p=2, dim=2)
                     
-                    all_window_embs.append(window_embs.cpu())
-                    all_window_labels.append(window_labels_batch.cpu())
+                    all_sensor_embs.append(sensor_embs.cpu())
+                    all_sensor_labels.append(sensor_labels_batch.cpu())
                 
-                window_embs = torch.cat(all_window_embs, dim=0)
-                window_labels = torch.cat(all_window_labels, dim=0)
+                sensor_embs = torch.cat(all_sensor_embs, dim=0)  # (B_total, N, D)
+                sensor_labels = torch.cat(all_sensor_labels, dim=0)  # (B_total, N)
                 
-                # Get centers
-                window_centers = center_loss.get_window_centers().cpu()
+                # Get sensor centers
+                sensor_centers = center_loss.get_sensor_centers().cpu()  # (N, 2, D)
                 
-                # Compute compactness
-                normal_mask = (window_labels == 0)
-                anomaly_mask = (window_labels == 1)
+                # Compute compactness per sensor, then average
+                normal_compactness = []
+                anomaly_compactness = []
                 
-                if normal_mask.sum() > 0:
-                    normal_embs = window_embs[normal_mask]
-                    normal_center = window_centers[0]
-                    compactness_normal = torch.norm(
-                        normal_embs - normal_center, dim=1
-                    ).mean().item()
+                for sensor_idx in range(num_sensors):
+                    sensor_embs_single = sensor_embs[:, sensor_idx, :]  # (B_total, D)
+                    sensor_labs_single = sensor_labels[:, sensor_idx]  # (B_total,)
+                    
+                    # Normal compactness for this sensor
+                    normal_mask = (sensor_labs_single == 0)
+                    if normal_mask.sum() > 0:
+                        normal_embs = sensor_embs_single[normal_mask]
+                        normal_center = sensor_centers[sensor_idx, 0]
+                        normal_dists = torch.norm(normal_embs - normal_center, dim=1)
+                        normal_compactness.append(normal_dists.mean().item())
+                    
+                    # Anomaly compactness for this sensor
+                    anomaly_mask = (sensor_labs_single == 1)
+                    if anomaly_mask.sum() > 0:
+                        anomaly_embs = sensor_embs_single[anomaly_mask]
+                        anomaly_center = sensor_centers[sensor_idx, 1]
+                        anomaly_dists = torch.norm(anomaly_embs - anomaly_center, dim=1)
+                        anomaly_compactness.append(anomaly_dists.mean().item())
                 
-                if anomaly_mask.sum() > 0:
-                    anomaly_embs = window_embs[anomaly_mask]
-                    anomaly_center = window_centers[1]
-                    compactness_anomaly = torch.norm(
-                        anomaly_embs - anomaly_center, dim=1
-                    ).mean().item()
-                
-                if compactness_normal is not None and compactness_anomaly is not None:
+                # Average across all sensors
+                if normal_compactness and anomaly_compactness:
+                    compactness_normal = sum(normal_compactness) / len(normal_compactness)
+                    compactness_anomaly = sum(anomaly_compactness) / len(anomaly_compactness)
                     avg_compactness = (compactness_normal + compactness_anomaly) / 2
-                    separation_ratio = separations['window_separation'] / avg_compactness
+                    separation_ratio = separations['sensor_mean_separation'] / avg_compactness
+
+        # Adaptive lambda_center adjustment (lowered thresholds for diverse anomalies)
+        # With diverse anomalies, ratio 3.0-4.0 is actually good performance.
+        # Only adjust if ratio is very low (< 2.5) or very high (> 6.0)
+        if epoch == 10 and separation_ratio is not None:
+            if separation_ratio > 6.0:
+                lambda_center = 0.5
+                print(f"  Reducing lambda_center to 0.5 (separation already strong: {separation_ratio:.2f})")
+            elif separation_ratio < 2.5:  # Lowered from 4.0 - ratio 3.44 is good with diverse anomalies
+                lambda_center = 0.7  # Reduced from 1.2 to be less aggressive
+                print(f"  Increasing lambda_center to 0.7 (separation weak: {separation_ratio:.2f})")
+            else:
+                print(f"  Separation ratio healthy ({separation_ratio:.2f}), keeping lambda_center={lambda_center}")
 
         # Logging (print separations and compactness every 5 epochs)
         if epoch % 5 == 0 or epoch == num_epochs - 1:
@@ -661,7 +742,6 @@ def train_stage2_multilevel(
                 f"Global: {train_loss_global:.4f} | "
                 f"Center: {train_loss_center:.4f} | "
                 f"Val Total: {val_total_loss:.4f} | "
-                f"Window sep: {separations['window_separation']:.4f} | "
                 f"Sensor mean sep: {separations['sensor_mean_separation']:.4f} | "
                 f"Sensor range: [{separations['sensor_min_separation']:.4f}, "
                 f"{separations['sensor_max_separation']:.4f}]"
@@ -685,7 +765,6 @@ def train_stage2_multilevel(
                 {
                     "model_state_dict": model.state_dict(),
                     "center_loss_state_dict": center_loss.state_dict(),
-                    "window_centers": center_loss.get_window_centers().cpu(),
                     "sensor_centers": center_loss.get_sensor_centers().cpu(),
                     "separations": separations,
                     "sensor_names": SENSOR_COLS,
@@ -721,10 +800,10 @@ def train_stage2_multilevel(
     center_loss.load_state_dict(checkpoint["center_loss_state_dict"])
 
     print(f"\n{'=' * 80}")
-    print(f"Stage 2 multi-level training complete!")
+    print(f"Stage 2 sensor-only training complete!")
     print(f"Best validation loss: {checkpoint['best_val_loss']:.4f}")
-    print(f"Window separation: {checkpoint['separations']['window_separation']:.4f}")
     print(f"Sensor mean separation: {checkpoint['separations']['sensor_mean_separation']:.4f}")
+    print(f"Sensor separation range: [{checkpoint['separations']['sensor_min_separation']:.4f}, {checkpoint['separations']['sensor_max_separation']:.4f}]")
     print(f"Best epoch: {checkpoint['epoch']}")
     print(f"{'=' * 80}\n")
 
