@@ -1,0 +1,54 @@
+{
+  "checkpoint": "checkpoints/stage1_best_forecast.pt",
+  "train_stats": {
+    "intra_drive_sim": 0.8910900429800546,
+    "inter_drive_sim": 0.004942396343527869,
+    "separation": 0.8861476466365267,
+    "intra_std": 0.14403969498850716,
+    "inter_std": 0.43906447144634764,
+    "num_drives": 79,
+    "num_windows": 23995
+  },
+  "val_stats": {
+    "intra_drive_sim": 0.6073531778506788,
+    "inter_drive_sim": 0.08835120398502848,
+    "separation": 0.5190019738656503,
+    "intra_std": 0.41129007421064706,
+    "inter_std": 0.44018941587702487,
+    "num_drives": 18,
+    "num_windows": 12380
+  },
+  "train_quality": {
+    "avg_pairwise_similarity": 0.02340305156861557,
+    "embedding_variance": 0.015258682891726494,
+    "norm_mean": 1.0,
+    "norm_std": 4.439074530182552e-08,
+    "norm_min": 0.9999998211860657,
+    "norm_max": 1.0000001192092896
+  },
+  "val_quality": {
+    "avg_pairwise_similarity": 0.12966765462536808,
+    "embedding_variance": 0.013597836717963219,
+    "norm_mean": 1.0,
+    "norm_std": 4.41715144461341e-08,
+    "norm_min": 0.9999998211860657,
+    "norm_max": 1.0000001192092896
+  },
+  "diagnosis": {
+    "gap_ratio": 0.5856834082171078,
+    "is_concerning": true,
+    "reason": "Validation drives are TOO DIVERSE. Model struggles to cluster them, indicating overfitting to training patterns.",
+    "recommendations": [
+      "Model may be overfitting to training drive patterns",
+      "Consider reducing contrastive loss weight",
+      "Add more regularization (dropout, weight decay)"
+    ]
+  },
+  "kag_estimate": {
+    "quality_tier": "Excellent",
+    "estimated_accuracy": "85-90%+",
+    "confidence_level": "Very High",
+    "description": "Strong separation. LLM generates expert-level, actionable diagnostics.",
+    "separation": 0.7025748102510885
+  }
+}
