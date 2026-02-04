@@ -141,6 +141,7 @@ class Neo4jKAGQueries:
         
         Finds CORRELATES_WITH relationships where the deviation between
         actual and expected correlation exceeds the threshold.
+        This is the STRONGEST fault signal - violations indicate broken sensor relationships.
         
         Args:
             window_idx: Window index to query
@@ -152,19 +153,69 @@ class Neo4jKAGQueries:
             - 'target': base sensor name
             - 'actual': actual_correlation value
             - 'expected': expected_correlation value
-            - 'deviation': absolute deviation
+            - 'deviation': absolute deviation (same as deviation_from_gdn)
+            - 'source_anomaly': anomaly_score of source sensor
+            - 'target_anomaly': anomaly_score of target sensor
+            - 'violates_gdn_expectation': True if deviation > threshold
         """
         with self.driver.session() as session:
             result = session.run("""
                 MATCH (s1:Sensor {window: $window_idx})-[r:CORRELATES_WITH]->(s2:Sensor {window: $window_idx})
-                WHERE abs(r.actual_correlation - r.expected_correlation) > $threshold
+                WHERE r.deviation > $threshold
                 RETURN s1.base_sensor_name AS source,
                        s2.base_sensor_name AS target,
                        r.actual_correlation AS actual,
                        r.expected_correlation AS expected,
-                       abs(r.actual_correlation - r.expected_correlation) AS deviation
+                       r.deviation AS deviation,
+                       s1.anomaly_score AS source_anomaly,
+                       s2.anomaly_score AS target_anomaly,
+                       (r.deviation > $threshold) AS violates_gdn_expectation
                 ORDER BY deviation DESC
             """, window_idx=window_idx, threshold=deviation_threshold)
+            return [dict(record) for record in result]
+    
+    def get_sensors_with_violations_and_anomaly(
+        self, window_idx: int, anomaly_threshold: float = 0.5, min_violations: int = 1
+    ) -> List[Dict]:
+        """
+        Retrieval: Find sensors with high anomaly scores AND many violated correlations.
+        
+        This combines two strong signals:
+        1. High GDN anomaly score (indicates likely fault)
+        2. Multiple correlation violations (indicates broken relationships)
+        
+        Args:
+            window_idx: Window index to query
+            anomaly_threshold: Minimum anomaly score (default: 0.5)
+            min_violations: Minimum number of violations (default: 1)
+            
+        Returns:
+            List of dictionaries with keys:
+            - 'sensor': base sensor name
+            - 'anomaly_score': GDN anomaly score
+            - 'violation_count': Number of violated correlations
+            - 'max_deviation': Maximum deviation among violations
+            - 'avg_deviation': Average deviation among violations
+            - 'subsystem': Sensor subsystem
+        """
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (s:Sensor {window: $window_idx})
+                WHERE s.anomaly_score > $anomaly_threshold
+                OPTIONAL MATCH (s)-[r:CORRELATES_WITH]->(other:Sensor {window: $window_idx})
+                WHERE r.deviation > 0.3
+                WITH s, count(r) AS violation_count,
+                     max(r.deviation) AS max_deviation,
+                     avg(r.deviation) AS avg_deviation
+                WHERE violation_count >= $min_violations
+                RETURN s.base_sensor_name AS sensor,
+                       s.anomaly_score AS anomaly_score,
+                       violation_count,
+                       max_deviation,
+                       avg_deviation,
+                       s.subsystem AS subsystem
+                ORDER BY violation_count DESC, anomaly_score DESC
+            """, window_idx=window_idx, anomaly_threshold=anomaly_threshold, min_violations=min_violations)
             return [dict(record) for record in result]
     
     def get_correlated_neighbors(self, sensor: str, window_idx: int, 
@@ -268,3 +319,159 @@ class Neo4jKAGQueries:
                 return dict(record)
             else:
                 return {'path_nodes': [], 'hops': 0}
+    
+    def get_temporal_sensor_history(self, window_idx: int, window_range: List[int]) -> List[Dict]:
+        """
+        Temporal Retrieval: Get sensor anomaly history over multiple time windows.
+        
+        Retrieves anomaly scores for sensors across a range of windows to identify
+        temporal patterns (e.g., sensors that become anomalous early, persistent faults).
+        
+        Args:
+            window_idx: Current window index (center of range)
+            window_range: List of window indices to query (e.g., [t-2, t-1, t])
+            
+        Returns:
+            List of dictionaries with keys:
+            - 'sensor': base sensor name
+            - 'window': window index
+            - 'score': anomaly_score in that window
+            - 'subsystem': sensor subsystem
+            - 'temporal_pattern': 'increasing', 'decreasing', 'persistent', or 'spike'
+        """
+        with self.driver.session() as session:
+            result = session.run("""
+                MATCH (s:Sensor)
+                WHERE s.window IN $window_range
+                RETURN s.base_sensor_name AS sensor,
+                       s.window AS window,
+                       s.anomaly_score AS score,
+                       s.subsystem AS subsystem
+                ORDER BY s.base_sensor_name, s.window
+            """, window_range=window_range)
+            
+            records = [dict(record) for record in result]
+            
+            # Group by sensor and compute temporal patterns
+            sensor_history = {}
+            for record in records:
+                sensor = record['sensor']
+                if sensor not in sensor_history:
+                    sensor_history[sensor] = []
+                sensor_history[sensor].append({
+                    'window': record['window'],
+                    'score': record['score'],
+                    'subsystem': record['subsystem']
+                })
+            
+            # Analyze temporal patterns
+            result_list = []
+            for sensor, history in sensor_history.items():
+                if len(history) < 2:
+                    pattern = 'single_window'
+                else:
+                    scores = [h['score'] for h in sorted(history, key=lambda x: x['window'])]
+                    if all(scores[i] <= scores[i+1] for i in range(len(scores)-1)):
+                        pattern = 'increasing'
+                    elif all(scores[i] >= scores[i+1] for i in range(len(scores)-1)):
+                        pattern = 'decreasing'
+                    elif all(s > 0.5 for s in scores):
+                        pattern = 'persistent'
+                    elif max(scores) > 0.7 and min(scores) < 0.3:
+                        pattern = 'spike'
+                    else:
+                        pattern = 'variable'
+                
+                # Add all windows for this sensor
+                for h in history:
+                    result_list.append({
+                        'sensor': sensor,
+                        'window': h['window'],
+                        'score': h['score'],
+                        'subsystem': h['subsystem'],
+                        'temporal_pattern': pattern
+                    })
+            
+            return result_list
+    
+    def explore_neighborhood(self, root_sensor: str, window_idx: int, radius: int = 2) -> Dict:
+        """
+        Exploration: Expand k-hop neighborhood from a root sensor.
+        
+        Finds all sensors within k hops of the root sensor via CORRELATES_WITH
+        relationships, along with their anomaly scores and violations.
+        
+        Args:
+            root_sensor: Base sensor name of root sensor
+            window_idx: Window index to query
+            radius: Number of hops to expand (default: 2)
+            
+        Returns:
+            Dictionary with keys:
+            - 'root_sensor': root sensor name
+            - 'neighbors': List of dicts with keys:
+                - 'sensor': base sensor name
+                - 'hop': distance from root (1, 2, ...)
+                - 'score': anomaly_score
+                - 'subsystem': sensor subsystem
+                - 'violations_count': number of violations involving this sensor
+            - 'summary': Dict with 'total_neighbors', 'anomalous_count', 'violations_count'
+        """
+        with self.driver.session() as session:
+            # Find all neighbors within radius hops
+            result = session.run("""
+                MATCH (root:Sensor {base_sensor_name: $root, window: $window_idx})
+                MATCH path = (root)-[:CORRELATES_WITH*1..$radius]-(neighbor:Sensor {window: $window_idx})
+                WHERE length(path) <= $radius
+                WITH neighbor, length(path) AS hop
+                RETURN DISTINCT neighbor.base_sensor_name AS sensor,
+                       hop,
+                       neighbor.anomaly_score AS score,
+                       neighbor.subsystem AS subsystem
+                ORDER BY hop, neighbor.anomaly_score DESC
+            """, root=root_sensor, window_idx=window_idx, radius=radius)
+            
+            neighbors = []
+            for record in result:
+                neighbors.append({
+                    'sensor': record['sensor'],
+                    'hop': record['hop'],
+                    'score': record['score'],
+                    'subsystem': record['subsystem']
+                })
+            
+            # Count violations for each neighbor
+            neighbor_names = [n['sensor'] for n in neighbors]
+            violations_count = {}
+            if neighbor_names:
+                violations_result = session.run("""
+                    MATCH (s1:Sensor {window: $window_idx})-[r:CORRELATES_WITH]->(s2:Sensor {window: $window_idx})
+                    WHERE s1.base_sensor_name IN $neighbors 
+                       OR s2.base_sensor_name IN $neighbors
+                       AND abs(r.actual_correlation - r.expected_correlation) > 0.3
+                    WITH s1.base_sensor_name AS sensor1, s2.base_sensor_name AS sensor2
+                    UNWIND [sensor1, sensor2] AS sensor
+                    WITH sensor, count(*) AS violations
+                    RETURN sensor, violations
+                """, window_idx=window_idx, neighbors=neighbor_names)
+                
+                for record in violations_result:
+                    violations_count[record['sensor']] = record['violations']
+            
+            # Add violation counts to neighbors
+            for neighbor in neighbors:
+                neighbor['violations_count'] = violations_count.get(neighbor['sensor'], 0)
+            
+            # Compute summary
+            anomalous_count = sum(1 for n in neighbors if n['score'] > 0.5)
+            total_violations = sum(n['violations_count'] for n in neighbors)
+            
+            return {
+                'root_sensor': root_sensor,
+                'neighbors': neighbors,
+                'summary': {
+                    'total_neighbors': len(neighbors),
+                    'anomalous_count': anomalous_count,
+                    'violations_count': total_violations
+                }
+            }

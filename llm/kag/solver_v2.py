@@ -403,6 +403,137 @@ class KGQueryExecutor:
                         operator="Retrieval",
                     )
                 return result
+            elif operation == "sensors_with_violations_and_anomaly":
+                # Extract parameters from object
+                anomaly_threshold = 0.5  # default
+                min_violations = 1  # default
+                
+                if isinstance(obj, dict):
+                    if "anomaly_threshold" in obj:
+                        anomaly_threshold = float(obj["anomaly_threshold"])
+                    if "min_violations" in obj:
+                        min_violations = int(obj["min_violations"])
+                
+                result = self.queries.get_sensors_with_violations_and_anomaly(
+                    window_idx_constraint, 
+                    anomaly_threshold=anomaly_threshold,
+                    min_violations=min_violations
+                )
+                
+                # Track tool call
+                if self.tool_tracker:
+                    self.tool_tracker.record_tool_call(
+                        tool_name="Retrieval",
+                        query_method="get_sensors_with_violations_and_anomaly",
+                        params={
+                            "window_idx": window_idx_constraint,
+                            "anomaly_threshold": anomaly_threshold,
+                            "min_violations": min_violations,
+                        },
+                        result=result,
+                        window_idx=window_idx,
+                        operator="Retrieval",
+                    )
+                return result
+            elif operation == "temporal_retrieval":
+                # Extract window_range from object
+                window_range = None
+                if isinstance(obj, dict):
+                    window_range = obj.get("window_range", None)
+                    if window_range is None:
+                        # Try to compute from window_idx and range spec
+                        range_spec = obj.get("range", [0, 0])  # e.g., [-2, 0] means [t-2, t]
+                        if isinstance(range_spec, list) and len(range_spec) == 2:
+                            start_offset = range_spec[0]
+                            end_offset = range_spec[1]
+                            window_range = list(range(window_idx_constraint + start_offset, window_idx_constraint + end_offset + 1))
+                        else:
+                            # Default: current window only
+                            window_range = [window_idx_constraint]
+                
+                if window_range is None:
+                    window_range = [window_idx_constraint]
+                
+                # Filter valid window indices (>= 0)
+                window_range = [w for w in window_range if w >= 0]
+                
+                if not window_range:
+                    window_range = [window_idx_constraint]
+                
+                result = self.queries.get_temporal_sensor_history(
+                    window_idx_constraint, window_range
+                )
+                
+                # Track tool call
+                if self.tool_tracker:
+                    self.tool_tracker.record_tool_call(
+                        tool_name="Retrieval",
+                        query_method="get_temporal_sensor_history",
+                        params={
+                            "window_idx": window_idx_constraint,
+                            "window_range": window_range,
+                        },
+                        result=result,
+                        window_idx=window_idx,
+                        operator="Retrieval",
+                    )
+                return result
+            elif operation == "explore_neighborhood":
+                # Extract root sensor and radius from object
+                root_sensor = None
+                radius = 2  # default
+                
+                if isinstance(obj, dict):
+                    root_sensor = obj.get("root", None)
+                    radius = obj.get("radius", 2)
+                
+                # If root not specified, try to get from step results
+                if root_sensor is None or root_sensor == "":
+                    # Try to extract from previous step results
+                    for step_id, step_result in step_results.items():
+                        if isinstance(step_result, list) and len(step_result) > 0:
+                            if isinstance(step_result[0], dict):
+                                # Check if it's a sensor result
+                                if "sensor" in step_result[0]:
+                                    # Use first sensor from previous results
+                                    root_sensor = step_result[0]["sensor"]
+                                    break
+                                elif "source" in step_result[0]:
+                                    # Use first source from violations
+                                    root_sensor = step_result[0]["source"]
+                                    break
+                
+                # If still no root, return empty result
+                if root_sensor is None or root_sensor == "":
+                    result = {
+                        'root_sensor': None,
+                        'neighbors': [],
+                        'summary': {
+                            'total_neighbors': 0,
+                            'anomalous_count': 0,
+                            'violations_count': 0
+                        }
+                    }
+                else:
+                    result = self.queries.explore_neighborhood(
+                        root_sensor, window_idx_constraint, radius
+                    )
+                
+                # Track tool call
+                if self.tool_tracker:
+                    self.tool_tracker.record_tool_call(
+                        tool_name="Retrieval",
+                        query_method="explore_neighborhood",
+                        params={
+                            "window_idx": window_idx_constraint,
+                            "root_sensor": root_sensor,
+                            "radius": radius,
+                        },
+                        result=result,
+                        window_idx=window_idx,
+                        operator="Retrieval",
+                    )
+                return result
         else:
             # Old format: s, p, o, constraints
             constraints = step.params.get("constraints", {})
@@ -1048,7 +1179,7 @@ class KAGIterativeSolver:
         sensor_names: List[str],
         model,
         tokenizer,
-        max_iterations: int = 1,
+        max_iterations: int = 3,  # Allow 2-3 iterations for reflection and exploration
         tool_tracker=None,
     ):
         """
@@ -1074,6 +1205,17 @@ class KAGIterativeSolver:
         self.executor = KGQueryExecutor(
             kg_builder, neo4j_queries, tool_tracker=tool_tracker
         )
+        
+        # Configuration constants for root cause selection
+        self.ROOT_K = 1  # Maximum number of root causes per window
+        self.ALPHA = 0.8  # Tie-breaking band: keep sensors within 80% of best score
+        self.MIN_ROOT_SCORE = 0.7  # Minimum score to predict fault (filter weak evidence)
+        self.CAND_ANOMALY = 0.5  # Candidate threshold: anomaly score or violation count required
+        # Scoring weights
+        self.W_ANOM = 1.0  # Weight for anomaly score
+        self.W_VCOUNT = 0.7  # Weight for violation count
+        self.W_VSEV = 0.3  # Weight for violation severity sum
+        self.W_NB = 0.3  # Weight for neighbor violations
         # Cache for anomaly scores: (window_idx, sensor_name) -> anomaly_score
         self._anomaly_score_cache = {}
         # Anomaly threshold for temporal analysis (default: 0.7, same as V1)
@@ -1248,6 +1390,203 @@ class KAGIterativeSolver:
                             valid_sensors.add(item["target"])
 
         return valid_sensors
+    
+    def _extract_sensors_from_exec_results(self, exec_results: Dict[int, Any]) -> Dict:
+        """
+        Extract root cause and affected sensors using scoring-based top-k selection.
+        
+        Uses weighted features (anomaly score, violation count, violation severity, 
+        neighbor violations) to compute scores, then selects top-k roots with tie-breaking.
+        
+        Args:
+            exec_results: Dictionary mapping step_id -> execution results
+            
+        Returns:
+            Dictionary with keys:
+            - 'root_cause_sensors': List of root cause sensor names (top-k, max ROOT_K)
+            - 'affected_sensors': List of affected sensor names
+            - 'all_faulty_sensors': List of all faulty sensors (root + affected)
+        """
+        from collections import defaultdict
+        
+        # Aggregate features per sensor
+        stats = defaultdict(lambda: {
+            "anomaly": 0.0,
+            "viol_count": 0,
+            "viol_severity": 0.0,
+            "neighbor_viol": 0.0,
+        })
+        
+        for step_id, step_results in exec_results.items():
+            if isinstance(step_results, list):
+                for item in step_results:
+                    if isinstance(item, dict):
+                        # 1) Direct anomalies
+                        if "sensor" in item and "score" in item:
+                            sensor = item.get("sensor", "")
+                            score = float(item.get("score", 0.0))
+                            
+                            if sensor and sensor in self.sensor_names:
+                                stats[sensor]["anomaly"] = max(stats[sensor]["anomaly"], score)
+                        
+                        # 2) Violations on edges (weight by deviation magnitude)
+                        if "source" in item and "target" in item and "deviation" in item:
+                            source = item.get("source", "")
+                            target = item.get("target", "")
+                            deviation = abs(float(item.get("deviation", 0.0)))
+                            
+                            for s in [source, target]:
+                                if s and s in self.sensor_names:
+                                    stats[s]["viol_count"] += 1
+                                    stats[s]["viol_severity"] += deviation
+                        
+                        # 3) Neighborhood exploration results (down-weight by hop distance)
+                        if "neighbors" in item:
+                            neighbors = item.get("neighbors", [])
+                            for neighbor in neighbors:
+                                if isinstance(neighbor, dict):
+                                    sensor = neighbor.get("sensor", "")
+                                    hop = neighbor.get("hop", 1)
+                                    vcnt = neighbor.get("violations_count", 0)
+                                    
+                                    if sensor and sensor in self.sensor_names:
+                                        # Down-weight distant neighbors
+                                        stats[sensor]["neighbor_viol"] += float(vcnt) / max(hop, 1)
+                                        
+                                        # Also track anomaly scores from neighbors
+                                        nb_score = neighbor.get("score", 0.0)
+                                        if nb_score > 0:
+                                            stats[sensor]["anomaly"] = max(stats[sensor]["anomaly"], float(nb_score))
+        
+        # Candidate set: sensors with meaningful evidence
+        candidates = {
+            s for s, f in stats.items()
+            if f["anomaly"] >= self.CAND_ANOMALY or f["viol_count"] > 0
+        }
+        
+        if not candidates:
+            return {
+                "root_cause_sensors": [],
+                "affected_sensors": [],
+                "all_faulty_sensors": [],
+            }
+        
+        # Compute weighted scores
+        scores = {}
+        for s in candidates:
+            f = stats[s]
+            scores[s] = (
+                self.W_ANOM * f["anomaly"]
+                + self.W_VCOUNT * min(f["viol_count"], 5) / 5.0  # Normalize count (cap at 5)
+                + self.W_VSEV * min(f["viol_severity"], 2.0) / 2.0  # Normalize severity (cap at 2.0)
+                + self.W_NB * min(f["neighbor_viol"], 3.0) / 3.0  # Normalize neighbor violations (cap at 3.0)
+            )
+        
+        # Select top-k roots with tie-breaking band
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        best_score = ranked[0][1]
+        
+        # If even the best score is weak, treat window as normal
+        if best_score < self.MIN_ROOT_SCORE:
+            return {
+                "root_cause_sensors": [],
+                "affected_sensors": [],
+                "all_faulty_sensors": [],
+            }
+        
+        # Select roots within ALPHA band of best score, limit to ROOT_K
+        root_cause_sensors = [
+            s for s, sc in ranked
+            if sc >= best_score * self.ALPHA
+        ][:self.ROOT_K]
+        
+        # Affected sensors: candidates that are not root cause
+        affected_sensors = [
+            s for s in candidates
+            if s not in root_cause_sensors
+        ]
+        
+        all_faulty_sensors = root_cause_sensors + affected_sensors
+        
+        return {
+            "root_cause_sensors": root_cause_sensors,
+            "affected_sensors": affected_sensors,
+            "all_faulty_sensors": all_faulty_sensors,
+        }
+    
+    def _merge_exec_and_llm_predictions(
+        self, exec_sensors: Dict, llm_prediction: Dict
+    ) -> Dict:
+        """
+        Merge execution-based sensor labels with LLM fault_type/reasoning.
+        
+        Execution results take priority for sensor identification (more reliable),
+        while LLM provides fault_type and reasoning.
+        
+        Args:
+            exec_sensors: Dictionary from _extract_sensors_from_exec_results()
+            llm_prediction: Dictionary from parse_llm_response()
+            
+        Returns:
+            Merged dictionary with:
+            - sensor_labels: Binary array (all faulty sensors from execution)
+            - sensor_labels_root_only: Binary array (only root cause from execution)
+            - fault_type: From LLM (or classified if LLM didn't provide)
+            - reasoning: From LLM
+            - root_cause_sensors: From execution
+            - affected_sensors: From execution
+        """
+        # Create sensor label arrays from execution results
+        sensor_labels = np.zeros(len(self.sensor_names), dtype=np.float32)
+        sensor_labels_root_only = np.zeros(len(self.sensor_names), dtype=np.float32)
+        
+        # Mark all faulty sensors
+        for sensor in exec_sensors.get('all_faulty_sensors', []):
+            if sensor in self.sensor_names:
+                idx = self.sensor_names.index(sensor)
+                sensor_labels[idx] = 1.0
+        
+        # Mark only root cause sensors
+        for sensor in exec_sensors.get('root_cause_sensors', []):
+            if sensor in self.sensor_names:
+                idx = self.sensor_names.index(sensor)
+                sensor_labels_root_only[idx] = 1.0
+        
+        # Use LLM fault_type if available, otherwise classify from execution results
+        fault_type = llm_prediction.get("fault_type", None)
+        if fault_type is None:
+            root_cause = exec_sensors.get('root_cause_sensors', [])
+            affected = exec_sensors.get('affected_sensors', [])
+            violations = []  # Could extract from exec_results if needed
+            fault_type = self._classify_fault_type(
+                root_cause[0] if root_cause else None,
+                affected,
+                violations
+            )
+        
+        # Use LLM reasoning if available
+        reasoning = llm_prediction.get("reasoning", "")
+        if not reasoning:
+            reasoning = f"Root cause identified from execution results: {exec_sensors.get('root_cause_sensors', [])}"
+        
+        # Determine window label
+        window_label = 0
+        if exec_sensors.get('root_cause_sensors'):
+            # Use first root cause sensor index (1-indexed)
+            root_sensor = exec_sensors['root_cause_sensors'][0]
+            if root_sensor in self.sensor_names:
+                window_label = self.sensor_names.index(root_sensor) + 1
+        
+        return {
+            'sensor_labels': sensor_labels_root_only,  # Root-only for metrics (precision improvement)
+            'sensor_labels_root_only': sensor_labels_root_only,  # Explicit root-only
+            'sensor_labels_raw': sensor_labels,  # All faulty sensors (root + affected) for analysis
+            'fault_type': fault_type,
+            'reasoning': reasoning,
+            'root_cause_sensors': exec_sensors.get('root_cause_sensors', []),
+            'affected_sensors': exec_sensors.get('affected_sensors', []),
+            'window_label': window_label
+        }
 
     # Fault type mappings constant
     FAULT_TYPE_MAPPINGS = {
@@ -1627,7 +1966,11 @@ The following 4 operators are available for traversing the knowledge graph:
    - Retrieval(operation="has_reading", subject={{"window_idx": 42}}, object={{"anomaly_score": {{"operation": "gt", "value": 0.7}}}})
      → Find all sensors in window 42 with anomaly score > 0.7
    - Retrieval(operation="correlates_with", subject={{"window_idx": 42}}, object={{"deviation_threshold": 0.3, "is_violation": true}})
-     → Find correlation violations in window 42 (strongest fault signal)
+     → Find correlation violations in window 42 (strongest fault signal - prioritize large deviations)
+   - Retrieval(operation="sensors_with_violations_and_anomaly", subject={{"window_idx": 42}}, object={{"anomaly_threshold": 0.5, "min_violations": 2}})
+     → Find sensors with high anomaly scores AND multiple violated correlations (combined strong signal)
+   - Retrieval(operation="temporal_retrieval", subject={{"sensor": "ENGINE_RPM", "window_idx": 42}}, object={{"window_range": [40, 42]}})
+     → Retrieve anomaly history for ENGINE_RPM in windows 40-42 (temporal propagation signal)
    - Retrieval(operation="find_similar_windows", subject={{"window_idx": 42}}, object={{"k": 5, "threshold": 0.2}})
      → Find 5 most similar windows via embedding distance
 
@@ -1675,34 +2018,58 @@ The following 4 operators are available for traversing the knowledge graph:
 """
 
         strategy_guidance = """
-**Diagnostic Strategy Guidance:**
+**Diagnostic Strategy Guidance (Aligned with Serialized KG Signals):**
 
-**Tool Effectiveness (use in priority order):**
-1. **Correlation Violations** (STRONGEST signal): Use Retrieval with operation="correlates_with" and is_violation=true
-   - Violations indicate broken sensor relationships - strong root cause signal
-   - Sensors with the MOST violations are often root causes
-   - Query FIRST when diagnosing faults
+**Priority Signals (use in this order - these are what make serialized KG powerful):**
 
-2. **Anomalous Sensors**: Use Retrieval with operation="has_reading" and anomaly_score threshold
+1. **Violation Edges with Large Deviation** (STRONGEST signal):
+   - Use `Retrieval(operation="correlates_with", object={"deviation_threshold": 0.3, "is_violation": true})`
+   - Focus on edges with large `deviation_from_gdn` (stored as `deviation` in Neo4j)
+   - Violations indicate broken sensor relationships - strongest root cause signal
+   - Sensors involved in violations with deviation > 0.5 are very likely root causes
+   - Query FIRST when diagnosing faults - this is the most reliable signal
+
+2. **Sensors with High Anomaly + Many Violated Correlations** (Combined signal):
+   - Use `Retrieval(operation="correlates_with", object={"is_violation": true})` to get violations
+   - Then identify sensors that appear in multiple violations AND have high anomaly scores
+   - Sensors with anomaly_score > 0.5 AND 2+ violations are strong root cause candidates
+   - This combines GDN predictions with relationship breakdown evidence
+
+3. **Temporal Propagation Edges** (Fault evolution):
+   - Use `Retrieval(operation="temporal_retrieval", object={"window_range": [t-2, t-1, t]})`
+   - Identify sensors that become anomalous earliest (temporal onset)
+   - Sensors that show increasing anomaly scores over time are likely root causes
+   - Faults typically propagate from root sensors to affected sensors over time
+
+4. **Anomalous Sensors** (Secondary signal):
+   - Use `Retrieval(operation="has_reading", object={"anomaly_score": {"operation": "gt", "value": 0.7}})`
    - Start with threshold=0.7 (high confidence) to reduce false positives
-   - If no results, fall back to threshold=0.5
-   - ALWAYS combine with violations when both are available
+   - ALWAYS combine with violations - anomaly alone is weaker than violations
+   - If no high-threshold anomalies, fall back to threshold=0.5
 
-3. **Similar Windows**: Use Retrieval with operation="find_similar_windows"
+5. **Similar Windows** (Pattern matching):
+   - Use `Retrieval(operation="find_similar_windows", object={"k": 5, "threshold": 0.2})`
    - Find windows with similar embedding patterns that were anomalous
    - Helps identify fault types by matching to historical patterns
-   - Distance threshold ~0.2 typically finds relevant similar windows
 
-4. **Anomalous Neighbors**: Use Retrieval with operation="find_anomalous_neighbors"
-   - Find windows with similar embeddings that were anomalous
-   - Useful for pattern matching and fault type identification
+**Key Insight from Serialized KG:**
+The serialized KG method is powerful because it shows ALL violations, temporal patterns, and high-anomaly sensors in one view. Your KAG plan should retrieve these same signals:
+- **Violation edges** with large deviation (deviation > 0.3, prioritize deviation > 0.5)
+- **Temporal propagation** (sensors that become anomalous early)
+- **Sensors with high anomaly + many violations** (combined evidence)
 
 **Recommended Hierarchical Strategy:**
-- Step 1: Query violations FIRST (strongest signal)
-- Step 2: Query anomalies with threshold=0.7 for sensors with violations
-- Step 3: Query similar windows via embeddings to find historical patterns
-- Step 4: If Step 1 finds nothing, query anomalies with threshold=0.5 + violations
+- Step 1: Query violations FIRST (strongest signal) - focus on large deviations (>0.3, prioritize >0.5)
+- Step 2: Identify sensors involved in multiple violations AND have high anomaly scores
+- Step 3: Query temporal history to see which sensors became anomalous earliest
+- Step 4: Query anomalies with threshold=0.7 for sensors with violations (refinement)
 - Step 5: Combine evidence - sensors with BOTH high anomaly scores AND violations are very likely faulty
+
+**Exploration Guidance:**
+- Prioritize violation edges with large deviation_from_gdn - these are the strongest signals
+- Use temporal_retrieval to identify temporal onset (which sensors became anomalous first)
+- Focus on sensors that combine multiple signals: high anomaly + many violations + early temporal onset
+- If violations are sparse, widen deviation threshold or check temporal propagation patterns
 """
 
         examples_block = """
@@ -1766,8 +2133,9 @@ Step <id>: <Operator>(<parameters_as_dict>)
 - Use only the operators: Retrieval, Math, Deduce, Sort
 - Use integer step ids starting from 1
 - Use "$step<id>_results" to reference outputs from previous steps
-- For Retrieval operations, use operation="has_reading", "correlates_with", "find_similar_windows", or "find_anomalous_neighbors"
+- For Retrieval operations, use operation="has_reading", "correlates_with", "find_similar_windows", "find_anomalous_neighbors", "temporal_retrieval", or "explore_neighborhood"
 - Parameters should be valid Python dict syntax (use double braces {{}} for dicts in f-strings)
+- Consider using optional exploration operators if initial evidence is insufficient
 
 **Now produce the logical-form steps for this question ONLY. Do not answer the question yet.**
 """
@@ -2101,37 +2469,45 @@ The following results were obtained by executing logical form steps over the kno
 Using only the structured evidence above, produce a JSON object in this EXACT format (no other text, no markdown, no code blocks):
 
 {{
-    "faulty_sensors": ["SENSOR_NAME_1", "SENSOR_NAME_2"] or [],
+    "root_cause_sensors": ["SENSOR_NAME"] or [],
+    "affected_sensors": ["SENSOR_NAME_1", "SENSOR_NAME_2"] or [],
+    "faulty_sensors": ["SENSOR_NAME_1", "SENSOR_NAME_2"] or [],  # backward compatibility (root + affected combined)
     "fault_type": "VSS_DROPOUT" | "COOLANT_DROPOUT" | "MAF_SCALE_LOW" | "TPS_STUCK" | "gradual_drift" or null,
     "reasoning": "2-4 sentences explaining why, referring to anomaly scores, violations and correlations from the structured results above",
     "confidence": 0.85
 }}
+
+**IMPORTANT:**
+- **root_cause_sensors**: The PRIMARY sensor(s) causing the fault (usually 1 sensor, the one with most violations or highest anomaly score)
+- **affected_sensors**: Secondary sensors that are affected by the root cause but are NOT the primary fault source
+- **faulty_sensors**: For backward compatibility, include ALL faulty sensors (root + affected combined)
 
 **Available Sensor Names:** {", ".join([s.replace(" ()", "") for s in self.sensor_names])}
 
 **Example Valid JSON Responses:**
 
 Example 1 (with fault):
-{{"faulty_sensors": ["VEHICLE_SPEED"], "fault_type": "VSS_DROPOUT", "reasoning": "VEHICLE_SPEED has multiple severe correlation violations (deviations >0.5) with ENGINE_RPM and INTAKE_MANIFOLD_PRESSURE, indicating broken relationships. Combined with high anomaly score (0.85) from Step 2 results, this strongly indicates VSS dropout fault as root cause.", "confidence": 0.90}}
+{{"root_cause_sensors": ["VEHICLE_SPEED"], "affected_sensors": [], "faulty_sensors": ["VEHICLE_SPEED"], "fault_type": "VSS_DROPOUT", "reasoning": "VEHICLE_SPEED has multiple severe correlation violations (deviations >0.5) with ENGINE_RPM and INTAKE_MANIFOLD_PRESSURE, indicating broken relationships. Combined with high anomaly score (0.85) from Step 2 results, this strongly indicates VSS dropout fault as root cause.", "confidence": 0.90}}
 
-Example 2 (with fault):
-{{"faulty_sensors": ["COOLANT_TEMPERATURE"], "fault_type": "COOLANT_DROPOUT", "reasoning": "COOLANT_TEMPERATURE shows correlation violations with ENGINE_LOAD (deviation 0.42) from Step 1 results and anomaly score of 0.72 from Step 2 results. The violation pattern suggests coolant sensor dropout affecting engine load correlation.", "confidence": 0.80}}
+Example 2 (with fault and affected sensors):
+{{"root_cause_sensors": ["COOLANT_TEMPERATURE"], "affected_sensors": ["ENGINE_LOAD"], "faulty_sensors": ["COOLANT_TEMPERATURE", "ENGINE_LOAD"], "fault_type": "COOLANT_DROPOUT", "reasoning": "COOLANT_TEMPERATURE shows correlation violations with ENGINE_LOAD (deviation 0.42) from Step 1 results and anomaly score of 0.72 from Step 2 results. ENGINE_LOAD is affected by the coolant sensor dropout but is not the root cause.", "confidence": 0.80}}
 
 Example 3 (no fault):
-{{"faulty_sensors": [], "fault_type": null, "reasoning": "All sensors show low anomaly scores (<0.5) from Step 2 results and NO correlation violations detected in Step 1 results. This indicates normal operation with no faults present.", "confidence": 0.90}}
+{{"root_cause_sensors": [], "affected_sensors": [], "faulty_sensors": [], "fault_type": null, "reasoning": "All sensors show low anomaly scores (<0.5) from Step 2 results and NO correlation violations detected in Step 1 results. This indicates normal operation with no faults present.", "confidence": 0.90}}
 
 Example 4 (no fault, despite high scores):
-{{"faulty_sensors": [], "fault_type": null, "reasoning": "Step 2 results show some sensors with elevated anomaly scores (0.65-0.75), but Step 1 found NO correlation violations. Since correlation violations are the STRONGEST signal and none were detected, this indicates normal operation despite elevated scores. High scores without violations suggest sensor noise or transient variations, not actual faults.", "confidence": 0.85}}
+{{"root_cause_sensors": [], "affected_sensors": [], "faulty_sensors": [], "fault_type": null, "reasoning": "Step 2 results show some sensors with elevated anomaly scores (0.65-0.75), but Step 1 found NO correlation violations. Since correlation violations are the STRONGEST signal and none were detected, this indicates normal operation despite elevated scores. High scores without violations suggest sensor noise or transient variations, not actual faults.", "confidence": 0.85}}
 
 **Critical Rules:**
 1. **You can ONLY name sensors that appear in the structured results above** - Do NOT invent sensors
 2. **Prioritize violations**: If violations exist in Step results, use them to identify root cause (sensor with most violations)
 3. **Combine evidence**: Use BOTH anomaly scores AND violations when both are available
-4. **NORMAL prediction rule**: If max anomaly score < 0.6 AND violations < 2, predict NORMAL (faulty_sensors: [], fault_type: null)
+4. **NORMAL prediction rule**: If max anomaly score < 0.6 AND violations < 2, predict NORMAL (root_cause_sensors: [], affected_sensors: [], faulty_sensors: [], fault_type: null)
 5. **Reference structured results**: In your reasoning, refer to specific Step results (e.g., "from Step 1 results", "Step 2 found...")
 6. **Violation severity**: Severe violations (deviation >0.5) are stronger signals than mild violations
-7. **Root cause = sensor with most violations**: When multiple sensors have violations, prioritize the one with most violations
-8. **JSON ONLY**: Output ONLY valid JSON. No markdown code blocks, no explanatory text, just the JSON object.
+7. **Root cause = sensor with most violations**: When multiple sensors have violations, prioritize the one with most violations as root_cause_sensors
+8. **Affected sensors**: Sensors that show anomalies but are NOT the primary fault source should go in affected_sensors
+9. **JSON ONLY**: Output ONLY valid JSON. No markdown code blocks, no explanatory text, just the JSON object.
 
 **Available sensor names from tool results:** {", ".join(sorted(valid_sensors)) if valid_sensors else "None"}
 
@@ -2216,7 +2592,42 @@ Now produce the JSON response using ONLY the structured reasoning results above.
         exec_results: Dict,
         memory: Dict,
     ) -> str:
-        """Reflect on low-confidence answer and generate follow-up question."""
+        """Reflect on low-confidence answer and generate exploratory follow-up question."""
+        
+        # Summarize what's been examined
+        sensors_inspected = set()
+        violations_checked = []
+        candidates_ruled_out = []
+        
+        for step_id, step_results in exec_results.items():
+            if isinstance(step_results, list):
+                for item in step_results:
+                    if isinstance(item, dict):
+                        if "sensor" in item:
+                            sensors_inspected.add(item["sensor"])
+                        if "source" in item and "deviation" in item:
+                            violations_checked.append({
+                                "source": item.get("source", ""),
+                                "target": item.get("target", ""),
+                                "deviation": item.get("deviation", 0.0)
+                            })
+                        # Check for candidates that were examined but ruled out
+                        if "score" in item and item.get("score", 0.0) < 0.5:
+                            if "sensor" in item:
+                                candidates_ruled_out.append(item["sensor"])
+        
+        # Format summary
+        sensors_summary = ", ".join(sorted(list(sensors_inspected))[:10])  # Limit to 10 for brevity
+        if len(sensors_inspected) > 10:
+            sensors_summary += f" (and {len(sensors_inspected) - 10} more)"
+        
+        violations_summary = f"{len(violations_checked)} violations checked"
+        if violations_checked:
+            top_violation = max(violations_checked, key=lambda x: x.get("deviation", 0.0))
+            violations_summary += f" (max deviation: {top_violation.get('deviation', 0.0):.3f})"
+        
+        candidates_summary = ", ".join(candidates_ruled_out[:5]) if candidates_ruled_out else "None"
+        
         prompt = f"""
 You attempted to answer this diagnostic question but the confidence was low.
 
@@ -2226,21 +2637,41 @@ Original question:
 Current answer:
 {current_answer}
 
+**Summary of What Has Been Examined:**
+- Sensors inspected: {sensors_summary if sensors_inspected else "None"}
+- Violations checked: {violations_summary}
+- Candidates ruled out: {candidates_summary}
+
 Structured reasoning results (truncated):
 {self._format_exec_results(exec_results)[:2000]}
 
 Global memory:
 {json.dumps(memory, indent=2)}
 
-1. Briefly state what is still uncertain (e.g., multiple candidate root sensors, missing temporal evidence).
-2. Then output a SINGLE refined follow-up question that would help disambiguate, in one sentence.
+**Exploratory Reflection:**
+1. Briefly state what is still uncertain (e.g., multiple candidate root sensors, missing temporal evidence, unexplored subsystems).
+2. Identify which sensors or relationships have **not** been examined yet but might change the diagnosis.
+3. Consider exploring:
+   - Other subsystems that haven't been checked
+   - Non-obvious correlations that might reveal root causes
+   - Temporal patterns (how faults developed over time)
+   - Neighborhood exploration around candidate sensors
+4. Generate a follow-up query using the available operators to explore new evidence.
+
+**Available Operators for Exploration:**
+- Retrieval(operation="correlates_with", is_violation=true) - Find violations
+- Retrieval(operation="correlates_with", constraints={{correlation < 0.2}}) - Find broken correlations
+- Retrieval(operation="temporal_retrieval", window_range=[t-2, t]) - Get sensor history
+- Retrieval(operation="explore_neighborhood", root=?, radius=2) - Expand k-hop neighborhood
+- Retrieval(operation="has_reading", object={{"anomaly_score": {{"operation": "gt", "value": 0.5}}}}) - Find anomalous sensors
 
 Format:
 Uncertainty: <text>
-Follow-up Question: <single new question to the knowledge graph>
+Unexplored Areas: <sensors, relationships, or subsystems not yet examined>
+Follow-up Question: <single new question to the knowledge graph that explores new evidence>
 """
         response = call_llm(
-            prompt, self.model, self.tokenizer, max_tokens=256, temperature=0.7
+            prompt, self.model, self.tokenizer, max_tokens=512, temperature=0.7
         )
 
         # Extract follow-up question
@@ -2482,18 +2913,60 @@ Follow-up Question: <single new question to the knowledge graph>
                         trace[-1]["structured_confidence"] = structured_confidence_vf
                         trace[-1]["violation_first"] = True
 
-            # Reflect and refine for next iteration
-            if iteration < self.max_iterations - 1:
-                question = self._reflect_and_refine(
+            # Confidence-based exploration: trigger broader exploration if confidence is low
+            confidence_threshold = 0.8
+            
+            # If confidence is high, stop early (unless we're in first iteration and want to explore)
+            if confidence >= confidence_threshold and iteration > 0:
+                # High confidence - no need for further exploration
+                break
+            
+            # If confidence is medium/low, trigger reflection for broader exploration
+            if confidence < confidence_threshold and iteration < self.max_iterations - 1:
+                # Enhance reflection prompt with exploration suggestions
+                enhanced_question = self._reflect_and_refine(
                     question, answer, exec_results, memory
                 )
+                
+                # If reflection suggests exploration, update question
+                if enhanced_question != question:
+                    question = enhanced_question
+                else:
+                    # If reflection didn't change question, suggest exploration strategies
+                    # Check if we should widen cutoffs or switch strategies
+                    max_score = max([item.get("score", 0.0) for step_result in exec_results.values() 
+                                    if isinstance(step_result, list) 
+                                    for item in step_result 
+                                    if isinstance(item, dict) and "score" in item], default=0.0)
+                    num_violations = sum([1 for step_result in exec_results.values() 
+                                         if isinstance(step_result, list) 
+                                         for item in step_result 
+                                         if isinstance(item, dict) and "deviation" in item])
+                    
+                    # Suggest widening anomaly cutoffs if scores are moderate
+                    if 0.5 <= max_score < 0.7 and num_violations < 2:
+                        question = f"Analyze window {window_idx} with broader criteria: include moderately anomalous sensors (score > 0.5) and check sensors with many correlations even if anomaly is moderate. What is the root cause?"
+                    # Suggest checking correlations if violations are few
+                    elif max_score >= 0.6 and num_violations < 2:
+                        question = f"Analyze window {window_idx}: Check sensors with many correlations even if anomaly is moderate. Explore neighborhood around candidate sensors. What is the root cause?"
+                    # Otherwise use enhanced reflection question
+                    else:
+                        question = enhanced_question
 
-        # Parse final answer
+        # Extract sensors directly from execution results (more reliable than NL parsing)
+        exec_sensors = self._extract_sensors_from_exec_results(exec_results)
+        
+        # Parse LLM answer for fault_type and reasoning
         prediction = parse_llm_response(answer, self.sensor_names)
-
-        # Weakened fallback: Only use if LLM explicitly failed to parse OR there's strong contradictory evidence
-        # Do NOT override explicit "no fault" predictions from LLM
-        sensor_labels = prediction["sensor_labels"]
+        
+        # Merge execution results (sensor labels) with LLM prediction (fault_type, reasoning)
+        merged_prediction = self._merge_exec_and_llm_predictions(exec_sensors, prediction)
+        
+        # Use merged prediction
+        # Note: merged_prediction["sensor_labels"] is root-only (for metrics)
+        #       merged_prediction["sensor_labels_raw"] is all faulty sensors (for analysis)
+        sensor_labels = merged_prediction["sensor_labels"]  # Root-only (for metrics)
+        sensor_labels_raw = merged_prediction["sensor_labels_raw"]  # All sensors (root + affected)
 
         # Check if LLM explicitly said "no fault" (empty list or explicit text)
         llm_said_no_fault = (
@@ -2502,6 +2975,7 @@ Follow-up Question: <single new question to the knowledge graph>
             and (
                 "Faulty Sensors: []" in answer
                 or '"faulty_sensors": []' in answer
+                or '"root_cause_sensors": []' in answer
                 or "no fault" in answer.lower()
                 or "no faulty sensors" in answer.lower()
             )
@@ -2589,32 +3063,20 @@ Follow-up Question: <single new question to the knowledge graph>
                                         idx = self.sensor_names.index(sensor_name)
                                         sensor_labels[idx] = 1.0
 
-        # Extract root cause and affected sensors
-        faulty_indices = np.where(sensor_labels > 0)[0]
-        root_cause_sensor = None
-        affected_sensors = []
-
-        if len(faulty_indices) > 0:
-            root_cause_idx = faulty_indices[0]
-            root_cause_sensor = self.sensor_names[root_cause_idx]
-            affected_sensors = [self.sensor_names[i] for i in faulty_indices[1:]]
-
-            # Classify fault_type if LLM didn't provide one but we have faulty sensors
-            fault_type = prediction.get("fault_type", None)
-            if fault_type is None:
-                fault_type = self._classify_fault_type(
-                    root_cause_sensor, affected_sensors, []
-                )
-        else:
-            # No fault - fault_type should be None
-            fault_type = None
+        # Extract root cause and affected sensors from merged prediction
+        root_cause_sensors_list = merged_prediction.get("root_cause_sensors", [])
+        affected_sensors_list = merged_prediction.get("affected_sensors", [])
+        
+        root_cause_sensor = root_cause_sensors_list[0] if root_cause_sensors_list else None
+        fault_type = merged_prediction.get("fault_type", None)
 
         return {
             "root_cause_sensor": root_cause_sensor,
-            "affected_sensors": affected_sensors,
+            "affected_sensors": affected_sensors_list,
             "fault_type": fault_type,
             "reasoning_trace": trace,
             "confidence": confidence,
-            "sensor_labels": sensor_labels,
-            "window_label": prediction["window_label"],
+            "sensor_labels": sensor_labels,  # Root-only (for precision improvement)
+            "sensor_labels_raw": sensor_labels_raw,  # All sensors (root + affected)
+            "window_label": merged_prediction.get("window_label", 0),
         }
