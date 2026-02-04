@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Visualize sensor embeddings in 2D using t-SNE.
+Visualize sensor embeddings in 3D using t-SNE.
 
 This script loads a trained GDN model checkpoint, extracts sensor embeddings
 from test data, and visualizes them using t-SNE to show:
@@ -15,11 +15,20 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 from sklearn.manifold import TSNE
 from pathlib import Path
 import pandas as pd
 from torch.utils.data import TensorDataset, DataLoader
 from tqdm import tqdm
+
+# Try to import plotly for interactive visualizations
+try:
+    import plotly.graph_objects as go
+
+    HAS_PLOTLY = True
+except ImportError:
+    HAS_PLOTLY = False
 
 # Add project root to path
 project_root = Path(__file__).parent.parent.parent
@@ -323,11 +332,21 @@ def extract_embeddings_with_faults(
     return embeddings, labels, sensor_ids
 
 
-def plot_tsne_embeddings(
-    embeddings, labels, sensor_ids, sensor_names, save_path="figures/embedding_tsne.png"
+def plot_tsne_embeddings_interactive(
+    embeddings,
+    labels,
+    sensor_ids,
+    sensor_names,
+    save_path="figures/embedding_tsne.html",
 ):
-    """Plot t-SNE visualization of embeddings."""
-    print("Computing t-SNE (this may take a few minutes)...")
+    """Plot interactive 3D t-SNE visualization using Plotly. Creates 3 separate HTML files."""
+    if not HAS_PLOTLY:
+        raise ImportError(
+            "Plotly is required for interactive visualizations. "
+            "Install it with: pip install plotly"
+        )
+
+    print("Computing 3D t-SNE (this may take a few minutes)...")
 
     # Subsample for faster t-SNE if too many points
     if len(embeddings) > 20000:
@@ -337,28 +356,269 @@ def plot_tsne_embeddings(
         labels = labels[indices]
         sensor_ids = sensor_ids[indices]
 
-    # Compute t-SNE
+    # Filter out RPM (index 0), SPEED (index 1), and LTFT (index 7)
+    print("Filtering out RPM, SPEED, and LTFT sensors...")
+    filter_mask = (
+        (sensor_ids != 0) & (sensor_ids != 1) & (sensor_ids != 7)
+    )  # Exclude RPM (0), SPEED (1), and LTFT (7)
+    embeddings_filtered = embeddings[filter_mask]
+    labels_filtered = labels[filter_mask]
+    sensor_ids_filtered = sensor_ids[filter_mask]
+
+    print(f"  Removed {np.sum(~filter_mask)} points (RPM, SPEED, and LTFT)")
+    print(
+        f"  Remaining: {len(embeddings_filtered)} points from {len(np.unique(sensor_ids_filtered))} sensors"
+    )
+
+    # Compute 3D t-SNE (once, shared across all three visualizations)
+    tsne = TSNE(
+        n_components=3, random_state=42, perplexity=30, max_iter=1000, verbose=1
+    )
+    embeddings_3d = tsne.fit_transform(embeddings_filtered)
+
+    # Color palette (only for remaining sensors)
+    # Map sensor IDs: original IDs 2-7 become 0-5 for color indexing
+    sensor_id_map = {
+        orig_id: idx
+        for idx, orig_id in enumerate(sorted(np.unique(sensor_ids_filtered)))
+    }
+    colors = plt.cm.tab10(np.linspace(0, 1, len(sensor_names)))
+    color_hex = [
+        f"rgb({int(c[0] * 255)},{int(c[1] * 255)},{int(c[2] * 255)})" for c in colors
+    ]
+
+    # Get remaining sensor indices (exclude RPM=0 and SPEED=1)
+    remaining_sensor_indices = sorted(np.unique(sensor_ids_filtered))
+
+    # Determine base path for output files
+    save_path = Path(save_path)
+    base_path = save_path.parent / save_path.stem
+
+    # Ensure output directory exists
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1. Normal vs Anomaly
+    print("Creating Normal vs Anomaly visualization...")
+    fig1 = go.Figure()
+    normal_mask = labels_filtered == 0
+    anomaly_mask = labels_filtered == 1
+
+    if np.sum(normal_mask) > 0:
+        fig1.add_trace(
+            go.Scatter3d(
+                x=embeddings_3d[normal_mask, 0],
+                y=embeddings_3d[normal_mask, 1],
+                z=embeddings_3d[normal_mask, 2],
+                mode="markers",
+                marker=dict(size=3, color="#2E86AB", opacity=0.4, line=dict(width=0)),
+                name="Normal",
+                hovertemplate="Normal<br>X: %{x:.2f}<br>Y: %{y:.2f}<br>Z: %{z:.2f}<extra></extra>",
+            )
+        )
+
+    if np.sum(anomaly_mask) > 0:
+        fig1.add_trace(
+            go.Scatter3d(
+                x=embeddings_3d[anomaly_mask, 0],
+                y=embeddings_3d[anomaly_mask, 1],
+                z=embeddings_3d[anomaly_mask, 2],
+                mode="markers",
+                marker=dict(
+                    size=5,
+                    color="#C73E1D",
+                    opacity=0.7,
+                    line=dict(width=1, color="black"),
+                ),
+                name="Anomaly",
+                hovertemplate="Anomaly<br>X: %{x:.2f}<br>Y: %{y:.2f}<br>Z: %{z:.2f}<extra></extra>",
+            )
+        )
+
+    fig1.update_layout(
+        title_text="Normal vs Anomaly (Interactive 3D t-SNE)",
+        title_x=0.5,
+        height=800,
+        scene=dict(
+            xaxis_title="t-SNE Dimension 1",
+            yaxis_title="t-SNE Dimension 2",
+            zaxis_title="t-SNE Dimension 3",
+            aspectmode="cube",
+        ),
+        legend=dict(yanchor="top", y=0.99, xanchor="left", x=1.01),
+    )
+
+    path1 = f"{base_path}_normal_vs_anomaly.html"
+    fig1.write_html(path1)
+    print(f"  ✓ Saved to {path1}")
+
+    # 2. By Sensor Type
+    print("Creating By Sensor Type visualization...")
+    fig2 = go.Figure()
+
+    # Only iterate over remaining sensors (exclude RPM=0 and SPEED=1)
+    for orig_sensor_id in remaining_sensor_indices:
+        sensor_name = sensor_names[orig_sensor_id]
+        mask = sensor_ids_filtered == orig_sensor_id
+        if np.sum(mask) > 0:
+            fig2.add_trace(
+                go.Scatter3d(
+                    x=embeddings_3d[mask, 0],
+                    y=embeddings_3d[mask, 1],
+                    z=embeddings_3d[mask, 2],
+                    mode="markers",
+                    marker=dict(
+                        size=4,
+                        color=color_hex[orig_sensor_id],
+                        opacity=0.5,
+                        line=dict(width=0),
+                    ),
+                    name=sensor_name,
+                    hovertemplate=f"{sensor_name}<br>X: %{{x:.2f}}<br>Y: %{{y:.2f}}<br>Z: %{{z:.2f}}<extra></extra>",
+                )
+            )
+
+    fig2.update_layout(
+        title_text="By Sensor Type (Interactive 3D t-SNE)",
+        title_x=0.5,
+        height=800,
+        scene=dict(
+            xaxis_title="t-SNE Dimension 1",
+            yaxis_title="t-SNE Dimension 2",
+            zaxis_title="t-SNE Dimension 3",
+            aspectmode="cube",
+        ),
+        legend=dict(yanchor="top", y=0.99, xanchor="left", x=1.01),
+    )
+
+    path2 = f"{base_path}_by_sensor_type.html"
+    fig2.write_html(path2)
+    print(f"  ✓ Saved to {path2}")
+
+    # 3. Combined view (sensor + anomaly)
+    print("Creating Sensor Types + Anomalies visualization...")
+    fig3 = go.Figure()
+
+    # Only iterate over remaining sensors (exclude RPM=0 and SPEED=1)
+    for orig_sensor_id in remaining_sensor_indices:
+        sensor_name = sensor_names[orig_sensor_id]
+        # Normal for this sensor
+        mask = (sensor_ids_filtered == orig_sensor_id) & (labels_filtered == 0)
+        if np.sum(mask) > 0:
+            fig3.add_trace(
+                go.Scatter3d(
+                    x=embeddings_3d[mask, 0],
+                    y=embeddings_3d[mask, 1],
+                    z=embeddings_3d[mask, 2],
+                    mode="markers",
+                    marker=dict(
+                        size=3,
+                        color=color_hex[orig_sensor_id],
+                        opacity=0.2,
+                        line=dict(width=0),
+                    ),
+                    name=f"{sensor_name} (normal)",
+                    hovertemplate=f"{sensor_name} (Normal)<br>X: %{{x:.2f}}<br>Y: %{{y:.2f}}<br>Z: %{{z:.2f}}<extra></extra>",
+                    showlegend=False,
+                )
+            )
+
+        # Anomaly for this sensor
+        mask = (sensor_ids_filtered == orig_sensor_id) & (labels_filtered == 1)
+        if np.sum(mask) > 0:
+            fig3.add_trace(
+                go.Scatter3d(
+                    x=embeddings_3d[mask, 0],
+                    y=embeddings_3d[mask, 1],
+                    z=embeddings_3d[mask, 2],
+                    mode="markers",
+                    marker=dict(
+                        size=6,
+                        color=color_hex[orig_sensor_id],
+                        opacity=0.8,
+                        symbol="x",
+                        line=dict(width=1, color="black"),
+                    ),
+                    name=f"{sensor_name} (anomaly)",
+                    hovertemplate=f"{sensor_name} (Anomaly)<br>X: %{{x:.2f}}<br>Y: %{{y:.2f}}<br>Z: %{{z:.2f}}<extra></extra>",
+                )
+            )
+
+    fig3.update_layout(
+        title_text="Sensor Types + Anomalies (Interactive 3D t-SNE)",
+        title_x=0.5,
+        height=800,
+        scene=dict(
+            xaxis_title="t-SNE Dimension 1",
+            yaxis_title="t-SNE Dimension 2",
+            zaxis_title="t-SNE Dimension 3",
+            aspectmode="cube",
+        ),
+        legend=dict(yanchor="top", y=0.99, xanchor="left", x=1.01),
+    )
+
+    path3 = f"{base_path}_sensor_types_anomalies.html"
+    fig3.write_html(path3)
+    print(f"  ✓ Saved to {path3}")
+
+    print(f"\n✓ Created 3 interactive 3D t-SNE visualizations:")
+    print(f"  1. {path1}")
+    print(f"  2. {path2}")
+    print(f"  3. {path3}")
+    print(
+        f"\n  Open any of these files in your web browser to explore the embedding space!"
+    )
+
+
+def plot_tsne_embeddings(
+    embeddings, labels, sensor_ids, sensor_names, save_path="figures/embedding_tsne.png"
+):
+    """Plot static 3D t-SNE visualization of embeddings using matplotlib."""
+    print("Computing 3D t-SNE (this may take a few minutes)...")
+
+    # Filter out RPM (index 0), SPEED (index 1), and LTFT (index 7)
+    print("Filtering out RPM, SPEED, and LTFT sensors...")
+    filter_mask = (
+        (sensor_ids != 0) & (sensor_ids != 1) & (sensor_ids != 7)
+    )  # Exclude RPM (0), SPEED (1), and LTFT (7)
+    embeddings = embeddings[filter_mask]
+    labels = labels[filter_mask]
+    sensor_ids = sensor_ids[filter_mask]
+    print(f"  Removed {np.sum(~filter_mask)} points (RPM, SPEED, and LTFT)")
+    print(
+        f"  Remaining: {len(embeddings)} points from {len(np.unique(sensor_ids))} sensors"
+    )
+
+    # Subsample for faster t-SNE if too many points
+    if len(embeddings) > 20000:
+        print(f"Subsampling from {len(embeddings)} to 20000 points for t-SNE...")
+        indices = np.random.choice(len(embeddings), 20000, replace=False)
+        embeddings = embeddings[indices]
+        labels = labels[indices]
+        sensor_ids = sensor_ids[indices]
+
+    # Compute 3D t-SNE
     # Use max_iter instead of n_iter (newer scikit-learn versions)
     tsne = TSNE(
-        n_components=2, random_state=42, perplexity=30, max_iter=1000, verbose=1
+        n_components=3, random_state=42, perplexity=30, max_iter=1000, verbose=1
     )
-    embeddings_2d = tsne.fit_transform(embeddings)
+    embeddings_3d = tsne.fit_transform(embeddings)
 
-    # Create figure with subplots
-    fig, axes = plt.subplots(1, 3, figsize=(22, 6))
+    # Create figure with 3D subplots
+    fig = plt.figure(figsize=(24, 7))
     fig.suptitle(
-        "Sensor Embedding Visualization (t-SNE)", fontsize=16, fontweight="bold"
+        "Sensor Embedding Visualization (3D t-SNE)", fontsize=16, fontweight="bold"
     )
 
     # 1. Color by normal/anomaly
-    ax = axes[0]
+    ax1 = fig.add_subplot(131, projection="3d")
     normal_mask = labels == 0
     anomaly_mask = labels == 1
 
     if np.sum(normal_mask) > 0:
-        ax.scatter(
-            embeddings_2d[normal_mask, 0],
-            embeddings_2d[normal_mask, 1],
+        ax1.scatter(
+            embeddings_3d[normal_mask, 0],
+            embeddings_3d[normal_mask, 1],
+            embeddings_3d[normal_mask, 2],
             c="#2E86AB",
             alpha=0.3,
             s=10,
@@ -367,9 +627,10 @@ def plot_tsne_embeddings(
         )
 
     if np.sum(anomaly_mask) > 0:
-        ax.scatter(
-            embeddings_2d[anomaly_mask, 0],
-            embeddings_2d[anomaly_mask, 1],
+        ax1.scatter(
+            embeddings_3d[anomaly_mask, 0],
+            embeddings_3d[anomaly_mask, 1],
+            embeddings_3d[anomaly_mask, 2],
             c="#C73E1D",
             alpha=0.5,
             s=20,
@@ -378,55 +639,61 @@ def plot_tsne_embeddings(
             linewidths=0.5,
         )
 
-    ax.set_title("Normal vs Anomaly", fontsize=14, fontweight="bold")
-    ax.set_xlabel("t-SNE Dimension 1", fontsize=12)
-    ax.set_ylabel("t-SNE Dimension 2", fontsize=12)
-    ax.legend(fontsize=12, markerscale=2)
-    ax.grid(True, alpha=0.3)
+    ax1.set_title("Normal vs Anomaly", fontsize=14, fontweight="bold")
+    ax1.set_xlabel("t-SNE Dimension 1", fontsize=12)
+    ax1.set_ylabel("t-SNE Dimension 2", fontsize=12)
+    ax1.set_zlabel("t-SNE Dimension 3", fontsize=12)
+    ax1.legend(fontsize=12, markerscale=2)
 
     # 2. Color by sensor type
-    ax = axes[1]
+    ax2 = fig.add_subplot(132, projection="3d")
     colors = plt.cm.tab10(np.linspace(0, 1, len(sensor_names)))
-    for i, sensor_name in enumerate(sensor_names):
-        mask = sensor_ids == i
+    remaining_sensor_indices = sorted(np.unique(sensor_ids))
+    for orig_sensor_id in remaining_sensor_indices:
+        sensor_name = sensor_names[orig_sensor_id]
+        mask = sensor_ids == orig_sensor_id
         if np.sum(mask) > 0:
-            ax.scatter(
-                embeddings_2d[mask, 0],
-                embeddings_2d[mask, 1],
-                c=[colors[i]],
+            ax2.scatter(
+                embeddings_3d[mask, 0],
+                embeddings_3d[mask, 1],
+                embeddings_3d[mask, 2],
+                c=[colors[orig_sensor_id]],
                 alpha=0.4,
                 s=15,
                 label=sensor_name,
                 edgecolors="none",
             )
-    ax.set_title("By Sensor Type", fontsize=14, fontweight="bold")
-    ax.set_xlabel("t-SNE Dimension 1", fontsize=12)
-    ax.set_ylabel("t-SNE Dimension 2", fontsize=12)
-    ax.legend(fontsize=9, markerscale=1.5, loc="best", ncol=2)
-    ax.grid(True, alpha=0.3)
+    ax2.set_title("By Sensor Type", fontsize=14, fontweight="bold")
+    ax2.set_xlabel("t-SNE Dimension 1", fontsize=12)
+    ax2.set_ylabel("t-SNE Dimension 2", fontsize=12)
+    ax2.set_zlabel("t-SNE Dimension 3", fontsize=12)
+    ax2.legend(fontsize=9, markerscale=1.5, loc="best", ncol=2)
 
     # 3. Combined view (sensor + anomaly)
-    ax = axes[2]
-    for i, sensor_name in enumerate(sensor_names):
+    ax3 = fig.add_subplot(133, projection="3d")
+    for orig_sensor_id in remaining_sensor_indices:
+        sensor_name = sensor_names[orig_sensor_id]
         # Normal for this sensor
-        mask = (sensor_ids == i) & (labels == 0)
+        mask = (sensor_ids == orig_sensor_id) & (labels == 0)
         if np.sum(mask) > 0:
-            ax.scatter(
-                embeddings_2d[mask, 0],
-                embeddings_2d[mask, 1],
-                c=[colors[i]],
+            ax3.scatter(
+                embeddings_3d[mask, 0],
+                embeddings_3d[mask, 1],
+                embeddings_3d[mask, 2],
+                c=[colors[orig_sensor_id]],
                 alpha=0.2,
                 s=10,
                 edgecolors="none",
             )
 
         # Anomaly for this sensor
-        mask = (sensor_ids == i) & (labels == 1)
+        mask = (sensor_ids == orig_sensor_id) & (labels == 1)
         if np.sum(mask) > 0:
-            ax.scatter(
-                embeddings_2d[mask, 0],
-                embeddings_2d[mask, 1],
-                c=[colors[i]],
+            ax3.scatter(
+                embeddings_3d[mask, 0],
+                embeddings_3d[mask, 1],
+                embeddings_3d[mask, 2],
+                c=[colors[orig_sensor_id]],
                 alpha=0.7,
                 s=30,
                 marker="X",
@@ -435,16 +702,31 @@ def plot_tsne_embeddings(
                 label=f"{sensor_name} (anomaly)",
             )
 
-    ax.set_title("Sensor Types + Anomalies", fontsize=14, fontweight="bold")
-    ax.set_xlabel("t-SNE Dimension 1", fontsize=12)
-    ax.set_ylabel("t-SNE Dimension 2", fontsize=12)
-    ax.legend(fontsize=8, markerscale=1, loc="best", ncol=2)
-    ax.grid(True, alpha=0.3)
+    ax3.set_title("Sensor Types + Anomalies", fontsize=14, fontweight="bold")
+    ax3.set_xlabel("t-SNE Dimension 1", fontsize=12)
+    ax3.set_ylabel("t-SNE Dimension 2", fontsize=12)
+    ax3.set_zlabel("t-SNE Dimension 3", fontsize=12)
+    ax3.legend(fontsize=8, markerscale=1, loc="best", ncol=2)
 
     plt.tight_layout()
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+
+    # Validate file extension
+    valid_extensions = [".png", ".jpg", ".jpeg", ".pdf", ".svg", ".eps"]
+    file_ext = Path(save_path).suffix.lower()
+    if file_ext not in valid_extensions:
+        # Try to fix common typos
+        if file_ext == ".wpng":
+            save_path = str(Path(save_path).with_suffix(".png"))
+            print(f"⚠ Fixed file extension typo: using {save_path}")
+        else:
+            raise ValueError(
+                f"Unsupported file format '{file_ext}'. "
+                f"Supported formats: {', '.join(valid_extensions)}"
+            )
+
     plt.savefig(save_path, dpi=300, bbox_inches="tight")
-    print(f"✓ Saved t-SNE plot to {save_path}")
+    print(f"✓ Saved 3D t-SNE plot to {save_path}")
     plt.close()
 
 
@@ -465,7 +747,13 @@ def main():
         "--output",
         type=str,
         default="figures/embedding_tsne.png",
-        help="Output path for visualization",
+        help="Output path for visualization (use .html for interactive, .png for static)",
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Generate interactive HTML visualization (requires plotly). "
+        "If output ends with .html, this is automatically enabled.",
     )
     parser.add_argument(
         "--max_windows",
@@ -522,10 +810,32 @@ def main():
         batch_size=args.batch_size,
     )
 
+    # Determine if we should use interactive visualization
+    use_interactive = args.interactive or args.output.endswith(".html")
+
+    if use_interactive:
+        if not HAS_PLOTLY:
+            print(
+                "⚠ Warning: Plotly not available. Falling back to static visualization."
+            )
+            print("  Install plotly with: pip install plotly")
+            use_interactive = False
+
     # Plot t-SNE
-    plot_tsne_embeddings(
-        embeddings, labels, sensor_ids, SENSOR_NAMES, save_path=args.output
-    )
+    if use_interactive:
+        # Ensure output is HTML
+        if not args.output.endswith(".html"):
+            args.output = str(Path(args.output).with_suffix(".html"))
+        plot_tsne_embeddings_interactive(
+            embeddings, labels, sensor_ids, SENSOR_NAMES, save_path=args.output
+        )
+    else:
+        # Ensure output is PNG (or other image format)
+        if args.output.endswith(".html"):
+            args.output = str(Path(args.output).with_suffix(".png"))
+        plot_tsne_embeddings(
+            embeddings, labels, sensor_ids, SENSOR_NAMES, save_path=args.output
+        )
 
     print("\n✓ Visualization complete!")
 
