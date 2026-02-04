@@ -16,7 +16,12 @@ from pathlib import Path
 from typing import Dict, List, Optional
 import time
 import re
+import sys
 from tqdm import tqdm
+
+# Add paths for imports
+project_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(project_root))
 
 from llm.inference import LMInference, load_llm_model as load_lm_studio_model
 from llm.evaluation.metrics import compute_all_metrics, format_metrics_report
@@ -140,11 +145,18 @@ def format_window_for_llm(
     lines.append("You MUST respond with a valid JSON object in this EXACT format (no other text):")
     lines.append("")
     lines.append("{")
-    lines.append('    "faulty_sensors": ["SENSOR_NAME_1", "SENSOR_NAME_2"] or [],')
+    lines.append('    "root_cause_sensors": ["SENSOR_NAME"] or [],')
+    lines.append('    "affected_sensors": ["SENSOR_NAME_1", "SENSOR_NAME_2"] or [],')
+    lines.append('    "faulty_sensors": ["SENSOR_NAME_1", "SENSOR_NAME_2"] or [],  # backward compatibility (root + affected combined)')
     lines.append('    "fault_type": "VSS_DROPOUT" | "COOLANT_DROPOUT" | "MAF_SCALE" | "TPS_STUCK" | "gradual_drift" or null,')
     lines.append('    "reasoning": "2-4 sentences explaining your diagnosis",')
     lines.append('    "confidence": 0.85')
     lines.append("}")
+    lines.append("")
+    lines.append("IMPORTANT:")
+    lines.append("- root_cause_sensors: The PRIMARY sensor(s) causing the fault (usually 1 sensor)")
+    lines.append("- affected_sensors: Secondary sensors that are affected by the root cause but are NOT the primary fault source")
+    lines.append("- faulty_sensors: For backward compatibility, include ALL faulty sensors (root + affected combined)")
     lines.append("")
     lines.append("Available sensor names:")
     for name in sensor_names:
@@ -153,7 +165,7 @@ def format_window_for_llm(
     lines.append("Fault types: VSS_DROPOUT, COOLANT_DROPOUT, MAF_SCALE, TPS_STUCK, gradual_drift")
     lines.append("")
     lines.append("CRITICAL: Only output valid JSON. No markdown, no code blocks, no extra text.")
-    lines.append("If no faults detected, use: {\"faulty_sensors\": [], \"fault_type\": null, \"reasoning\": \"...\", \"confidence\": 0.9}")
+    lines.append("If no faults detected, use: {\"root_cause_sensors\": [], \"affected_sensors\": [], \"faulty_sensors\": [], \"fault_type\": null, \"reasoning\": \"...\", \"confidence\": 0.9}")
 
     return "\n".join(lines)
 
@@ -162,9 +174,11 @@ def parse_llm_response(response: str, sensor_names: List[str]) -> Dict[str, any]
     """
     Parse LLM response to extract fault predictions.
     
-    Now supports JSON structured output format:
+    Now supports JSON structured output format with root cause and affected sensors:
     {
-        "faulty_sensors": ["SENSOR_NAME_1", "SENSOR_NAME_2"] or [],
+        "root_cause_sensors": ["SENSOR_NAME"] or [],
+        "affected_sensors": ["SENSOR_NAME_1", "SENSOR_NAME_2"] or [],
+        "faulty_sensors": ["SENSOR_NAME_1", "SENSOR_NAME_2"] or [],  # backward compatibility
         "fault_type": "VSS_DROPOUT" | "COOLANT_DROPOUT" | "MAF_SCALE" | "TPS_STUCK" | "gradual_drift" or null,
         "reasoning": "2-4 sentences explaining why",
         "confidence": 0.85
@@ -179,11 +193,18 @@ def parse_llm_response(response: str, sensor_names: List[str]) -> Dict[str, any]
     Returns:
         Dictionary with predictions:
         - 'window_label': int - is window faulty? (0 or 1)
-        - 'sensor_labels': (num_sensors,) binary array - which sensors are faulty
+        - 'sensor_labels': (num_sensors,) binary array - all faulty sensors (root + affected, or faulty_sensors for backward compat)
+        - 'sensor_labels_raw': (num_sensors,) binary array - all faulty sensors (same as sensor_labels for backward compat)
+        - 'sensor_labels_root_only': (num_sensors,) binary array - only root cause sensors
+        - 'root_cause_sensors': List[str] - root cause sensor names
+        - 'affected_sensors': List[str] - affected sensor names
         - 'fault_type': str - predicted fault type
         - 'reasoning': str - LLM reasoning
     """
     sensor_labels = np.zeros(len(sensor_names), dtype=np.float32)
+    sensor_labels_root_only = np.zeros(len(sensor_names), dtype=np.float32)
+    root_cause_sensors = []
+    affected_sensors = []
     fault_type = None  # No fault type if no fault detected
     reasoning = ""
     
@@ -204,35 +225,61 @@ def parse_llm_response(response: str, sensor_names: List[str]) -> Dict[str, any]
         if json_match:
             result = json.loads(json_match.group(0))
             
-            # Extract values from JSON
+            # Extract root cause and affected sensors (new format)
+            root_cause_sensors = result.get("root_cause_sensors", [])
+            affected_sensors = result.get("affected_sensors", [])
+            
+            # Backward compatibility: if new format not present, use faulty_sensors
             faulty_sensors = result.get("faulty_sensors", [])
+            if not root_cause_sensors and not affected_sensors and faulty_sensors:
+                # Old format: treat all as root cause for backward compatibility
+                root_cause_sensors = faulty_sensors
+                affected_sensors = []
+            
             fault_type = result.get("fault_type", None)  # None if no fault
             # Convert "unknown" to None for backward compatibility
             if fault_type == "unknown" or fault_type == "":
                 fault_type = None
             reasoning = result.get("reasoning", "")
             
-            # Validate and map sensor names to indices
-            for sensor in faulty_sensors:
+            # Helper function to map sensor name to index
+            def map_sensor_to_index(sensor: str) -> Optional[int]:
                 # Try exact match first
                 if sensor in sensor_names:
-                    idx = sensor_names.index(sensor)
-                    sensor_labels[idx] = 1.0
+                    return sensor_names.index(sensor)
                 else:
                     # Try matching without parentheses
                     sensor_clean = sensor.replace(" ()", "").strip()
                     for i, name in enumerate(sensor_names):
                         name_clean = name.replace(" ()", "").strip()
                         if sensor_clean == name_clean:
-                            sensor_labels[i] = 1.0
-                            break
+                            return i
+                return None
+            
+            # Map root cause sensors
+            for sensor in root_cause_sensors:
+                idx = map_sensor_to_index(sensor)
+                if idx is not None:
+                    sensor_labels_root_only[idx] = 1.0
+                    sensor_labels[idx] = 1.0  # Include in full labels too
+            
+            # Map affected sensors (only to full labels, not root-only)
+            for sensor in affected_sensors:
+                idx = map_sensor_to_index(sensor)
+                if idx is not None:
+                    sensor_labels[idx] = 1.0
             
             # Convert sensor labels to sensor-indexed window label (0-8)
-            window_label = sensor_labels_to_window_label(sensor_labels)
+            # Use root-only for window label (primary sensor)
+            window_label = sensor_labels_to_window_label(sensor_labels_root_only)
             
             return {
                 "window_label": window_label,
-                "sensor_labels": sensor_labels,
+                "sensor_labels": sensor_labels,  # All faulty sensors (root + affected)
+                "sensor_labels_raw": sensor_labels.copy(),  # Same as sensor_labels for now
+                "sensor_labels_root_only": sensor_labels_root_only,  # Only root cause
+                "root_cause_sensors": root_cause_sensors,
+                "affected_sensors": affected_sensors,
                 "fault_type": fault_type,
                 "reasoning": reasoning if reasoning else "No reasoning provided",
             }
@@ -367,15 +414,63 @@ def parse_llm_response(response: str, sensor_names: List[str]) -> Dict[str, any]
             # Empty list explicitly provided
             pass
     
+    # For old text format, treat all parsed sensors as root cause (backward compatibility)
+    sensor_labels_root_only = sensor_labels.copy()
+    
     # Convert sensor labels to sensor-indexed window label (0-8)
-    window_label = sensor_labels_to_window_label(sensor_labels)
+    window_label = sensor_labels_to_window_label(sensor_labels_root_only)
+    
+    # Extract sensor names for root_cause_sensors and affected_sensors
+    parsed_root_sensors = [sensor_names[i] for i in range(len(sensor_names)) if sensor_labels_root_only[i] > 0]
+    parsed_affected_sensors = []  # Old format doesn't distinguish, so empty
 
     return {
         "window_label": window_label,
-        "sensor_labels": sensor_labels,
+        "sensor_labels": sensor_labels,  # All faulty sensors
+        "sensor_labels_raw": sensor_labels.copy(),  # Same as sensor_labels for backward compat
+        "sensor_labels_root_only": sensor_labels_root_only,  # Only root cause (all sensors in old format)
+        "root_cause_sensors": parsed_root_sensors,
+        "affected_sensors": parsed_affected_sensors,
         "fault_type": fault_type,
         "reasoning": reasoning if reasoning else "No reasoning provided",
     }
+
+
+def filter_sensor_labels_to_root_only(parsed_result: Dict, sensor_names: List[str]) -> np.ndarray:
+    """
+    Filter sensor labels to only include root cause sensors.
+    
+    Args:
+        parsed_result: Dictionary from parse_llm_response() containing:
+            - 'root_cause_sensors': List of root cause sensor names
+            - 'sensor_labels_root_only': Binary array (already filtered)
+        sensor_names: List of all sensor names
+    
+    Returns:
+        Binary array (num_sensors,) with only root cause sensors marked as 1
+    """
+    # If root_only labels already computed, use them
+    if "sensor_labels_root_only" in parsed_result:
+        return parsed_result["sensor_labels_root_only"].copy()
+    
+    # Otherwise, extract from root_cause_sensors list
+    sensor_labels = np.zeros(len(sensor_names), dtype=np.float32)
+    root_cause_sensors = parsed_result.get("root_cause_sensors", [])
+    
+    for sensor in root_cause_sensors:
+        if sensor in sensor_names:
+            idx = sensor_names.index(sensor)
+            sensor_labels[idx] = 1.0
+        else:
+            # Try matching without parentheses
+            sensor_clean = sensor.replace(" ()", "").strip()
+            for i, name in enumerate(sensor_names):
+                name_clean = name.replace(" ()", "").strip()
+                if sensor_clean == name_clean:
+                    sensor_labels[i] = 1.0
+                    break
+    
+    return sensor_labels
 
 
 def call_llm(
@@ -546,7 +641,8 @@ def evaluate_llm_baseline(
     # Run predictions
     print("Running LLM predictions...")
     window_labels_pred = []
-    sensor_labels_pred = []
+    sensor_labels_pred = []  # Filtered (root-only) predictions
+    sensor_labels_pred_raw = []  # Raw (all sensors) predictions
     fault_types_pred = []
     reasoning_list = []
     processing_times = []
@@ -585,15 +681,22 @@ def evaluate_llm_baseline(
                 ]  # Store first 200 chars of response
             except Exception as e:
                 # Fallback to no-fault prediction
+                empty_labels = np.zeros(len(sensor_names), dtype=np.float32)
                 prediction = {
                     "window_label": 0,
-                    "sensor_labels": np.zeros(len(sensor_names), dtype=np.float32),
+                    "sensor_labels": empty_labels,
+                    "sensor_labels_root_only": empty_labels.copy(),
                     "fault_type": None,
                     "reasoning": f"Error: {str(e)}",
                 }
 
+            # Apply root-only filtering for precision improvement
+            sensor_labels_filtered = filter_sensor_labels_to_root_only(prediction, sensor_names)
+            sensor_labels_raw = prediction.get("sensor_labels", sensor_labels_filtered.copy())
+
             window_labels_pred.append(prediction["window_label"])
-            sensor_labels_pred.append(prediction["sensor_labels"])
+            sensor_labels_pred.append(sensor_labels_filtered)  # Use filtered (root-only) for metrics
+            sensor_labels_pred_raw.append(sensor_labels_raw)  # Keep raw for analysis
             fault_types_pred.append(prediction["fault_type"])
             reasoning_list.append(prediction.get("reasoning", ""))
             processing_times.append(time.time() - start_time)
@@ -610,7 +713,8 @@ def evaluate_llm_baseline(
                 pbar.set_postfix({"avg_time": f"{avg_time:.2f}s"})
 
     window_labels_pred = np.array(window_labels_pred)
-    sensor_labels_pred = np.array(sensor_labels_pred)
+    sensor_labels_pred = np.array(sensor_labels_pred)  # Filtered (root-only)
+    sensor_labels_pred_raw = np.array(sensor_labels_pred_raw)  # Raw (all sensors)
 
     avg_processing_time = np.mean(processing_times)
     total_processing_time = np.sum(processing_times)
@@ -622,18 +726,41 @@ def evaluate_llm_baseline(
         print(f"  Average context length: {avg_context_length:.0f} tokens")
     print()
 
+    # Convert window_labels_true to sensor-indexed format (0-8)
+    # The dataset stores window_labels as window indices, not sensor-indexed labels
+    window_labels_true_converted = np.zeros(len(window_labels_true), dtype=np.int64)
+    for i in range(len(window_labels_true)):
+        faulty_indices = np.where(sensor_labels_true[i] > 0)[0]
+        if len(faulty_indices) > 0:
+            window_labels_true_converted[i] = faulty_indices[0] + 1  # 1-indexed (sensor 0 -> label 1)
+        else:
+            window_labels_true_converted[i] = 0  # No fault
+    window_labels_true = window_labels_true_converted
+
     # Compute metrics
     print("Computing evaluation metrics...")
     fault_types_true = data.get("fault_types", None)
 
+    # Compute metrics using filtered (root-only) predictions for precision improvement
     metrics = compute_all_metrics(
         y_true_window=window_labels_true,
         y_pred_window=window_labels_pred,
         y_true_sensor=sensor_labels_true,
-        y_pred_sensor=sensor_labels_pred,
+        y_pred_sensor=sensor_labels_pred,  # Use filtered (root-only) for main metrics
         sensor_names=sensor_names,
         fault_types=fault_types_true if fault_types_true is not None else None,
     )
+    
+    # Also compute raw metrics for comparison
+    metrics_raw = compute_all_metrics(
+        y_true_window=window_labels_true,
+        y_pred_window=window_labels_pred,
+        y_true_sensor=sensor_labels_true,
+        y_pred_sensor=sensor_labels_pred_raw,  # Use raw (all sensors) for comparison
+        sensor_names=sensor_names,
+        fault_types=fault_types_true if fault_types_true is not None else None,
+    )
+    metrics["sensor_level_raw"] = metrics_raw["sensor_level"]
 
     # Add efficiency metrics
     metrics["efficiency"] = {
@@ -656,7 +783,8 @@ def evaluate_llm_baseline(
         "metrics": metrics,
         "predictions": {
             "window_labels": window_labels_pred.tolist(),
-            "sensor_labels": sensor_labels_pred.tolist(),
+            "sensor_labels": sensor_labels_pred.tolist(),  # Filtered (root-only)
+            "sensor_labels_raw": sensor_labels_pred_raw.tolist(),  # Raw (all sensors)
             "fault_types": fault_types_pred,
             "reasoning": reasoning_list[:10]
             if len(reasoning_list) > 10

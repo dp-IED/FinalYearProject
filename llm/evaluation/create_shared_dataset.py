@@ -58,20 +58,21 @@ from scipy import stats
 import sys
 
 # Add path for preprocessing functions
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "anomaly-detection"))
-from train_gdn_center_loss import (
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts" / "training"))
+from train_gdn_stage1_forecast import (
     remove_zero_variance_columns,
     mean_fill_missing_timestamps_and_remove_duplicates,
     downsample,
     filter_long_drives,
     add_cross_channel_features,
-    build_clean_windows,
     SENSOR_COLS,
     ID_COL,
     TIME_COL,
     WINDOW_SIZE,
-    FORECAST_HORIZON,
 )
+from train_gdn_stage2_multilevel import build_clean_windows
+
+FORECAST_HORIZON = 1  # Default forecast horizon
 
 # Import shared fault injection with stratified distribution
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts" / "training"))

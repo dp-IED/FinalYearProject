@@ -1,5 +1,5 @@
 """
-Evaluate GDN->KG->LLM method on shared evaluation dataset.
+Evaluate Serialised KG->LLM method on shared evaluation dataset.
 
 This script:
 1. Loads shared dataset
@@ -33,7 +33,8 @@ from llm.evaluation.evaluate_llm_baseline import (
     load_llm_model,
     call_llm,
     parse_llm_response,
-    format_window_for_llm
+    format_window_for_llm,
+    filter_sensor_labels_to_root_only,
 )
 from llm.kag.graphdb import Neo4jLoader
 from llm.kag.solver_v2 import KAGIterativeSolver
@@ -560,13 +561,21 @@ def format_window_with_kg_for_llm(
     lines.append("IMPORTANT: You MUST respond with ONLY a valid JSON object. No markdown, no code blocks (no ```), no explanations before or after.")
     lines.append("")
     lines.append("Required JSON format:")
-    lines.append('{"faulty_sensors": ["SENSOR_NAME"] or [], "fault_type": "FAULT_TYPE" or null, "reasoning": "explanation", "confidence": 0.85}')
+    lines.append('{"root_cause_sensors": ["SENSOR_NAME"] or [], "affected_sensors": ["SENSOR_NAME_1", "SENSOR_NAME_2"] or [], "faulty_sensors": ["SENSOR_NAME_1", "SENSOR_NAME_2"] or [], "fault_type": "FAULT_TYPE" or null, "reasoning": "explanation", "confidence": 0.85}')
+    lines.append("")
+    lines.append("IMPORTANT:")
+    lines.append("- root_cause_sensors: The PRIMARY sensor(s) causing the fault (usually 1 sensor)")
+    lines.append("- affected_sensors: Secondary sensors that are affected by the root cause but are NOT the primary fault source")
+    lines.append("- faulty_sensors: For backward compatibility, include ALL faulty sensors (root + affected combined)")
     lines.append("")
     lines.append("Example 1 (with fault):")
-    lines.append('{"faulty_sensors": ["VEHICLE_SPEED"], "fault_type": "VSS_DROPOUT", "reasoning": "Vehicle speed sensor shows dropout pattern", "confidence": 0.9}')
+    lines.append('{"root_cause_sensors": ["VEHICLE_SPEED"], "affected_sensors": [], "faulty_sensors": ["VEHICLE_SPEED"], "fault_type": "VSS_DROPOUT", "reasoning": "Vehicle speed sensor shows dropout pattern", "confidence": 0.9}')
     lines.append("")
-    lines.append("Example 2 (no fault):")
-    lines.append('{"faulty_sensors": [], "fault_type": null, "reasoning": "All sensors appear normal", "confidence": 0.85}')
+    lines.append("Example 2 (with fault and affected sensors):")
+    lines.append('{"root_cause_sensors": ["COOLANT_TEMPERATURE"], "affected_sensors": ["ENGINE_LOAD"], "faulty_sensors": ["COOLANT_TEMPERATURE", "ENGINE_LOAD"], "fault_type": "COOLANT_DROPOUT", "reasoning": "Coolant sensor dropout affecting engine load", "confidence": 0.8}')
+    lines.append("")
+    lines.append("Example 3 (no fault):")
+    lines.append('{"root_cause_sensors": [], "affected_sensors": [], "faulty_sensors": [], "fault_type": null, "reasoning": "All sensors appear normal", "confidence": 0.85}')
     lines.append("")
     lines.append("Available sensor names:")
     for name in kg_builder.sensor_names:
@@ -597,7 +606,7 @@ def evaluate_gdn_kg_llm(
     neo4j_password: str = "password"
 ) -> Dict[str, any]:
     """
-    Evaluate GDN->KG->LLM method on shared dataset.
+    Evaluate Serialised KG->LLM method on shared dataset.
     
     Args:
         dataset_path: Path to shared dataset (.npz file)
@@ -615,7 +624,7 @@ def evaluate_gdn_kg_llm(
         Dictionary with evaluation results
     """
     print("="*80)
-    print("Evaluating GDN->KG->LLM Method")
+    print("Evaluating Serialised KG->LLM Method")
     print("="*80)
     print(f"Dataset: {dataset_path}")
     print(f"GDN Model: {model_path}")
@@ -848,7 +857,8 @@ def evaluate_gdn_kg_llm(
     # Run LLM predictions with KG context
     print("Running LLM predictions with KG context...")
     window_labels_pred = []
-    sensor_labels_pred = []
+    sensor_labels_pred = []  # Filtered (root-only) predictions
+    sensor_labels_pred_raw = []  # Raw (all sensors) predictions
     fault_types_pred = []
     reasoning_list = []
     processing_times = []
@@ -864,9 +874,13 @@ def evaluate_gdn_kg_llm(
                     result = solver.solve(window_idx)
                     
                     # Map solver output to evaluation format
+                    # Use root-only sensor labels from solver (already filtered)
+                    sensor_labels_filtered = result.get('sensor_labels', np.zeros(len(sensor_names), dtype=np.float32))
+                    sensor_labels_raw = result.get('sensor_labels_raw', sensor_labels_filtered.copy())
                     prediction = {
                         'window_label': result['window_label'],
-                        'sensor_labels': result['sensor_labels'],
+                        'sensor_labels': sensor_labels_filtered,  # Root-only
+                        'sensor_labels_raw': sensor_labels_raw,  # All sensors
                         'fault_type': result['fault_type'],
                         'reasoning': result.get('reasoning_trace', [{}])[-1].get('answer', '') if result.get('reasoning_trace') else ''
                     }
@@ -878,9 +892,11 @@ def evaluate_gdn_kg_llm(
                             prediction['reasoning'] = last_trace['answer'][:500]  # Limit length
                 except Exception as e:
                     # Fallback to no-fault prediction on solver error
+                    empty_labels = np.zeros(len(sensor_names), dtype=np.float32)
                     prediction = {
                         'window_label': 0,
-                        'sensor_labels': np.zeros(len(sensor_names), dtype=np.float32),
+                        'sensor_labels': empty_labels,
+                        'sensor_labels_raw': empty_labels.copy(),
                         'fault_type': None,
                         'reasoning': f"KAG Solver error: {str(e)}"
                     }
@@ -986,15 +1002,26 @@ def evaluate_gdn_kg_llm(
                         prediction['reasoning'] = response[:500]  # Store first 500 chars for debugging
                 except Exception as e:
                     # Fallback to no-fault prediction (window_label = 0)
+                    empty_labels = np.zeros(len(sensor_names), dtype=np.float32)
                     prediction = {
                         'window_label': 0,  # 0 = no fault
-                        'sensor_labels': np.zeros(len(sensor_names), dtype=np.float32),
+                        'sensor_labels': empty_labels,
+                        'sensor_labels_raw': empty_labels.copy(),
                         'fault_type': None,
                         'reasoning': f"Error: {str(e)}"
                     }
             
+            # Apply root-only filtering for precision improvement (if not already filtered)
+            if 'sensor_labels_raw' not in prediction:
+                sensor_labels_filtered = filter_sensor_labels_to_root_only(prediction, sensor_names)
+                sensor_labels_raw = prediction.get('sensor_labels', sensor_labels_filtered.copy())
+            else:
+                sensor_labels_filtered = prediction.get('sensor_labels', np.zeros(len(sensor_names), dtype=np.float32))
+                sensor_labels_raw = prediction.get('sensor_labels_raw', sensor_labels_filtered.copy())
+            
             window_labels_pred.append(prediction['window_label'])
-            sensor_labels_pred.append(prediction['sensor_labels'])
+            sensor_labels_pred.append(sensor_labels_filtered)  # Use filtered (root-only) for metrics
+            sensor_labels_pred_raw.append(sensor_labels_raw)  # Keep raw for analysis
             fault_types_pred.append(prediction['fault_type'])
             reasoning_list.append(prediction.get('reasoning', ''))
             processing_times.append(time.time() - start_time)
@@ -1012,7 +1039,8 @@ def evaluate_gdn_kg_llm(
             pass
     
     window_labels_pred = np.array(window_labels_pred)
-    sensor_labels_pred = np.array(sensor_labels_pred)
+    sensor_labels_pred = np.array(sensor_labels_pred)  # Filtered (root-only)
+    sensor_labels_pred_raw = np.array(sensor_labels_pred_raw)  # Raw (all sensors)
     
     avg_processing_time = np.mean(processing_times)
     total_processing_time = np.sum(processing_times)
@@ -1022,18 +1050,41 @@ def evaluate_gdn_kg_llm(
     print(f"  Total LLM processing time: {llm_time:.2f} seconds")
     print()
     
+    # Convert window_labels_true to sensor-indexed format (0-8)
+    # The dataset stores window_labels as window indices, not sensor-indexed labels
+    window_labels_true_converted = np.zeros(len(window_labels_true), dtype=np.int64)
+    for i in range(len(window_labels_true)):
+        faulty_indices = np.where(sensor_labels_true[i] > 0)[0]
+        if len(faulty_indices) > 0:
+            window_labels_true_converted[i] = faulty_indices[0] + 1  # 1-indexed (sensor 0 -> label 1)
+        else:
+            window_labels_true_converted[i] = 0  # No fault
+    window_labels_true = window_labels_true_converted
+    
     # Compute metrics
     print("Computing evaluation metrics...")
     fault_types_true = data.get('fault_types', None)
     
+    # Compute metrics using filtered (root-only) predictions for precision improvement
     metrics = compute_all_metrics(
         y_true_window=window_labels_true,
         y_pred_window=window_labels_pred,
         y_true_sensor=sensor_labels_true,
-        y_pred_sensor=sensor_labels_pred,
+        y_pred_sensor=sensor_labels_pred,  # Use filtered (root-only) for main metrics
         sensor_names=sensor_names,
         fault_types=fault_types_true if fault_types_true is not None else None
     )
+    
+    # Also compute raw metrics for comparison
+    metrics_raw = compute_all_metrics(
+        y_true_window=window_labels_true,
+        y_pred_window=window_labels_pred,
+        y_true_sensor=sensor_labels_true,
+        y_pred_sensor=sensor_labels_pred_raw,  # Use raw (all sensors) for comparison
+        sensor_names=sensor_names,
+        fault_types=fault_types_true if fault_types_true is not None else None
+    )
+    metrics["sensor_level_raw"] = metrics_raw["sensor_level"]
     
     # Add efficiency metrics
     total_time = gdn_time + kg_time + llm_time
@@ -1061,7 +1112,8 @@ def evaluate_gdn_kg_llm(
         'metrics': metrics,
         'predictions': {
             'window_labels': window_labels_pred.tolist(),
-            'sensor_labels': sensor_labels_pred.tolist(),
+            'sensor_labels': sensor_labels_pred.tolist(),  # Filtered (root-only)
+            'sensor_labels_raw': sensor_labels_pred_raw.tolist(),  # Raw (all sensors)
             'fault_types': fault_types_pred,
             'reasoning': reasoning_list[:10] if len(reasoning_list) > 10 else reasoning_list  # Sample reasoning
         }
@@ -1079,7 +1131,7 @@ def evaluate_gdn_kg_llm(
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Evaluate GDN->KG->LLM method on shared evaluation dataset'
+        description='Evaluate Serialised KG->LLM method on shared evaluation dataset'
     )
     parser.add_argument(
         '--dataset',

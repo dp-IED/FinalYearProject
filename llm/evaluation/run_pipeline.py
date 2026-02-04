@@ -1,5 +1,5 @@
 """
-Run the complete evaluation pipeline: dataset creation -> LLM eval -> GDN->KG eval -> GDN->KG->LLM eval -> KAG v1 -> KAG v2 -> comparison.
+Run the complete evaluation pipeline: dataset creation -> LLM eval -> Serialised KG->LLM eval -> KAG -> comparison.
 
 This script orchestrates the entire evaluation workflow with progress visualization.
 """
@@ -83,8 +83,8 @@ def run_command(
     # Combine stderr with stdout so all output appears together
     # Set PYTHONUNBUFFERED to ensure child Python processes output immediately
     env = os.environ.copy()
-    env['PYTHONUNBUFFERED'] = '1'
-    
+    env["PYTHONUNBUFFERED"] = "1"
+
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -100,7 +100,7 @@ def run_command(
     try:
         # Read line by line and print immediately
         # Use iter() with readline() for better real-time behavior
-        for line in iter(process.stdout.readline, ''):
+        for line in iter(process.stdout.readline, ""):
             if not line:
                 break
             # Write and flush immediately
@@ -129,8 +129,8 @@ def run_command(
             # Show last few lines of output for debugging
             if output_lines:
                 print("\nLast output lines:")
-                output_text = ''.join(output_lines)
-                lines = output_text.split('\n')
+                output_text = "".join(output_lines)
+                lines = output_text.split("\n")
                 for line in lines[-10:]:
                     print(line)
 
@@ -139,7 +139,7 @@ def run_command(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run complete evaluation pipeline: dataset -> LLM -> GDN->KG -> GDN->KG->LLM -> comparison"
+        description="Run complete evaluation pipeline: dataset -> LLM -> Serialised KG->LLM -> KAG -> comparison"
     )
     parser.add_argument(
         "--raw-data-path",
@@ -150,7 +150,7 @@ def main():
     parser.add_argument(
         "--model-path",
         type=str,
-        default="anomaly-detection/best_focal_multilabel_gdn.pt",
+        default="checkpoints/stage2_sensor_only_0130_002721.pt",
         help="Path to GDN model checkpoint",
     )
     parser.add_argument(
@@ -183,22 +183,47 @@ def main():
         help="Skip LLM baseline evaluation (use existing results)",
     )
     parser.add_argument(
-        "--skip-gdn-kg",
-        action="store_true",
-        help="Skip GDN->KG evaluation (use existing results)",
-    )
-    parser.add_argument(
         "--skip-kg-llm",
         action="store_true",
-        help="Skip GDN->KG->LLM evaluation (faster, but no KG-enhanced LLM comparison)",
-    )
-    parser.add_argument(
-        "--skip-kag-v1", action="store_true", help="Skip KAG v1 (heuristic) evaluation"
+        help="Skip Serialised KG->LLM evaluation (faster, but no KG-enhanced LLM comparison)",
     )
     parser.add_argument(
         "--skip-kag-v2",
         action="store_true",
-        help="Skip KAG v2 (LLM-planned) evaluation",
+        help="Skip KAG evaluation",
+    )
+    parser.add_argument(
+        "--skip-rag",
+        action="store_true",
+        help="Skip RAG evaluation",
+    )
+    parser.add_argument(
+        "--skip-populate-chromadb",
+        action="store_true",
+        help="Skip ChromaDB population (assumes ChromaDB already populated)",
+    )
+    parser.add_argument(
+        "--chromadb-collection",
+        type=str,
+        default="window_data",
+        help="Name of ChromaDB collection",
+    )
+    parser.add_argument(
+        "--chromadb-persist-dir",
+        type=str,
+        default="chromadb_data",
+        help="Directory where ChromaDB is persisted",
+    )
+    parser.add_argument(
+        "--rag-top-k",
+        type=int,
+        default=3,
+        help="Number of similar windows to retrieve for RAG",
+    )
+    parser.add_argument(
+        "--use-gdn-embeddings-for-rag",
+        action="store_true",
+        help="Use GDN embeddings for RAG retrieval (vs text descriptions)",
     )
     parser.add_argument(
         "--neo4j-uri",
@@ -225,16 +250,16 @@ def main():
     total_steps = 1  # Dataset creation (if not skipped)
     if not args.skip_dataset_creation:
         total_steps += 0  # Already counted
+    if not args.skip_populate_chromadb:
+        total_steps += 1  # Populate ChromaDB
     if not args.skip_llm_baseline:
         total_steps += 1  # LLM baseline
-    if not args.skip_gdn_kg:
-        total_steps += 1  # GDN->KG
     if not args.skip_kg_llm:
         total_steps += 1  # GDN->KG->LLM
-    if not args.skip_kag_v1:
-        total_steps += 1  # KAG v1
     if not args.skip_kag_v2:
         total_steps += 1  # KAG v2
+    if not args.skip_rag:
+        total_steps += 1  # RAG
     total_steps += 1  # Comparison
 
     tracker = ProgressTracker(total_steps)
@@ -298,7 +323,62 @@ def main():
 
     print(f"\n✓ Using dataset: {dataset_path}")
 
-    # Step 2: Evaluate LLM baseline
+    # Resolve model path (needed for ChromaDB population and evaluations)
+    model_path = Path(args.model_path)
+    if not model_path.exists():
+        # Try alternative locations
+        alt_paths = [Path("checkpoints") / args.model_path, Path(args.model_path)]
+        for alt_path in alt_paths:
+            if alt_path.exists():
+                model_path = alt_path
+                break
+
+        if not model_path.exists():
+            print(f"\n⚠️  Model not found: {args.model_path}")
+            print("Available models:")
+            for pt_file in Path("checkpoints").glob("*.pt"):
+                print(f"  - {pt_file}")
+            if (
+                not args.skip_populate_chromadb
+                or not args.skip_kg_llm
+                or not args.skip_kag_v2
+            ):
+                print("\nCannot proceed without model.")
+                return 1
+
+    # Step 2: Populate ChromaDB
+    if not args.skip_populate_chromadb:
+        populate_cmd = [
+            "python",
+            "llm/rag/populate_chromadb.py",
+            "--dataset",
+            str(dataset_path),
+            "--gdn-model",
+            str(model_path),
+            "--collection-name",
+            args.chromadb_collection,
+            "--persist-dir",
+            args.chromadb_persist_dir,
+            "--device",
+            "cpu",
+        ]
+        if args.limit is not None:
+            populate_cmd.extend(["--limit", str(args.limit)])
+
+        success, _ = run_command(
+            populate_cmd,
+            "Populating ChromaDB with Window Descriptions and GDN Embeddings",
+            tracker,
+        )
+        if not success:
+            print(
+                "\n⚠️  ChromaDB population failed. RAG evaluation may not work correctly."
+            )
+    else:
+        print("\n⏭️  Skipping ChromaDB population (--skip-populate-chromadb flag set)")
+        tracker.current_step += 1  # Skip counting this step
+
+    # Step 3: Evaluate LLM baseline
     llm_results_path = Path(args.results_dir) / f"llm_baseline_{args.split}.json"
 
     if not args.skip_llm_baseline:
@@ -320,54 +400,7 @@ def main():
         print("\n⏭️  Skipping LLM baseline evaluation (--skip-llm-baseline flag set)")
         tracker.current_step += 1  # Skip counting this step
 
-    # Resolve model path (needed for GDN->KG, GDN->KG->LLM, and KAG v2)
-    model_path = Path(args.model_path)
-    if not model_path.exists():
-        # Try alternative locations
-        alt_paths = [Path("anomaly-detection") / args.model_path, Path(args.model_path)]
-        for alt_path in alt_paths:
-            if alt_path.exists():
-                model_path = alt_path
-                break
-
-        if not model_path.exists():
-            print(f"\n⚠️  Model not found: {args.model_path}")
-            print("Available models:")
-            for pt_file in Path("anomaly-detection").glob("*.pt"):
-                print(f"  - {pt_file}")
-            if not args.skip_gdn_kg:
-                print("\nSkipping GDN->KG evaluation...")
-                return 0
-
-    # Step 3: Evaluate GDN->KG
-    gdn_kg_results_path = Path(args.results_dir) / f"gdn_kg_{args.split}.json"
-
-    if not args.skip_gdn_kg:
-
-        gdn_kg_cmd = [
-            "python",
-            "llm/evaluation/evaluate_gdn_kg.py",
-            "--dataset",
-            str(dataset_path),
-            "--model-path",
-            str(model_path),
-            "--output",
-            str(gdn_kg_results_path),
-            "--device",
-            "cpu",  # Use CPU by default
-        ]
-        if args.limit is not None:
-            gdn_kg_cmd.extend(["--limit", str(args.limit)])
-
-        success, _ = run_command(gdn_kg_cmd, "Evaluating GDN->KG Method", tracker)
-        if not success:
-            print("\n⚠️  GDN->KG evaluation failed.")
-            return 1
-    else:
-        print("\n⏭️  Skipping GDN->KG evaluation (--skip-gdn-kg flag set)")
-        tracker.current_step += 1  # Skip counting this step
-
-    # Step 4: Evaluate GDN->KG->LLM
+    # Step 4: Evaluate Serialised KG->LLM
     gdn_kg_llm_results_path = Path(args.results_dir) / f"gdn_kg_llm_{args.split}.json"
 
     if not args.skip_kg_llm:
@@ -387,43 +420,17 @@ def main():
             gdn_kg_llm_cmd.extend(["--limit", str(args.limit)])
 
         success, _ = run_command(
-            gdn_kg_llm_cmd, "Evaluating GDN->KG->LLM Method", tracker
+            gdn_kg_llm_cmd, "Evaluating Serialised KG->LLM Method", tracker
         )
         if not success:
-            print("\n⚠️  GDN->KG->LLM evaluation failed. Continuing with comparison...")
+            print(
+                "\n⚠️  Serialised KG->LLM evaluation failed. Continuing with comparison..."
+            )
     else:
-        print("\n⏭️  Skipping GDN->KG->LLM evaluation (--skip-kg-llm flag set)")
+        print("\n⏭️  Skipping Serialised KG->LLM evaluation (--skip-kg-llm flag set)")
         tracker.current_step += 1  # Skip counting this step
 
-    # Step 5: Evaluate KAG v1 (Heuristic)
-    kag_v1_results_path = Path(args.results_dir) / f"kag_v1_{args.split}.json"
-
-    if not args.skip_kag_v1:
-        kag_v1_cmd = [
-            "python",
-            "llm/evaluation/evaluate_kag_v1.py",
-            "--dataset",
-            str(dataset_path),
-            "--output",
-            str(kag_v1_results_path),
-            "--neo4j-uri",
-            args.neo4j_uri,
-            "--neo4j-user",
-            args.neo4j_user,
-            "--neo4j-password",
-            args.neo4j_password,
-        ]
-        if args.limit is not None:
-            kag_v1_cmd.extend(["--limit", str(args.limit)])
-
-        success, _ = run_command(kag_v1_cmd, "Evaluating KAG v1 (Heuristic)", tracker)
-        if not success:
-            print("\n⚠️  KAG v1 evaluation failed. Continuing...")
-    else:
-        print("\n⏭️  Skipping KAG v1 evaluation (--skip-kag-v1 flag set)")
-        tracker.current_step += 1  # Skip counting this step
-
-    # Step 6: Evaluate KAG v2 (LLM-planned)
+    # Step 5: Evaluate KAG
     kag_v2_results_path = Path(args.results_dir) / f"kag_v2_{args.split}.json"
 
     if not args.skip_kag_v2:
@@ -448,11 +455,41 @@ def main():
         if args.limit is not None:
             kag_v2_cmd.extend(["--limit", str(args.limit)])
 
-        success, _ = run_command(kag_v2_cmd, "Evaluating KAG v2 (LLM-planned)", tracker)
+        success, _ = run_command(kag_v2_cmd, "Evaluating KAG", tracker)
         if not success:
-            print("\n⚠️  KAG v2 evaluation failed. Continuing...")
+            print("\n⚠️  KAG evaluation failed. Continuing...")
     else:
-        print("\n⏭️  Skipping KAG v2 evaluation (--skip-kag-v2 flag set)")
+        print("\n⏭️  Skipping KAG evaluation (--skip-kag-v2 flag set)")
+        tracker.current_step += 1  # Skip counting this step
+
+    # Step 6: Evaluate RAG
+    rag_results_path = Path(args.results_dir) / f"rag_{args.split}.json"
+
+    if not args.skip_rag:
+        rag_cmd = [
+            "python",
+            "llm/evaluation/evaluate_rag.py",
+            "--dataset",
+            str(dataset_path),
+            "--chromadb-collection",
+            args.chromadb_collection,
+            "--chromadb-persist-dir",
+            args.chromadb_persist_dir,
+            "--output",
+            str(rag_results_path),
+            "--top-k",
+            str(args.rag_top_k),
+        ]
+        if args.use_gdn_embeddings_for_rag:
+            rag_cmd.extend(["--use-gdn-embeddings", "--gdn-model", str(model_path)])
+        if args.limit is not None:
+            rag_cmd.extend(["--limit", str(args.limit)])
+
+        success, _ = run_command(rag_cmd, "Evaluating RAG Method", tracker)
+        if not success:
+            print("\n⚠️  RAG evaluation failed. Continuing...")
+    else:
+        print("\n⏭️  Skipping RAG evaluation (--skip-rag flag set)")
         tracker.current_step += 1  # Skip counting this step
 
     # Step 7: Compare methods
@@ -460,31 +497,22 @@ def main():
 
     # Determine which comparison to run based on available results
     has_llm = llm_results_path.exists()
-    has_gdn_kg = gdn_kg_results_path.exists() if not args.skip_gdn_kg else False
     has_gdn_kg_llm = gdn_kg_llm_results_path.exists() if not args.skip_kg_llm else False
-    has_kag_v1 = kag_v1_results_path.exists() if not args.skip_kag_v1 else False
     has_kag_v2 = kag_v2_results_path.exists() if not args.skip_kag_v2 else False
+    has_rag = rag_results_path.exists() if not args.skip_rag else False
 
-    # Build comparison command - include all available methods
-    if not (has_llm and has_gdn_kg and has_gdn_kg_llm):
+    # Build comparison command - require at least GDN->KG->LLM
+    if not has_gdn_kg_llm:
         print("\n⚠️  Cannot compare methods - missing required result files")
-        if not has_llm:
-            print(f"  Missing: {llm_results_path}")
-        if not has_gdn_kg:
-            print(f"  Missing: {gdn_kg_results_path}")
         if not has_gdn_kg_llm and not args.skip_kg_llm:
             print(f"  Missing: {gdn_kg_llm_results_path}")
         tracker.print_summary()
         return 1
 
-    # Build comparison command with all available methods
+    # Build comparison command with available methods
     compare_cmd = [
         "python",
         "llm/evaluation/compare_methods.py",
-        "--llm-results",
-        str(llm_results_path),
-        "--gdn-kg-results",
-        str(gdn_kg_results_path),
         "--gdn-kg-llm-results",
         str(gdn_kg_llm_results_path),
         "--output",
@@ -493,11 +521,17 @@ def main():
         str(Path(args.results_dir) / f"comparison_{args.split}.json"),
     ]
 
-    # Add optional KAG results if available
-    if has_kag_v1:
-        compare_cmd.extend(["--kag-v1-results", str(kag_v1_results_path)])
+    # Add optional LLM baseline results if available
+    if has_llm:
+        compare_cmd.extend(["--llm-results", str(llm_results_path)])
+
+    # Add optional KAG v2 results if available
     if has_kag_v2:
         compare_cmd.extend(["--kag-v2-results", str(kag_v2_results_path)])
+
+    # Add optional RAG results if available
+    if has_rag:
+        compare_cmd.extend(["--rag-results", str(rag_results_path)])
 
     success, _ = run_command(compare_cmd, "Comparing Methods", tracker)
     if not success:
@@ -510,15 +544,14 @@ def main():
     print("\n" + "=" * 80)
     print("✓ PIPELINE COMPLETE!")
     print("=" * 80)
-    print(f"\nResults:")
+    print("\nResults:")
     print(f"  - LLM Baseline: {llm_results_path}")
-    print(f"  - GDN->KG: {gdn_kg_results_path}")
     if has_gdn_kg_llm:
-        print(f"  - GDN->KG->LLM: {gdn_kg_llm_results_path}")
-    if has_kag_v1:
-        print(f"  - KAG v1 (Heuristic): {kag_v1_results_path}")
+        print(f"  - Serialised KG->LLM: {gdn_kg_llm_results_path}")
     if has_kag_v2:
-        print(f"  - KAG v2 (LLM-planned): {kag_v2_results_path}")
+        print(f"  - KAG: {kag_v2_results_path}")
+    if has_rag:
+        print(f"  - RAG: {rag_results_path}")
     print(f"  - Comparison Report: {comparison_path}")
     print()
 

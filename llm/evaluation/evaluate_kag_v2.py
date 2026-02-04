@@ -1,7 +1,7 @@
 """
-Evaluate KAG Solver v2 (LLM-Planned Iterative Reasoning)
+Evaluate KAG (LLM-Planned Iterative Reasoning)
 
-Evaluates the LLM-planned KAG solver v2 on shared evaluation dataset.
+Evaluates the LLM-planned KAG solver on shared evaluation dataset.
 This solver uses LLM to generate logical form steps that are executed
 over the knowledge graph, enabling flexible, adaptive reasoning.
 
@@ -51,7 +51,7 @@ def evaluate_kag_v2(
     limit: Optional[int] = None,
 ) -> Dict[str, any]:
     """
-    Evaluate KAG Solver V2 (LLM-planned iterative reasoning).
+    Evaluate KAG (LLM-planned iterative reasoning).
 
     Args:
         dataset_path: Path to shared dataset (.npz file)
@@ -70,7 +70,7 @@ def evaluate_kag_v2(
         Dictionary with evaluation results
     """
     print("=" * 80)
-    print("Evaluating KAG Solver v2 (LLM-Planned Iterative Reasoning)")
+    print("Evaluating KAG (LLM-Planned Iterative Reasoning)")
     print("=" * 80)
     print(f"Dataset: {dataset_path}")
     print(f"GDN Model: {gdn_model_path}")
@@ -249,7 +249,7 @@ def evaluate_kag_v2(
         print(json.dumps(summary, indent=2))
 
     # Initialize solver
-    print("Initializing KAG Solver v2...")
+    print("Initializing KAG Solver...")
     solver = KAGIterativeSolver(
         kg_builder=kg_builder,
         neo4j_queries=queries,
@@ -263,9 +263,10 @@ def evaluate_kag_v2(
     print()
 
     # Process windows
-    print("Running KAG Solver v2 on windows...")
+    print("Running KAG Solver on windows...")
     window_labels_pred = []
-    sensor_labels_pred = []
+    sensor_labels_pred = []  # Filtered (root-only) predictions
+    sensor_labels_pred_raw = []  # Raw (all sensors) predictions
     fault_types_pred = []
     reasoning_traces = []
     processing_times = []
@@ -274,7 +275,7 @@ def evaluate_kag_v2(
 
     with tqdm(
         total=num_windows,
-        desc="KAG Solver v2",
+        desc="KAG Solver",
         unit="window",
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
         file=sys.stderr,
@@ -289,7 +290,11 @@ def evaluate_kag_v2(
                 result = solver.solve(window_idx)
 
                 window_labels_pred.append(result["window_label"])
-                sensor_labels_pred.append(result["sensor_labels"])
+                # Use root-only sensor labels for precision improvement
+                sensor_labels_filtered = result.get("sensor_labels", np.zeros(len(sensor_names), dtype=int))  # Root-only
+                sensor_labels_raw_val = result.get("sensor_labels_raw", sensor_labels_filtered.copy())  # All sensors
+                sensor_labels_pred.append(sensor_labels_filtered)  # Use filtered (root-only) for metrics
+                sensor_labels_pred_raw.append(sensor_labels_raw_val)  # Keep raw for analysis
                 fault_types_pred.append(result["fault_type"])
                 reasoning_traces.append(result["reasoning_trace"])
 
@@ -302,9 +307,9 @@ def evaluate_kag_v2(
                 pred_window_label = int(result["window_label"])
                 is_correct_window = true_window_label == pred_window_label
 
-                # Get sensor-level correctness
+                # Get sensor-level correctness (use filtered for tracking)
                 true_sensor_labels = sensor_labels_true[window_idx]
-                pred_sensor_labels = result["sensor_labels"]
+                pred_sensor_labels = sensor_labels_filtered
 
                 # Convert to sensor names
                 true_sensors = [
@@ -338,7 +343,9 @@ def evaluate_kag_v2(
 
                         traceback.print_exc()
                 window_labels_pred.append(0)
-                sensor_labels_pred.append(np.zeros(len(sensor_names), dtype=int))
+                empty_labels = np.zeros(len(sensor_names), dtype=int)
+                sensor_labels_pred.append(empty_labels)
+                sensor_labels_pred_raw.append(empty_labels.copy())
                 fault_types_pred.append(None)
                 reasoning_traces.append(
                     [{"step": 0, "operation": "error", "result": str(e)}]
@@ -395,10 +402,11 @@ def evaluate_kag_v2(
                             f"KAG Solver v2 (ETA: {eta_minutes}m{eta_secs}s)"
                         )
                     else:
-                        pbar.set_description("KAG Solver v2")
+                        pbar.set_description("KAG Solver")
 
     window_labels_pred = np.array(window_labels_pred)
-    sensor_labels_pred = np.array(sensor_labels_pred)
+    sensor_labels_pred = np.array(sensor_labels_pred)  # Filtered (root-only)
+    sensor_labels_pred_raw = np.array(sensor_labels_pred_raw)  # Raw (all sensors)
 
     avg_processing_time = np.mean(processing_times)
     total_processing_time = np.sum(processing_times)
@@ -429,16 +437,27 @@ def evaluate_kag_v2(
             window_labels_true_converted[i] = 0
     window_labels_true = window_labels_true_converted
 
-    # Compute metrics
+    # Compute metrics (using filtered root-only predictions for precision improvement)
     print("Computing evaluation metrics...")
     metrics = compute_all_metrics(
         y_true_window=window_labels_true,
         y_pred_window=window_labels_pred,
         y_true_sensor=sensor_labels_true,
-        y_pred_sensor=sensor_labels_pred,
+        y_pred_sensor=sensor_labels_pred,  # Use filtered (root-only) for main metrics
         sensor_names=sensor_names,
         fault_types=fault_types_true if fault_types_true is not None else None,
     )
+    
+    # Also compute raw metrics for comparison
+    metrics_raw = compute_all_metrics(
+        y_true_window=window_labels_true,
+        y_pred_window=window_labels_pred,
+        y_true_sensor=sensor_labels_true,
+        y_pred_sensor=sensor_labels_pred_raw,  # Use raw (all sensors) for comparison
+        sensor_names=sensor_names,
+        fault_types=fault_types_true if fault_types_true is not None else None,
+    )
+    metrics["sensor_level_raw"] = metrics_raw["sensor_level"]
 
     # Add efficiency metrics
     metrics["efficiency"] = {
@@ -480,7 +499,8 @@ def evaluate_kag_v2(
         "metrics": metrics,
         "predictions": {
             "window_labels": window_labels_pred.tolist(),
-            "sensor_labels": sensor_labels_pred.tolist(),
+            "sensor_labels": sensor_labels_pred.tolist(),  # Filtered (root-only)
+            "sensor_labels_raw": sensor_labels_pred_raw.tolist(),  # Raw (all sensors)
             "fault_types": fault_types_pred,
             "reasoning_traces": reasoning_traces[:10]
             if len(reasoning_traces) > 10
@@ -500,7 +520,7 @@ def evaluate_kag_v2(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate KAG Solver v2 (LLM-planned iterative reasoning) on shared evaluation dataset"
+        description="Evaluate KAG (LLM-planned iterative reasoning) on shared evaluation dataset"
     )
     parser.add_argument(
         "--dataset", type=str, required=True, help="Path to shared dataset .npz file"
