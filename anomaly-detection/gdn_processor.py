@@ -16,14 +16,14 @@ import matplotlib.pyplot as plt
 
 try:
     # Try relative import first (when used as a module)
-    from .models.gdn_model import MultiLabelGDN, ImprovedMultiLabelGDN, FastImprovedMultiLabelGDN, MetricLearningGDN
+    from .models.gdn_model import MultiLabelGDN, KAGOptimizedGDN
 except ImportError:
     # Fall back to absolute import (when run as a script)
     import sys
     from pathlib import Path
 
     sys.path.insert(0, str(Path(__file__).parent))
-    from models.gdn_model import MultiLabelGDN, ImprovedMultiLabelGDN, FastImprovedMultiLabelGDN, MetricLearningGDN
+    from models.gdn_model import MultiLabelGDN, KAGOptimizedGDN
 
 
 class GDNPredictor:
@@ -88,18 +88,27 @@ class GDNPredictor:
         checkpoint = torch.load(
             self.model_path, map_location=self.device, weights_only=False
         )
-        
+
         # Detect model type from checkpoint
+        # First check checkpoint metadata for model_type
+        model_type = None
+        if isinstance(checkpoint, dict):
+            model_type = checkpoint.get("model_type", None)
+
         # Check for MetricLearningGDN first (metric learning model)
         use_metric_learning = False
         use_fast_improved = False
         use_improved = False
+        use_kag_optimized = False
         num_gat_layers = 2  # Default for improved model
-        
+
         model_path_str = str(self.model_path).lower()
-        
+
+        # Check model_type from checkpoint first
+        if model_type == "kag_optimized":
+            use_kag_optimized = True
         # Check for MetricLearningGDN
-        if "metric_learning" in model_path_str or "metric" in model_path_str:
+        elif "metric_learning" in model_path_str or "metric" in model_path_str:
             use_metric_learning = True
         # Check for FastImprovedMultiLabelGDN (simplified)
         elif "fast_improved" in model_path_str or "fast" in model_path_str:
@@ -110,13 +119,45 @@ class GDNPredictor:
                 num_gat_layers = checkpoint["num_gat_layers"]
             elif "architecture_improved" in model_path_str:
                 use_improved = True
-        
+
         # Initialize model architecture
-        if use_metric_learning:
+        if use_kag_optimized:
+            # Get dimensions from checkpoint
+            embed_dim = (
+                checkpoint.get("embed_dim", self.embed_dim)
+                if isinstance(checkpoint, dict)
+                else self.embed_dim
+            )
+            hidden_dim = (
+                checkpoint.get("hidden_dim", self.hidden_dim)
+                if isinstance(checkpoint, dict)
+                else self.hidden_dim
+            )
+            top_k = (
+                checkpoint.get("top_k", self.top_k)
+                if isinstance(checkpoint, dict)
+                else self.top_k
+            )
+            self.model = KAGOptimizedGDN(
+                num_nodes=self.num_sensors,
+                window_size=self.window_size,
+                embed_dim=embed_dim,
+                top_k=top_k,
+                hidden_dim=hidden_dim,
+            ).to(self.device)
+        elif use_metric_learning:
             # MetricLearningGDN uses larger dimensions (128 default)
             # Detect from checkpoint if available
-            embed_dim = checkpoint.get("embed_dim", 128) if isinstance(checkpoint, dict) else 128
-            hidden_dim = checkpoint.get("hidden_dim", 128) if isinstance(checkpoint, dict) else 128
+            embed_dim = (
+                checkpoint.get("embed_dim", 128)
+                if isinstance(checkpoint, dict)
+                else 128
+            )
+            hidden_dim = (
+                checkpoint.get("hidden_dim", 128)
+                if isinstance(checkpoint, dict)
+                else 128
+            )
             self.model = MetricLearningGDN(
                 num_nodes=self.num_sensors,
                 window_size=self.window_size,
@@ -515,13 +556,27 @@ class GDNPredictor:
         sensor_embeddings = self.get_sensor_embeddings()
         adjacency_matrix = self.compute_adjacency_matrix()
 
+        # ========================================================================
+        # CRITICAL: All KG construction features are computed WITHOUT using labels
+        # ========================================================================
+        # Ground truth labels (sensor_labels, window_labels) are NEVER used in:
+        # - GDN predictions (anomaly scores)
+        # - Sensor embeddings
+        # - Adjacency matrix computation
+        # - Window embeddings
+        # - Distance calculations
+        # Labels are ONLY stored in the result dictionary for evaluation purposes.
+        # ========================================================================
+        
         # Always get GDN predictions (probabilities, not binary labels)
         # This is what the KG should use, not ground truth labels
+        # NOTE: self.predict() only uses X_windows, NOT sensor_labels or window_labels
         gdn_predictions = self.predict(
             X_windows, return_global=False, batch_size=batch_size
         )
 
         # Extract window embeddings and compute distances to center loss centers
+        # NOTE: get_corr_embedding() only uses X_windows, NOT labels
         window_embeddings = None
         distances_to_normal = None
         distances_to_anomalous = None
@@ -529,48 +584,75 @@ class GDNPredictor:
 
         try:
             # Extract embeddings using batch processing
-            window_embeddings = self.get_corr_embedding(X_windows, batch_size=batch_size)
-            
+            window_embeddings = self.get_corr_embedding(
+                X_windows, batch_size=batch_size
+            )
+
             # Get center loss centers if available
-            if hasattr(self, 'center_loss') and self.center_loss is not None:
+            if hasattr(self, "center_loss") and self.center_loss is not None:
                 # Centers are available from loaded center_loss
-                centers = self.center_loss.centers.detach().cpu().numpy()  # (2, hidden_dim)
+                centers = (
+                    self.center_loss.centers.detach().cpu().numpy()
+                )  # (2, hidden_dim)
                 center_normal = centers[0]  # Class 0: normal
                 center_anomalous = centers[1]  # Class 1: anomalous
                 center_embeddings = centers
-            elif hasattr(self, 'normal_center') and self.normal_center is not None:
+            elif hasattr(self, "normal_center") and self.normal_center is not None:
                 # Only normal center available, try to get anomalous from checkpoint
-                center_normal = self.normal_center.cpu().numpy() if hasattr(self.normal_center, 'cpu') else self.normal_center
+                center_normal = (
+                    self.normal_center.cpu().numpy()
+                    if hasattr(self.normal_center, "cpu")
+                    else self.normal_center
+                )
                 # Try to load anomalous center from checkpoint
                 try:
-                    checkpoint = torch.load(self.model_path, map_location='cpu')
-                    if 'center_loss_state_dict' in checkpoint:
+                    checkpoint = torch.load(self.model_path, map_location="cpu")
+                    if "center_loss_state_dict" in checkpoint:
                         # Load center loss temporarily to get centers
                         import importlib.util
-                        train_script_path = Path(__file__).parent / "train_gdn_separation.py"
+
+                        train_script_path = (
+                            Path(__file__).parent / "train_gdn_separation.py"
+                        )
                         if train_script_path.exists():
-                            spec = importlib.util.spec_from_file_location("train_gdn_separation", train_script_path)
+                            spec = importlib.util.spec_from_file_location(
+                                "train_gdn_separation", train_script_path
+                            )
                             train_module = importlib.util.module_from_spec(spec)
                             spec.loader.exec_module(train_module)
                             CenterLoss = train_module.CenterLoss
-                            temp_center_loss = CenterLoss(embed_dim=window_embeddings.shape[1], num_classes=2)
-                            temp_center_loss.load_state_dict(checkpoint['center_loss_state_dict'])
+                            temp_center_loss = CenterLoss(
+                                embed_dim=window_embeddings.shape[1], num_classes=2
+                            )
+                            temp_center_loss.load_state_dict(
+                                checkpoint["center_loss_state_dict"]
+                            )
                             centers = temp_center_loss.centers.detach().cpu().numpy()
                             center_normal = centers[0]
                             center_anomalous = centers[1]
                             center_embeddings = centers
                         else:
                             # Fallback: create dummy anomalous center
-                            center_anomalous = center_normal + np.ones_like(center_normal) * 0.3
-                            center_embeddings = np.stack([center_normal, center_anomalous], axis=0)
+                            center_anomalous = (
+                                center_normal + np.ones_like(center_normal) * 0.3
+                            )
+                            center_embeddings = np.stack(
+                                [center_normal, center_anomalous], axis=0
+                            )
                     else:
                         # No center loss in checkpoint, create dummy anomalous center
-                        center_anomalous = center_normal + np.ones_like(center_normal) * 0.3
-                        center_embeddings = np.stack([center_normal, center_anomalous], axis=0)
+                        center_anomalous = (
+                            center_normal + np.ones_like(center_normal) * 0.3
+                        )
+                        center_embeddings = np.stack(
+                            [center_normal, center_anomalous], axis=0
+                        )
                 except Exception:
                     # Fallback: create dummy anomalous center
                     center_anomalous = center_normal + np.ones_like(center_normal) * 0.3
-                    center_embeddings = np.stack([center_normal, center_anomalous], axis=0)
+                    center_embeddings = np.stack(
+                        [center_normal, center_anomalous], axis=0
+                    )
             else:
                 # No center loss available, skip embedding extraction
                 window_embeddings = None
@@ -593,7 +675,18 @@ class GDNPredictor:
             distances_to_anomalous = None
             center_embeddings = None
 
+        # ========================================================================
+        # LABEL PROCESSING (FOR EVALUATION ONLY - NOT USED IN KG CONSTRUCTION)
+        # ========================================================================
+        # The following code processes ground truth labels ONLY for bookkeeping.
+        # These labels are stored in the result dictionary for evaluation metrics
+        # but are NEVER used in any KG construction computations above.
+        # All KG features (predictions, embeddings, distances) are computed
+        # independently from X_windows only.
+        # ========================================================================
+        
         # Keep sensor_labels and window_labels for evaluation purposes (separate from KG construction)
+        # These are NOT used in any computations above - only stored for evaluation
         if sensor_labels is not None:
             if isinstance(sensor_labels, torch.Tensor):
                 sensor_labels = sensor_labels.cpu().numpy()
@@ -612,23 +705,27 @@ class GDNPredictor:
             # If not provided, derive from GDN predictions (for reference, not used in KG)
             window_labels = (gdn_predictions.max(axis=1) > 0.5).astype(np.int64)
 
+        # Build result dictionary
+        # NOTE: All features above (gdn_predictions, embeddings, etc.) were computed
+        # WITHOUT using sensor_labels or window_labels. Labels are included here
+        # ONLY for evaluation metrics computation, not for KG construction.
         result = {
             "sensor_names": self.sensor_names,
-            "sensor_embeddings": sensor_embeddings,
-            "adjacency_matrix": adjacency_matrix,
-            "X_windows": X_windows,
-            "gdn_predictions": gdn_predictions,  # GDN probabilities for KG construction
-            "sensor_labels": sensor_labels,  # Ground truth (for evaluation only)
-            "window_labels": window_labels,  # Ground truth (for evaluation only)
+            "sensor_embeddings": sensor_embeddings,  # Computed from model weights only
+            "adjacency_matrix": adjacency_matrix,  # Computed from model weights only
+            "X_windows": X_windows,  # Input data only
+            "gdn_predictions": gdn_predictions,  # GDN probabilities (computed from X_windows only, NOT labels)
+            "sensor_labels": sensor_labels,  # Ground truth (for evaluation ONLY - never used in KG)
+            "window_labels": window_labels,  # Ground truth (for evaluation ONLY - never used in KG)
         }
-        
+
         # Add embedding data if available
         if window_embeddings is not None:
             result["window_embeddings"] = window_embeddings
             result["distances_to_normal"] = distances_to_normal
             result["distances_to_anomalous"] = distances_to_anomalous
             result["center_embeddings"] = center_embeddings
-        
+
         return result
 
     def analyze_topk_correlations(
