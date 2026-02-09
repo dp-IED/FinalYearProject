@@ -23,9 +23,9 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root / 'anomaly-detection'))
 sys.path.insert(0, str(project_root))
 
-from gdn_processor import GDNPredictor
-from llm.helpers.KG import KnowledgeGraphBuilder
-from metrics import compute_all_metrics, format_metrics_report
+from llm.gdn_processor import GDNPredictor
+from kg.create_kg import KnowledgeGraph
+from llm.evaluation.metrics import compute_all_metrics, format_metrics_report
 
 
 def sensor_labels_to_window_label(sensor_labels: np.ndarray) -> int:
@@ -47,14 +47,14 @@ def sensor_labels_to_window_label(sensor_labels: np.ndarray) -> int:
 
 
 def extract_predictions_from_kg(
-    kg_builder: KnowledgeGraphBuilder,
+    kg: KnowledgeGraph,
     threshold: float = 0.5
 ) -> Dict[str, np.ndarray]:
     """
     Extract fault predictions from Knowledge Graph.
     
     Args:
-        kg_builder: KnowledgeGraphBuilder instance with built KG
+        kg: KnowledgeGraph instance with built KG
         threshold: Threshold for anomaly scores
         
     Returns:
@@ -63,21 +63,21 @@ def extract_predictions_from_kg(
         - 'sensor_labels': (N, num_sensors) binary array
         - 'fault_types': (N,) list of fault type strings
     """
-    num_windows = len(kg_builder.window_graphs)
-    num_sensors = len(kg_builder.sensor_names)
+    num_windows = len(kg.window_graphs)
+    num_sensors = len(kg.sensor_names)
     
     window_labels = np.zeros(num_windows, dtype=np.int64)
     sensor_labels = np.zeros((num_windows, num_sensors), dtype=np.float32)
     fault_types = []
     
-    for window_idx in sorted(kg_builder.window_graphs.keys()):
-        stats = kg_builder.window_stats.get(window_idx, {})
-        graph = kg_builder.window_graphs[window_idx]
+    for window_idx in sorted(kg.window_graphs.keys()):
+        stats = kg.window_stats.get(window_idx, {})
+        graph = kg.window_graphs[window_idx]
         
         # Extract faulty sensors from window stats
         faulty_sensors_in_window = []
         for sensor_name, stat in stats.items():
-            sensor_idx = kg_builder.sensor_to_idx.get(sensor_name, -1)
+            sensor_idx = kg.sensor_to_idx.get(sensor_name, -1)
             if sensor_idx >= 0:
                 # Use anomaly_score from stats
                 if stat.anomaly_score > threshold:
@@ -97,7 +97,7 @@ def extract_predictions_from_kg(
                     violations.append((u, v))
             
             # Infer fault type from violations and faulty sensors
-            faulty_sensor_names = [kg_builder.sensor_names[i] for i in range(num_sensors) 
+            faulty_sensor_names = [kg.sensor_names[i] for i in range(num_sensors) 
                                   if sensor_labels[window_idx, i] > 0]
             
             if 'VEHICLE_SPEED ()' in faulty_sensor_names:
@@ -241,7 +241,7 @@ def evaluate_gdn_kg(
     start_time = time.time()
     
     with tqdm(total=1, desc="KG Construction", unit="step") as pbar:
-        kg_builder = KnowledgeGraphBuilder(
+        kg = KnowledgeGraph(
             sensor_names=kg_data['sensor_names'],
             sensor_embeddings=kg_data['sensor_embeddings'],
             adjacency_matrix=kg_data['adjacency_matrix']
@@ -249,7 +249,7 @@ def evaluate_gdn_kg(
         pbar.update(0.5)
         
         # Use GDN predictions (not ground truth) for KG construction
-        kg = kg_builder.build_from_gdn_windows(
+        kg.construct(
             X_windows=kg_data['X_windows'],
             gdn_predictions=kg_data['gdn_predictions']  # GDN predictions, not ground truth labels
         )
@@ -257,7 +257,7 @@ def evaluate_gdn_kg(
     
     kg_time = time.time() - start_time
     print(f"  Knowledge Graph built in {kg_time:.2f} seconds")
-    print(f"  Nodes: {kg.number_of_nodes()}, Edges: {kg.number_of_edges()}")
+    print(f"  Nodes: {kg.kg.number_of_nodes()}, Edges: {kg.kg.number_of_edges()}")
     print()
     
     # Extract predictions from KG
@@ -265,7 +265,7 @@ def evaluate_gdn_kg(
     start_time = time.time()
     
     with tqdm(total=1, desc="Prediction Extraction", unit="step") as pbar:
-        predictions = extract_predictions_from_kg(kg_builder, threshold=0.5)
+        predictions = extract_predictions_from_kg(kg, threshold=0.5)
         pbar.update(1)
     
     extraction_time = time.time() - start_time
@@ -322,8 +322,29 @@ def evaluate_gdn_kg(
         with open(output_path, 'w') as f:
             json.dump(results, f, indent=2)
         print(f"\n✓ Results saved to: {output_path}")
+        # Also write gnn_metrics.md (one-row table) for GNN model metrics report
+        _write_gnn_metrics_md(output_path.parent, results)
     
     return results
+
+
+def _write_gnn_metrics_md(results_dir: Path, results: Dict) -> None:
+    """Write gnn_metrics.md: one-row markdown table of metrics (loop-built)."""
+    metrics = results.get('metrics', {})
+    row = {'method': 'GNN', 'num_windows': results.get('num_windows')}
+    for section in ('window_level', 'sensor_level', 'efficiency'):
+        for k, v in metrics.get(section, {}).items():
+            if isinstance(v, (int, float)):
+                row[k] = v
+    columns = list(row.keys())
+    lines = [
+        '| ' + ' | '.join(columns) + ' |',
+        '| ' + ' | '.join('---' for _ in columns) + ' |',
+        '| ' + ' | '.join(str(row[c]) if not isinstance(row[c], float) else f'{row[c]:.4f}' for c in columns) + ' |',
+    ]
+    md_path = results_dir / 'gnn_metrics.md'
+    md_path.write_text('\n'.join(lines), encoding='utf-8')
+    print(f"✓ GNN metrics table saved to: {md_path}")
 
 
 def main():

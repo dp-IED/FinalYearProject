@@ -31,7 +31,7 @@ sys.path.insert(0, str(project_root / "anomaly-detection"))
 
 from llm.kag.neo4j_queries import Neo4jKAGQueries
 from llm.kag.solver_v2 import KAGIterativeSolver
-from llm.helpers.KG import KnowledgeGraphBuilder
+from kg.create_kg import KnowledgeGraph
 from llm.evaluation.evaluate_llm_baseline import load_llm_model
 from llm.evaluation.metrics import compute_all_metrics, format_metrics_report
 from llm.evaluation.tool_tracker import ToolTracker
@@ -153,7 +153,7 @@ def evaluate_kag_v2(
     # Get sensor embeddings from checkpoint
     sensor_embeddings = checkpoint.get("sensor_embeddings")
 
-    # If not in checkpoint, create dummy arrays (kg_builder is not used for queries anyway)
+    # If not in checkpoint, create dummy arrays (kg is not used for queries anyway)
     if sensor_embeddings is None:
         num_sensors = len(sensor_names)
         embed_dim = checkpoint.get("embed_dim", 32)
@@ -195,18 +195,18 @@ def evaluate_kag_v2(
     print(f"  ✓ Checkpoint loaded in {checkpoint_load_time:.2f} seconds")
     print()
 
-    # Create minimal kg_builder (not used for queries, but required by solver interface)
+    # Create minimal kg (not used for queries, but required by solver interface)
     # All queries go through Neo4j, which is already loaded by create_shared_dataset.py
-    print("Creating minimal KG builder (queries use Neo4j)...")
+    print("Creating minimal KG (queries use Neo4j)...")
     kg_build_start = time.time()
 
-    kg_builder = KnowledgeGraphBuilder(
+    kg = KnowledgeGraph(
         sensor_names=sensor_names,
         sensor_embeddings=sensor_embeddings,
         adjacency_matrix=adjacency_matrix,
     )
     kg_time = time.time() - kg_build_start
-    print(f"  ✓ KG builder created (using Neo4j for all queries) in {kg_time:.2f} seconds")
+    print(f"  ✓ KG created (using Neo4j for all queries) in {kg_time:.2f} seconds")
     print()
     
     # Set gdn_time to 0 since we're not processing through GDN (using Neo4j instead)
@@ -251,7 +251,7 @@ def evaluate_kag_v2(
     # Initialize solver
     print("Initializing KAG Solver...")
     solver = KAGIterativeSolver(
-        kg_builder=kg_builder,
+        kg=kg,
         neo4j_queries=queries,
         sensor_names=sensor_names,
         model=model,

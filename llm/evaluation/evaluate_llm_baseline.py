@@ -509,6 +509,7 @@ def call_llm(
             max_tokens=max_tokens,
             temperature=temperature,
             repetition_penalty=repetition_penalty,
+            repetition_context_size=repetition_context_size,
         )
     else:
         # Fallback for MLX (if still needed)
