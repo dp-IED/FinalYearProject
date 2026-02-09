@@ -130,6 +130,9 @@ class LMInference:
         # Add any additional parameters that LM Studio supports
         if "repetition_penalty" in kwargs:
             payload["repetition_penalty"] = kwargs["repetition_penalty"]
+        if "repetition_context_size" in kwargs:
+            # LM Studio / llama.cpp often use repeat_penalty_last_n for this
+            payload["repeat_penalty_last_n"] = kwargs["repetition_context_size"]
         if "top_p" in kwargs:
             payload["top_p"] = kwargs["top_p"]
         if "top_k" in kwargs:
@@ -150,6 +153,19 @@ class LMInference:
                 result = response.json()
                 return result["choices"][0]["message"]["content"]
                 
+        except requests.exceptions.HTTPError as e:
+            # Get more details about the error
+            error_details = ""
+            try:
+                error_response = e.response.json()
+                error_details = f" Response: {error_response}"
+            except:
+                error_details = f" Response text: {e.response.text[:200]}"
+            raise RuntimeError(
+                f"Failed to connect to LM Studio at {self.base_url}. "
+                f"Make sure LM Studio is running with the HTTP server enabled and the model '{self.model_name}' is loaded. "
+                f"Error: {e}{error_details}"
+            )
         except requests.exceptions.RequestException as e:
             raise RuntimeError(
                 f"Failed to connect to LM Studio at {self.base_url}. "
