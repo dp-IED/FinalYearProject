@@ -396,6 +396,8 @@ class KnowledgeGraphBuilder:
         self.temporal_edges = []  # Temporal edges between windows
         self.anomaly_propagation_chains = []  # Fault propagation chains
         self.window_embeddings = {}  # Per-window embedding data
+        self.window_stage2_features = {}  # Per-window Stage 2 features (embedding distances)
+        self.distribution_thresholds = None  # Distribution-based thresholds (computed after processing)
         
         # Store raw window data for Layer 3 (time-series access)
         self.X_windows = None  # Normalized windows (N, 300, 8)
@@ -421,7 +423,10 @@ class KnowledgeGraphBuilder:
             )
     
     def build_from_gdn_windows(self, X_windows: np.ndarray, gdn_predictions: np.ndarray,
-                                X_windows_unnormalized: Optional[np.ndarray] = None) -> nx.MultiDiGraph:
+                                X_windows_unnormalized: Optional[np.ndarray] = None,
+                                stage2_features: Optional[Dict[int, Dict[str, float]]] = None,
+                                sensor_labels_true: Optional[np.ndarray] = None,
+                                window_labels_true: Optional[np.ndarray] = None) -> nx.MultiDiGraph:
         """
         Main entry point: Build KG by traversing windows temporally.
         
@@ -433,6 +438,7 @@ class KnowledgeGraphBuilder:
             X_windows: (num_windows, 300, 8) array - normalized sensor data windows
             gdn_predictions: (num_windows, 8) array - GDN anomaly scores (0.0-1.0) per sensor per window
             X_windows_unnormalized: (num_windows, 300, 8) array - unnormalized sensor data windows (optional)
+            stage2_features: Optional dict mapping window_idx to Stage 2 features (embedding distances)
             
         Returns:
             Knowledge graph with temporal traversal
@@ -443,21 +449,265 @@ class KnowledgeGraphBuilder:
         self.X_windows = X_windows
         self.X_windows_unnormalized = X_windows_unnormalized
         
-        # Traverse windows sequentially
+        # Store Stage 2 features if provided
+        self.window_stage2_features = stage2_features if stage2_features else {}
+        
+        # First pass: Process all windows to collect statistics
         for window_idx in range(num_windows):
             window_data = X_windows[window_idx]  # (300, 8)
             window_gdn_scores = gdn_predictions[window_idx]  # (8,) - GDN predictions for this window
             
-            self._process_window(window_idx, window_data, window_gdn_scores)
+            window_stage2 = self.window_stage2_features.get(window_idx, {})
+            self._process_window(window_idx, window_data, window_gdn_scores, window_stage2)
             
             if window_idx > 0:
                 self._build_temporal_edges(window_idx - 1, window_idx, 
                                          X_windows[window_idx - 1], window_data,
                                          gdn_predictions[window_idx - 1], window_gdn_scores)
         
+        # Compute distribution-based thresholds after processing all windows
+        # Use data-driven thresholds if ground truth available, otherwise percentile-based
+        self.distribution_thresholds = self.compute_distribution_based_thresholds(
+            gdn_predictions=gdn_predictions,
+            sensor_labels_true=sensor_labels_true,
+            window_labels_true=window_labels_true
+        )
+        
+        # Second pass: Re-process edges with distribution-based thresholds
+        for window_idx in range(num_windows):
+            window_data = X_windows[window_idx]
+            window_gdn_scores = gdn_predictions[window_idx]
+            window_stage2 = self.window_stage2_features.get(window_idx, {})
+            self._update_edges_with_distribution_thresholds(window_idx, window_data, window_gdn_scores, window_stage2)
+        
         self._track_anomaly_propagation(gdn_predictions)
         
         return self.kg
+    
+    def compute_data_driven_thresholds(self, gdn_predictions: np.ndarray,
+                                     sensor_labels_true: Optional[np.ndarray] = None,
+                                     window_labels_true: Optional[np.ndarray] = None) -> Dict[str, any]:
+        """
+        Compute data-driven thresholds using ground truth labels to find optimal separation.
+        
+        Uses ROC/PR curves to find thresholds that maximize F1 score, providing clear
+        normal vs anomalous ranges for LLM context.
+        
+        Args:
+            gdn_predictions: (num_windows, num_sensors) GDN anomaly scores
+            sensor_labels_true: (num_windows, num_sensors) Ground truth sensor labels (optional)
+            window_labels_true: (num_windows,) Ground truth window labels (optional)
+        
+        Returns:
+            Dictionary with optimal thresholds and confidence ranges
+        """
+        from sklearn.metrics import precision_recall_curve, roc_curve, f1_score
+        
+        thresholds = {
+            'anomaly_threshold_global': 0.5,
+            'anomaly_threshold_per_sensor': {},
+            'deviation_threshold': 0.3,
+            'normal_range': {'min': 0.0, 'max': 0.5, 'p95': 0.5},
+            'anomalous_range': {'min': 0.5, 'max': 1.0, 'p5': 0.5},
+            'confidence_intervals': {}
+        }
+        
+        # If ground truth available, compute optimal thresholds
+        if sensor_labels_true is not None and len(sensor_labels_true) > 0:
+            # Per-sensor optimal thresholds using F1-optimal
+            for sensor_idx, sensor_name in enumerate(self.sensor_names):
+                sensor_scores = gdn_predictions[:, sensor_idx]
+                sensor_labels = sensor_labels_true[:, sensor_idx]
+                
+                # Skip if no positive examples
+                if sensor_labels.sum() == 0:
+                    thresholds['anomaly_threshold_per_sensor'][sensor_name] = 0.5
+                    continue
+                
+                # Find F1-optimal threshold
+                try:
+                    precisions, recalls, thresh = precision_recall_curve(sensor_labels, sensor_scores)
+                    f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-8)
+                    best_idx = np.argmax(f1_scores)
+                    optimal_threshold = thresh[best_idx] if best_idx < len(thresh) else np.median(sensor_scores)
+                    
+                    # Compute normal and anomalous ranges
+                    normal_mask = sensor_labels == 0
+                    anomalous_mask = sensor_labels == 1
+                    
+                    if normal_mask.sum() > 0:
+                        normal_scores = sensor_scores[normal_mask]
+                        normal_p95 = float(np.percentile(normal_scores, 95))
+                        normal_max = float(np.max(normal_scores))
+                    else:
+                        normal_p95 = 0.5
+                        normal_max = 0.5
+                    
+                    if anomalous_mask.sum() > 0:
+                        anomalous_scores = sensor_scores[anomalous_mask]
+                        anomalous_p5 = float(np.percentile(anomalous_scores, 5))
+                        anomalous_min = float(np.min(anomalous_scores))
+                    else:
+                        anomalous_p5 = 0.5
+                        anomalous_min = 0.5
+                    
+                    thresholds['anomaly_threshold_per_sensor'][sensor_name] = float(optimal_threshold)
+                    thresholds['confidence_intervals'][sensor_name] = {
+                        'normal_range': {'p95': normal_p95, 'max': normal_max},
+                        'anomalous_range': {'p5': anomalous_p5, 'min': anomalous_min},
+                        'optimal_threshold': float(optimal_threshold),
+                        'separation': float(anomalous_p5 - normal_p95)  # Gap between normal p95 and anomalous p5
+                    }
+                except Exception:
+                    thresholds['anomaly_threshold_per_sensor'][sensor_name] = 0.5
+            
+            # Global optimal threshold (window-level)
+            if window_labels_true is not None and len(window_labels_true) > 0:
+                # Use max score per window as window-level anomaly score
+                window_scores = np.max(gdn_predictions, axis=1)
+                window_labels = (window_labels_true > 0).astype(int)  # Binary: 0=normal, 1=faulty
+                
+                if window_labels.sum() > 0:
+                    try:
+                        precisions, recalls, thresh = precision_recall_curve(window_labels, window_scores)
+                        f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-8)
+                        best_idx = np.argmax(f1_scores)
+                        optimal_threshold = thresh[best_idx] if best_idx < len(thresh) else np.median(window_scores)
+                        
+                        normal_mask = window_labels == 0
+                        anomalous_mask = window_labels == 1
+                        
+                        if normal_mask.sum() > 0:
+                            normal_scores = window_scores[normal_mask]
+                            thresholds['normal_range'] = {
+                                'min': float(np.min(normal_scores)),
+                                'max': float(np.max(normal_scores)),
+                                'p95': float(np.percentile(normal_scores, 95)),
+                                'mean': float(np.mean(normal_scores))
+                            }
+                        
+                        if anomalous_mask.sum() > 0:
+                            anomalous_scores = window_scores[anomalous_mask]
+                            thresholds['anomalous_range'] = {
+                                'min': float(np.min(anomalous_scores)),
+                                'max': float(np.max(anomalous_scores)),
+                                'p5': float(np.percentile(anomalous_scores, 5)),
+                                'mean': float(np.mean(anomalous_scores))
+                            }
+                        
+                        thresholds['anomaly_threshold_global'] = float(optimal_threshold)
+                    except Exception:
+                        pass
+        
+        return thresholds
+    
+    def compute_distribution_based_thresholds(self, anomaly_percentile: float = 95.0, 
+                                             deviation_percentile: float = 90.0,
+                                             gdn_predictions: Optional[np.ndarray] = None,
+                                             sensor_labels_true: Optional[np.ndarray] = None,
+                                             window_labels_true: Optional[np.ndarray] = None) -> Dict[str, any]:
+        """
+        Compute thresholds based on the actual distribution of GDN predictions.
+        If ground truth labels are provided, uses data-driven optimal thresholds.
+        Otherwise, uses percentile-based thresholds.
+        
+        Args:
+            anomaly_percentile: Percentile for anomaly score threshold (default: 95th)
+            deviation_percentile: Percentile for deviation threshold (default: 90th)
+            gdn_predictions: Optional (num_windows, num_sensors) GDN predictions for data-driven thresholds
+            sensor_labels_true: Optional (num_windows, num_sensors) Ground truth labels
+            window_labels_true: Optional (num_windows,) Ground truth window labels
+        
+        Returns:
+            Dictionary with computed thresholds and statistics
+        """
+        # If ground truth available, use data-driven thresholds
+        if (gdn_predictions is not None and 
+            sensor_labels_true is not None and 
+            len(sensor_labels_true) > 0):
+            data_driven = self.compute_data_driven_thresholds(
+                gdn_predictions, sensor_labels_true, window_labels_true
+            )
+            # Merge with distribution-based thresholds for deviations
+            distribution = self._compute_percentile_thresholds(anomaly_percentile, deviation_percentile)
+            # Use data-driven for anomalies, distribution for deviations
+            return {
+                **data_driven,
+                'deviation_threshold': distribution['deviation_threshold'],
+                'deviation_p50': distribution['deviation_p50'],
+                'deviation_p95': distribution['deviation_p95'],
+                'deviation_mean': distribution['deviation_mean'],
+                'deviation_std': distribution['deviation_std'],
+            }
+        
+        # Otherwise, use percentile-based thresholds
+        return self._compute_percentile_thresholds(anomaly_percentile, deviation_percentile)
+    
+    def _compute_percentile_thresholds(self, anomaly_percentile: float = 95.0,
+                                       deviation_percentile: float = 90.0) -> Dict[str, any]:
+        """
+        Compute percentile-based thresholds from collected statistics.
+        """
+        # Collect all anomaly scores across all windows and sensors
+        all_anomaly_scores = []
+        per_sensor_scores = {sensor_name: [] for sensor_name in self.sensor_names}
+        all_deviations = []
+        
+        for window_idx, window_stats in self.window_stats.items():
+            for sensor_name, stats in window_stats.items():
+                score = stats.anomaly_score
+                all_anomaly_scores.append(score)
+                per_sensor_scores[sensor_name].append(score)
+        
+        # Collect all deviations from GDN expectations
+        for window_idx, graph in self.window_graphs.items():
+            for u, v, data in graph.edges(data=True):
+                deviation = data.get('deviation_from_gdn', 0)
+                if deviation > 0:  # Only non-zero deviations
+                    all_deviations.append(deviation)
+        
+        # Compute percentile-based thresholds
+        if len(all_anomaly_scores) > 0:
+            anomaly_threshold_global = float(np.percentile(all_anomaly_scores, anomaly_percentile))
+            anomaly_p50 = float(np.percentile(all_anomaly_scores, 50))
+            anomaly_p95 = float(np.percentile(all_anomaly_scores, 95))
+        else:
+            anomaly_threshold_global = 0.5
+            anomaly_p50 = 0.5
+            anomaly_p95 = 0.5
+        
+        # Per-sensor thresholds (GDN+ approach)
+        anomaly_threshold_per_sensor = {}
+        for sensor_name in self.sensor_names:
+            if len(per_sensor_scores[sensor_name]) > 0:
+                anomaly_threshold_per_sensor[sensor_name] = float(
+                    np.percentile(per_sensor_scores[sensor_name], anomaly_percentile)
+                )
+            else:
+                anomaly_threshold_per_sensor[sensor_name] = anomaly_threshold_global
+        
+        if len(all_deviations) > 0:
+            deviation_threshold = float(np.percentile(all_deviations, deviation_percentile))
+            deviation_p50 = float(np.percentile(all_deviations, 50))
+            deviation_p95 = float(np.percentile(all_deviations, 95))
+        else:
+            deviation_threshold = 0.3
+            deviation_p50 = 0.3
+            deviation_p95 = 0.3
+        
+        return {
+            'anomaly_threshold_global': anomaly_threshold_global,
+            'anomaly_threshold_per_sensor': anomaly_threshold_per_sensor,
+            'deviation_threshold': deviation_threshold,
+            'anomaly_p50': anomaly_p50,
+            'anomaly_p95': anomaly_p95,
+            'anomaly_mean': float(np.mean(all_anomaly_scores)) if all_anomaly_scores else 0.0,
+            'anomaly_std': float(np.std(all_anomaly_scores)) if all_anomaly_scores else 0.0,
+            'deviation_p50': deviation_p50,
+            'deviation_p95': deviation_p95,
+            'deviation_mean': float(np.mean(all_deviations)) if all_deviations else 0.0,
+            'deviation_std': float(np.std(all_deviations)) if all_deviations else 0.0,
+        }
     
     def store_window_embeddings(
         self,
@@ -488,7 +738,7 @@ class KnowledgeGraphBuilder:
         }
     
     def _process_window(self, window_idx: int, window_data: np.ndarray,
-                       gdn_scores: np.ndarray):
+                       gdn_scores: np.ndarray, stage2_features: Optional[Dict[str, float]] = None):
         """
         Process a single window using GDN predictions, not ground truth labels.
         
@@ -501,6 +751,7 @@ class KnowledgeGraphBuilder:
             window_idx: Index of the window
             window_data: (300, 8) array - normalized sensor data for this window
             gdn_scores: (8,) array - GDN anomaly prediction scores (0.0-1.0) per sensor
+            stage2_features: Optional dict with Stage 2 features (embedding distances) for this window
         """
         window_stats = {}
         for sensor_idx, sensor_name in enumerate(self.sensor_names):
@@ -545,9 +796,18 @@ class KnowledgeGraphBuilder:
         
         window_graph = nx.Graph()
         
-        # Use prediction threshold (0.5) to determine if sensor is likely anomalous
-        prediction_threshold = 0.5
+        # Use distribution-based threshold if available, otherwise fallback to 0.5
+        if hasattr(self, 'distribution_thresholds') and self.distribution_thresholds:
+            thresholds = self.distribution_thresholds
+            anomaly_threshold_per_sensor = thresholds.get('anomaly_threshold_per_sensor', {})
+            anomaly_threshold_global = thresholds.get('anomaly_threshold_global', 0.5)
+        else:
+            anomaly_threshold_per_sensor = {}
+            anomaly_threshold_global = 0.5
+        
         for sensor_name, stats in window_stats.items():
+            # Use per-sensor threshold if available, otherwise global
+            threshold = anomaly_threshold_per_sensor.get(sensor_name, anomaly_threshold_global)
             window_graph.add_node(
                 sensor_name,
                 window_idx=window_idx,
@@ -556,8 +816,17 @@ class KnowledgeGraphBuilder:
                 min=stats.min,
                 max=stats.max,
                 variation_from_normal=stats.variation_from_normal,
-                is_faulty=bool(stats.anomaly_score > prediction_threshold)  # Based on GDN prediction threshold
+                is_faulty=bool(stats.anomaly_score > threshold)  # Distribution-based threshold
             )
+        
+        # Get thresholds for edge inference
+        if hasattr(self, 'distribution_thresholds') and self.distribution_thresholds:
+            thresholds = self.distribution_thresholds
+            anomaly_threshold = thresholds.get('anomaly_threshold_global', 0.5)
+            deviation_threshold = thresholds.get('deviation_threshold', 0.3)
+        else:
+            anomaly_threshold = 0.5
+            deviation_threshold = 0.3
         
         for i, sensor_i in enumerate(self.sensor_names):
             for j, sensor_j in enumerate(self.sensor_names):
@@ -570,7 +839,10 @@ class KnowledgeGraphBuilder:
                 
                 edge_type, edge_attrs = self._infer_semantic_edge(
                     sensor_i, sensor_j, window_corr, expected_corr, 
-                    window_stats[sensor_i], window_stats[sensor_j]
+                    window_stats[sensor_i], window_stats[sensor_j],
+                    anomaly_threshold=anomaly_threshold,
+                    deviation_threshold=deviation_threshold,
+                    stage2_features=stage2_features
                 )
                 
                 if edge_type:
@@ -594,7 +866,10 @@ class KnowledgeGraphBuilder:
     
     def _infer_semantic_edge(self, sensor_i: str, sensor_j: str, 
                             window_corr: float, expected_corr_gdn: float,
-                            stats_i: WindowStats, stats_j: WindowStats) -> Tuple[Optional[str], Dict]:
+                            stats_i: WindowStats, stats_j: WindowStats,
+                            anomaly_threshold: float = 0.5,
+                            deviation_threshold: float = 0.3,
+                            stage2_features: Optional[Dict[str, float]] = None) -> Tuple[Optional[str], Dict]:
         """
         Create edges based on observed correlations with semantic labels.
         
@@ -614,6 +889,9 @@ class KnowledgeGraphBuilder:
             expected_corr_gdn: GDN-learned expected correlation from adjacency matrix
             stats_i: WindowStats for source sensor
             stats_j: WindowStats for target sensor
+            anomaly_threshold: Distribution-based anomaly threshold (default: 0.5)
+            deviation_threshold: Distribution-based deviation threshold (default: 0.3)
+            stage2_features: Optional dict with Stage 2 features (embedding distances)
         
         Returns:
             (edge_type, edge_attributes) or (None, {}) if no edge should be created
@@ -676,26 +954,52 @@ class KnowledgeGraphBuilder:
             # No domain knowledge for this pair
             edge_attrs['violates_domain_expectation'] = False
         
-        # ===== STEP 3: Add GDN model expectation =====
+        # ===== STEP 3: Add GDN model expectation with distribution-based thresholds =====
         deviation_from_gdn = abs(window_corr - expected_corr_gdn)
         edge_attrs['expected_correlation_gdn'] = float(expected_corr_gdn)
         edge_attrs['deviation_from_gdn'] = float(deviation_from_gdn)
         
-        # Flag if GDN expected different pattern
-        gdn_violation_threshold = 0.3
-        if deviation_from_gdn > gdn_violation_threshold:
+        # Use Stage 2 features to adjust violation confidence
+        violation_confidence = 0.0
+        if stage2_features:
+            embedding_distance_normal = stage2_features.get('embedding_distance_normal')
+            if embedding_distance_normal is not None:
+                # Normalize distance (typical separation is 0.3-0.5)
+                typical_separation = 0.4
+                distance_factor = min(embedding_distance_normal / typical_separation, 2.0)  # Cap at 2.0
+                violation_confidence += distance_factor * 0.4
+        
+        # Adaptive threshold adjustment
+        # If GDN says anomalous, be more sensitive
+        gdn_says_anomalous = (stats_i.anomaly_score > anomaly_threshold or 
+                             stats_j.anomaly_score > anomaly_threshold)
+        
+        if gdn_says_anomalous:
+            # More sensitive when GDN detects anomaly
+            effective_deviation_threshold = deviation_threshold * 0.7
+        else:
+            # More conservative when GDN says normal
+            effective_deviation_threshold = deviation_threshold * 1.3
+        
+        # Adjust threshold based on Stage 2 features (high distance = stronger signal)
+        if violation_confidence > 0.5:
+            effective_deviation_threshold *= (1.0 - violation_confidence * 0.3)
+        
+        if deviation_from_gdn > effective_deviation_threshold:
             edge_attrs['violates_gdn_expectation'] = True
         else:
             edge_attrs['violates_gdn_expectation'] = False
+        
+        edge_attrs['violation_confidence'] = float(violation_confidence)
         
         # ===== STEP 4: Add GDN anomaly context =====
         edge_attrs['gdn_score_source'] = float(stats_i.anomaly_score)
         edge_attrs['gdn_score_target'] = float(stats_j.anomaly_score)
         
-        # High GDN scores + violation = strong fault evidence (but don't label as "supports_fault")
+        # High GDN scores + violation = strong fault evidence (using distribution-based threshold)
         if (edge_attrs.get('violates_domain_expectation', False) or 
             edge_attrs.get('violates_gdn_expectation', False)):
-            if stats_i.anomaly_score > 0.5 or stats_j.anomaly_score > 0.5:
+            if stats_i.anomaly_score > anomaly_threshold or stats_j.anomaly_score > anomaly_threshold:
                 edge_attrs['potential_fault_indicator'] = True
             else:
                 edge_attrs['potential_fault_indicator'] = False
@@ -704,6 +1008,112 @@ class KnowledgeGraphBuilder:
         
         edge_attrs['edge_type'] = edge_type
         return edge_type, edge_attrs
+    
+    def _update_edges_with_distribution_thresholds(self, window_idx: int, 
+                                                   window_data: np.ndarray, 
+                                                   gdn_scores: np.ndarray,
+                                                   stage2_features: Optional[Dict[str, float]] = None):
+        """
+        Update edge violation flags using distribution-based thresholds.
+        Re-processes edges after thresholds have been computed.
+        
+        Args:
+            window_idx: Index of the window
+            window_data: (300, 8) array - normalized sensor data
+            gdn_scores: (8,) array - GDN anomaly scores
+            stage2_features: Optional dict with Stage 2 features for this window
+        """
+        if window_idx not in self.window_graphs:
+            return
+        
+        graph = self.window_graphs[window_idx]
+        window_stats = self.window_stats.get(window_idx, {})
+        thresholds = self.distribution_thresholds
+        
+        anomaly_threshold = thresholds.get('anomaly_threshold_global', 0.5)
+        deviation_threshold = thresholds.get('deviation_threshold', 0.3)
+        
+        # Update edges with correct thresholds
+        correlation_matrix = np.corrcoef(window_data.T)
+        
+        for i, sensor_i in enumerate(self.sensor_names):
+            for j, sensor_j in enumerate(self.sensor_names):
+                if i >= j:
+                    continue
+                
+                if not graph.has_edge(sensor_i, sensor_j):
+                    continue
+                
+                window_corr = correlation_matrix[i, j]
+                expected_corr_gdn = self.adjacency_matrix[i, j]
+                stats_i = window_stats.get(sensor_i)
+                stats_j = window_stats.get(sensor_j)
+                
+                if stats_i is None or stats_j is None:
+                    continue
+                
+                # Recompute violation with distribution-based threshold
+                deviation_from_gdn = abs(window_corr - expected_corr_gdn)
+                
+                # Use Stage 2 features for violation confidence
+                violation_confidence = 0.0
+                if stage2_features:
+                    embedding_distance_normal = stage2_features.get('embedding_distance_normal')
+                    if embedding_distance_normal is not None:
+                        typical_separation = 0.4
+                        distance_factor = min(embedding_distance_normal / typical_separation, 2.0)
+                        violation_confidence += distance_factor * 0.4
+                
+                # Adaptive threshold
+                gdn_says_anomalous = (stats_i.anomaly_score > anomaly_threshold or 
+                                     stats_j.anomaly_score > anomaly_threshold)
+                
+                if gdn_says_anomalous:
+                    effective_deviation_threshold = deviation_threshold * 0.7
+                else:
+                    effective_deviation_threshold = deviation_threshold * 1.3
+                
+                if violation_confidence > 0.5:
+                    effective_deviation_threshold *= (1.0 - violation_confidence * 0.3)
+                
+                # Update edge attributes
+                # window_graph is nx.Graph (not MultiDiGraph), so graph[u][v] returns edge data dict directly
+                if graph.has_edge(sensor_i, sensor_j):
+                    edge_attrs = graph[sensor_i][sensor_j]
+                    # Only update if this edge belongs to this window
+                    if edge_attrs.get('window_idx') == window_idx:
+                        edge_attrs['deviation_from_gdn'] = float(deviation_from_gdn)
+                        edge_attrs['violates_gdn_expectation'] = deviation_from_gdn > effective_deviation_threshold
+                        edge_attrs['violation_confidence'] = float(violation_confidence)
+                        
+                        # Update potential_fault_indicator
+                        if (edge_attrs.get('violates_gdn_expectation', False) or 
+                            edge_attrs.get('violates_domain_expectation', False)):
+                            if (stats_i.anomaly_score > anomaly_threshold or 
+                                stats_j.anomaly_score > anomaly_threshold):
+                                edge_attrs['potential_fault_indicator'] = True
+                            else:
+                                edge_attrs['potential_fault_indicator'] = False
+                        else:
+                            edge_attrs['potential_fault_indicator'] = False
+                        
+                        # Also update in main KG (which is MultiDiGraph)
+                        if self.kg.has_edge(sensor_i, sensor_j):
+                            kg_edge_dict = self.kg[sensor_i][sensor_j]
+                            for kg_edge_key, kg_edge_attrs in kg_edge_dict.items():
+                                if kg_edge_attrs.get('window_idx') == window_idx:
+                                    kg_edge_attrs['deviation_from_gdn'] = float(deviation_from_gdn)
+                                    kg_edge_attrs['violates_gdn_expectation'] = deviation_from_gdn > effective_deviation_threshold
+                                    kg_edge_attrs['violation_confidence'] = float(violation_confidence)
+                                    if (kg_edge_attrs.get('violates_gdn_expectation', False) or 
+                                        kg_edge_attrs.get('violates_domain_expectation', False)):
+                                        if (stats_i.anomaly_score > anomaly_threshold or 
+                                            stats_j.anomaly_score > anomaly_threshold):
+                                            kg_edge_attrs['potential_fault_indicator'] = True
+                                        else:
+                                            kg_edge_attrs['potential_fault_indicator'] = False
+                                    else:
+                                        kg_edge_attrs['potential_fault_indicator'] = False
     
     def _build_temporal_edges(self, prev_window_idx: int, curr_window_idx: int,
                              prev_window_data: np.ndarray, curr_window_data: np.ndarray,
