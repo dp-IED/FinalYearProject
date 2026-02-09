@@ -77,6 +77,7 @@ class GDNPredictor:
             False  # Use distance to normal center instead of probabilities
         )
         self.normal_center = None  # Normal center for distance-based scoring
+        self.sensor_centers = None  # Multi-level sensor centers (num_sensors, 2, hidden_dim)
         self._load_model()
 
     def _load_model(self) -> None:
@@ -197,8 +198,21 @@ class GDNPredictor:
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
             state_dict = checkpoint["model_state_dict"]
 
+            # Check for Stage 2 multi-level format (sensor_centers: per-sensor centers)
+            if "sensor_centers" in checkpoint:
+                self.sensor_centers = checkpoint["sensor_centers"].to(self.device).detach()
+                self.use_distance_scoring = True
+                self.center_loss = None  # Not needed for multi-level format
+                
+                sensor_centers_shape = self.sensor_centers.shape
+                print(f"  ✓ Multi-level sensor centers found (Stage 2): shape {sensor_centers_shape}")
+                print(f"    Format: {sensor_centers_shape[0]} sensors × 2 classes × {sensor_centers_shape[2]} hidden_dim")
+                
+                # Also extract a global normal center (mean of all sensor normal centers) for compatibility
+                self.normal_center = self.sensor_centers[:, 0, :].mean(dim=0).detach()  # Average normal center across sensors
+                print(f"  ✓ Extracted global normal center (mean of sensor centers) for compatibility")
             # Check for Phase 2 checkpoint format (normal_center directly)
-            if "normal_center" in checkpoint:
+            elif "normal_center" in checkpoint:
                 self.normal_center = checkpoint["normal_center"].to(self.device)
                 self.use_distance_scoring = True
                 self.center_loss = None  # Not needed for Phase 2
@@ -727,6 +741,154 @@ class GDNPredictor:
             result["center_embeddings"] = center_embeddings
 
         return result
+
+    def extract_stage2_features(self, X_windows: Union[np.ndarray, torch.Tensor],
+                                batch_size: int = 32) -> Dict[int, Dict[str, float]]:
+        """
+        Extract Stage 2 features (embedding distances to normal/anomalous centers) for each window.
+        
+        Args:
+            X_windows: (num_windows, window_size, num_sensors) input windows
+            batch_size: Batch size for inference
+        
+        Returns:
+            Dictionary mapping window_idx to Stage 2 features:
+            {
+                window_idx: {
+                    'embedding_distance_normal': float,
+                    'embedding_distance_anomalous': float (if available)
+                }
+            }
+        """
+        # Convert inputs to numpy if needed
+        if isinstance(X_windows, torch.Tensor):
+            X_windows = X_windows.cpu().numpy()
+        
+        X_windows = np.asarray(X_windows)
+        num_windows = len(X_windows)
+        
+        # Check if Stage 2 features are available
+        # Check for sensor_centers first (multi-level), then normal_center (window-level)
+        if self.sensor_centers is None and self.normal_center is None:
+            # No Stage 2 checkpoint, return empty dict
+            return {}
+        
+        # Extract window embeddings
+        try:
+            window_embeddings = self.get_corr_embedding(X_windows, batch_size=batch_size)
+        except Exception as e:
+            print(f"  ⚠️  Warning: Could not extract embeddings for Stage 2 features: {e}")
+            return {}
+        
+        if window_embeddings is None:
+            return {}
+        
+        # Get centers - use loaded sensor_centers if available, otherwise try to load from checkpoint
+        sensor_centers = None
+        if self.sensor_centers is not None:
+            # Use already-loaded sensor centers (detach if tensor requires grad)
+            if hasattr(self.sensor_centers, 'cpu'):
+                sensor_centers = self.sensor_centers.detach().cpu().numpy()
+            else:
+                sensor_centers = self.sensor_centers
+            print(f"  ✓ Using multi-level sensor centers: shape {sensor_centers.shape}")
+        else:
+            # Fallback: try to load from checkpoint (shouldn't happen if _load_model worked correctly)
+            try:
+                checkpoint = torch.load(self.model_path, map_location='cpu', weights_only=False)
+                if 'sensor_centers' in checkpoint:
+                    sensor_centers = checkpoint['sensor_centers'].cpu().numpy() if hasattr(checkpoint['sensor_centers'], 'cpu') else checkpoint['sensor_centers']
+                    print(f"  ✓ Found multi-level sensor centers in checkpoint: shape {sensor_centers.shape}")
+            except Exception as e:
+                pass
+        
+        # Fallback to window-level centers
+        normal_center_np = None
+        anomalous_center_np = None
+        
+        if sensor_centers is None:
+            # Try window-level centers
+            if hasattr(self, 'normal_center') and self.normal_center is not None:
+                normal_center_np = self.normal_center.cpu().numpy() if hasattr(self.normal_center, 'cpu') else self.normal_center
+            
+            if hasattr(self, 'anomalous_center') and self.anomalous_center is not None:
+                anomalous_center_np = self.anomalous_center.cpu().numpy() if hasattr(self.anomalous_center, 'cpu') else self.anomalous_center
+            elif hasattr(self, 'center_loss') and self.center_loss is not None:
+                # Try to get from center_loss
+                try:
+                    centers = self.center_loss.centers.detach().cpu().numpy()
+                    if len(centers) >= 2:
+                        normal_center_np = centers[0]
+                        anomalous_center_np = centers[1]
+                except Exception:
+                    pass
+        
+        # Compute distances for each window
+        stage2_features = {}
+        for window_idx in range(num_windows):
+            embedding = window_embeddings[window_idx]
+            
+            features = {}
+            
+            if sensor_centers is not None and len(sensor_centers.shape) == 3:
+                # Multi-level: compute per-sensor distances and aggregate
+                # sensor_centers shape: (num_sensors, 2, hidden_dim)
+                # We need sensor embeddings - extract from model if available
+                try:
+                    # Get sensor embeddings for this window
+                    X_window_tensor = torch.from_numpy(X_windows[window_idx:window_idx+1]).float().to(self.device)
+                    self.model.eval()
+                    with torch.no_grad():
+                        if hasattr(self.model, 'get_sensor_embeddings'):
+                            sensor_emb = self.model.get_sensor_embeddings(X_window_tensor).cpu().numpy()[0]  # (num_sensors, hidden_dim)
+                        else:
+                            # Fallback: use window embedding for all sensors
+                            sensor_emb = np.tile(embedding, (self.num_sensors, 1))
+                    
+                    # Compute distances to each sensor's centers
+                    sensor_distances_normal = []
+                    sensor_distances_anomalous = []
+                    num_sensors = len(self.sensor_names)
+                    for sensor_idx in range(num_sensors):
+                        sensor_emb_single = sensor_emb[sensor_idx]
+                        sensor_normal_center = sensor_centers[sensor_idx, 0]  # Normal center for this sensor
+                        sensor_anomalous_center = sensor_centers[sensor_idx, 1]  # Anomalous center for this sensor
+                        
+                        dist_normal = float(np.linalg.norm(sensor_emb_single - sensor_normal_center))
+                        dist_anomalous = float(np.linalg.norm(sensor_emb_single - sensor_anomalous_center))
+                        
+                        sensor_distances_normal.append(dist_normal)
+                        sensor_distances_anomalous.append(dist_anomalous)
+                    
+                    # Aggregate: use mean or min distance
+                    features['embedding_distance_normal'] = float(np.mean(sensor_distances_normal))
+                    features['embedding_distance_anomalous'] = float(np.mean(sensor_distances_anomalous))
+                    features['embedding_distance_normal_min'] = float(np.min(sensor_distances_normal))
+                    features['embedding_distance_anomalous_min'] = float(np.min(sensor_distances_anomalous))
+                except Exception as e:
+                    # Fallback to window-level if sensor extraction fails
+                    if window_idx == 0:  # Only print once for first window
+                        print(f"  ⚠️  Warning: Sensor embedding extraction failed: {e}")
+                        print(f"    Falling back to window-level centers")
+                    if normal_center_np is not None:
+                        features['embedding_distance_normal'] = float(np.linalg.norm(embedding - normal_center_np))
+                    if anomalous_center_np is not None:
+                        features['embedding_distance_anomalous'] = float(np.linalg.norm(embedding - anomalous_center_np))
+            else:
+                # Window-level centers
+                if normal_center_np is not None:
+                    features['embedding_distance_normal'] = float(np.linalg.norm(embedding - normal_center_np))
+                if anomalous_center_np is not None:
+                    features['embedding_distance_anomalous'] = float(np.linalg.norm(embedding - anomalous_center_np))
+            
+            # Always add features dict, even if empty (for debugging)
+            stage2_features[window_idx] = features
+        
+        # Return empty dict if no features were extracted
+        if not any(features for features in stage2_features.values()):
+            return {}
+        
+        return stage2_features
 
     def analyze_topk_correlations(
         self,
