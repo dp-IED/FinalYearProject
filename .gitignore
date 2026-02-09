@@ -48,3 +48,7 @@ __pycache__/
 *.pyd
 .Python
 *.so
+
+# Web (Vite)
+web/node_modules/
+web/dist/
