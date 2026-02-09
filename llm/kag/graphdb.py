@@ -1,7 +1,7 @@
 """
 Neo4j Loader for Window Analysis Data
 
-Loads window analysis data from KnowledgeGraphBuilder into Neo4j database
+Loads window analysis data from KnowledgeGraph into Neo4j database
 following the specified schema:
 - Window nodes with labels, fault_type, and faulty_sensor
 - Per-window Sensor nodes with composite names (Window_{idx}_Sensor_{name}):
@@ -28,12 +28,12 @@ import json
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from llm.helpers.KG import KnowledgeGraphBuilder, SENSOR_SUBSYSTEMS, SENSOR_DESCRIPTIONS
+from kg.create_kg import KnowledgeGraph, SENSOR_SUBSYSTEMS, SENSOR_DESCRIPTIONS
 
 
 class Neo4jLoader:
     """
-    Loads window analysis data from KnowledgeGraphBuilder into Neo4j.
+    Loads window analysis data from KnowledgeGraph into Neo4j.
     """
 
     def __init__(
@@ -148,7 +148,7 @@ class Neo4jLoader:
 
     def load_window_sensors(
         self,
-        kg_builder: KnowledgeGraphBuilder,
+        kg: KnowledgeGraph,
         window_indices: List[int],
         subsample_rate: int = 20,
         batch_size: int = 10,
@@ -159,28 +159,28 @@ class Neo4jLoader:
         Creates BELONGS_TO relationships from sensors to their windows.
 
         Args:
-            kg_builder: KnowledgeGraphBuilder instance with built KG
+            kg: KnowledgeGraph instance with built KG
             window_indices: List of window indices to load
             subsample_rate: Keep every Nth point for time-series (20 means 300 -> 15 points)
             batch_size: Number of sensors to create per transaction
         """
         self.connect()
 
-        has_timeseries = kg_builder.X_windows_unnormalized is not None
+        has_timeseries = kg.X_windows_unnormalized is not None
         total_expected = sum(
-            len(kg_builder.window_stats.get(w, {})) for w in window_indices
+            len(kg.window_stats.get(w, {})) for w in window_indices
         )
         total_sensors = 0
 
         # Pre-compute base correlations for each sensor type
         base_correlations_map = {}
-        if kg_builder.adjacency_matrix is not None:
-            for i, sensor_name in enumerate(kg_builder.sensor_names):
+        if kg.adjacency_matrix is not None:
+            for i, sensor_name in enumerate(kg.sensor_names):
                 base_correlations = {}
-                for j, other_sensor in enumerate(kg_builder.sensor_names):
+                for j, other_sensor in enumerate(kg.sensor_names):
                     if i != j:
                         base_correlations[other_sensor] = float(
-                            kg_builder.adjacency_matrix[i, j]
+                            kg.adjacency_matrix[i, j]
                         )
                 base_correlations_map[sensor_name] = (
                     json.dumps(base_correlations) if base_correlations else None
@@ -191,15 +191,15 @@ class Neo4jLoader:
             current_batch = []
 
             for window_idx in window_indices:
-                if window_idx not in kg_builder.window_stats:
+                if window_idx not in kg.window_stats:
                     continue
 
-                window_stats = kg_builder.window_stats[window_idx]
+                window_stats = kg.window_stats[window_idx]
                 window_has_timeseries = has_timeseries and window_idx < len(
-                    kg_builder.X_windows_unnormalized
+                    kg.X_windows_unnormalized
                 )
 
-                for sensor_idx, base_sensor_name in enumerate(kg_builder.sensor_names):
+                for sensor_idx, base_sensor_name in enumerate(kg.sensor_names):
                     if base_sensor_name not in window_stats:
                         continue
 
@@ -223,12 +223,12 @@ class Neo4jLoader:
                     timesteps_array = None
 
                     if window_has_timeseries:
-                        window_data = kg_builder.X_windows_unnormalized[
+                        window_data = kg.X_windows_unnormalized[
                             window_idx
                         ]  # (300, 8)
                         window_data_norm = (
-                            kg_builder.X_windows[window_idx]
-                            if kg_builder.X_windows is not None
+                            kg.X_windows[window_idx]
+                            if kg.X_windows is not None
                             else None
                         )
 
@@ -890,7 +890,7 @@ class Neo4jLoader:
 
     def load_correlations(
         self,
-        kg_builder: KnowledgeGraphBuilder,
+        kg: KnowledgeGraph,
         window_indices: List[int],
         batch_size: int = 20,
         top_k: int = 10,
@@ -910,7 +910,7 @@ class Neo4jLoader:
         Sensors are matched by window property - correlations only exist between sensors of the same window.
 
         Args:
-            kg_builder: KnowledgeGraphBuilder instance with built KG
+            kg: KnowledgeGraph instance with built KG
             window_indices: List of window indices to load
             batch_size: Number of relationships to create per transaction
             top_k: Number of top correlations to select per window (default: 10)
@@ -926,13 +926,13 @@ class Neo4jLoader:
 
             for window_idx in window_indices:
                 # Compute correlation matrix for this window directly from data
-                if kg_builder.X_windows is None:
+                if kg.X_windows is None:
                     continue
 
-                if window_idx >= len(kg_builder.X_windows):
+                if window_idx >= len(kg.X_windows):
                     continue
 
-                window_data = kg_builder.X_windows[window_idx]  # (300, 8) normalized
+                window_data = kg.X_windows[window_idx]  # (300, 8) normalized
 
                 try:
                     correlation_matrix = np.corrcoef(window_data.T)  # (8, 8)
@@ -941,11 +941,11 @@ class Neo4jLoader:
 
                 # Extract GDN anomaly score for this window
                 # Use max sensor anomaly score as window-level score
-                if window_idx not in kg_builder.window_stats:
+                if window_idx not in kg.window_stats:
                     # Fallback: skip window if no stats available
                     continue
                 
-                window_stats = kg_builder.window_stats[window_idx]
+                window_stats = kg.window_stats[window_idx]
                 gdn_anomaly_score = max(
                     stats.anomaly_score for stats in window_stats.values()
                 )
@@ -953,9 +953,9 @@ class Neo4jLoader:
                 # Select top-k most informative correlations
                 top_edges = self.select_topk_correlations(
                     actual_corr_matrix=correlation_matrix,
-                    expected_corr_matrix=kg_builder.adjacency_matrix,
+                    expected_corr_matrix=kg.adjacency_matrix,
                     gdn_anomaly_score=gdn_anomaly_score,
-                    sensor_names=kg_builder.sensor_names,
+                    sensor_names=kg.sensor_names,
                     top_k=top_k,
                     threshold_center=threshold_center,
                     threshold_steepness=threshold_steepness,
@@ -1062,14 +1062,14 @@ class Neo4jLoader:
             print(f"✓ Loaded {total_correlations} CORRELATES_WITH relationships")
 
     def load_temporal_propagation(
-        self, kg_builder: KnowledgeGraphBuilder, window_indices: List[int]
+        self, kg: KnowledgeGraph, window_indices: List[int]
     ):
         """
         Create PRECEDES relationships between consecutive Windows for temporal ordering.
         PROPAGATES relationships are no longer used - windows are only connected via PRECEDES.
 
         Args:
-            kg_builder: KnowledgeGraphBuilder instance (unused, kept for API compatibility)
+            kg: KnowledgeGraph instance (unused, kept for API compatibility)
             window_indices: List of window indices (should be sorted)
         """
         self.connect()
@@ -1103,7 +1103,7 @@ class Neo4jLoader:
 
     def load_timeseries_readings(
         self,
-        kg_builder: KnowledgeGraphBuilder,
+        kg: KnowledgeGraph,
         window_indices: List[int],
         subsample_rate: int = 20,
     ):
@@ -1111,13 +1111,13 @@ class Neo4jLoader:
         Create Reading nodes with subsampled time-series data (Layer 3).
 
         Args:
-            kg_builder: KnowledgeGraphBuilder instance with built KG
+            kg: KnowledgeGraph instance with built KG
             window_indices: List of window indices to load
             subsample_rate: Keep every Nth point (20 means 300 -> 15 points)
         """
         self.connect()
 
-        if kg_builder.X_windows_unnormalized is None:
+        if kg.X_windows_unnormalized is None:
             print(
                 "⚠️  Warning: Unnormalized windows not available, skipping time-series layer"
             )
@@ -1127,17 +1127,17 @@ class Neo4jLoader:
             total_readings = 0
 
             for window_idx in window_indices:
-                if window_idx >= len(kg_builder.X_windows_unnormalized):
+                if window_idx >= len(kg.X_windows_unnormalized):
                     continue
 
-                window_data = kg_builder.X_windows_unnormalized[window_idx]  # (300, 8)
+                window_data = kg.X_windows_unnormalized[window_idx]  # (300, 8)
                 window_data_norm = (
-                    kg_builder.X_windows[window_idx]
-                    if kg_builder.X_windows is not None
+                    kg.X_windows[window_idx]
+                    if kg.X_windows is not None
                     else None
                 )
 
-                for sensor_idx, sensor_name in enumerate(kg_builder.sensor_names):
+                for sensor_idx, sensor_name in enumerate(kg.sensor_names):
                     full_series = window_data[:, sensor_idx]  # (300,)
 
                     # Subsample: keep every Nth point
@@ -1187,9 +1187,9 @@ class Neo4jLoader:
 
             print(f"✓ Loaded {total_readings} Reading nodes (Layer 3: time-series)")
 
-    def load_from_kg_builder(
+    def load_from_kg(
         self,
-        kg_builder: KnowledgeGraphBuilder,
+        kg: KnowledgeGraph,
         window_labels: Optional[np.ndarray] = None,
         sensor_labels: Optional[np.ndarray] = None,
         window_indices_subset: Optional[List[int]] = None,
@@ -1198,10 +1198,10 @@ class Neo4jLoader:
         correlation_threshold_steepness: float = 10.0,
     ):
         """
-        Main entry point: Load data from KnowledgeGraphBuilder into Neo4j.
+        Main entry point: Load data from KnowledgeGraph into Neo4j.
 
         Args:
-            kg_builder: KnowledgeGraphBuilder instance with built KG
+            kg: KnowledgeGraph instance with built KG
             window_labels: Optional array of window labels (ground truth binary: 0 or 1)
             sensor_labels: Optional (num_windows, num_sensors) array - binary fault labels per sensor
             window_indices_subset: Optional list of window indices to load (if None, loads all windows)
@@ -1234,11 +1234,11 @@ class Neo4jLoader:
         start_time = time.time()
 
         # Get window indices (either subset or all)
-        all_window_indices = sorted(kg_builder.window_graphs.keys())
+        all_window_indices = sorted(kg.window_graphs.keys())
         if window_indices_subset is not None:
             # Filter to only include windows that exist in the KG
             window_indices = sorted(
-                [w for w in window_indices_subset if w in kg_builder.window_graphs]
+                [w for w in window_indices_subset if w in kg.window_graphs]
             )
             print(
                 f"📋 Loading subset: {len(window_indices)}/{len(all_window_indices)} windows"
@@ -1247,7 +1247,7 @@ class Neo4jLoader:
             window_indices = all_window_indices
 
         if not window_indices:
-            print("⚠️  No windows found in KnowledgeGraphBuilder")
+            print("⚠️  No windows found in KnowledgeGraph")
             return
 
         total_windows = len(window_indices)
@@ -1255,7 +1255,7 @@ class Neo4jLoader:
 
         print("📊 Dataset Overview:")
         print(f"   Windows: {total_windows}")
-        print(f"   Sensors per window: {len(kg_builder.sensor_names)}")
+        print(f"   Sensors per window: {len(kg.sensor_names)}")
         print(f"   Total steps: {total_steps}")
         print()
 
@@ -1264,7 +1264,7 @@ class Neo4jLoader:
             step_start = time.time()
             print(f"[1/{total_steps}] Loading windows...")
             self.load_windows(
-                window_indices, window_labels, sensor_labels, kg_builder.sensor_names
+                window_indices, window_labels, sensor_labels, kg.sensor_names
             )
             step_time = time.time() - step_start
             print(f"   ✓ Completed in {step_time:.2f}s")
@@ -1282,10 +1282,10 @@ class Neo4jLoader:
             print("   - Time-series arrays (subsampled)")
             print("   - Base correlations from GDN adjacency matrix")
             expected_sensors = sum(
-                len(kg_builder.window_stats.get(w, {})) for w in window_indices
+                len(kg.window_stats.get(w, {})) for w in window_indices
             )
             print(f"   Expected: ~{expected_sensors} sensor nodes")
-            self.load_window_sensors(kg_builder, window_indices, subsample_rate=20)
+            self.load_window_sensors(kg, window_indices, subsample_rate=20)
             step_time = time.time() - step_start
             print(f"   ✓ Completed in {step_time:.2f}s")
             print()
@@ -1313,7 +1313,7 @@ class Neo4jLoader:
             expected_correlations = total_windows * top_k_correlations
             print(f"   Expected: ~{expected_correlations} relationships (top-{top_k_correlations} per window)")
             self.load_correlations(
-                kg_builder,
+                kg,
                 window_indices,
                 top_k=top_k_correlations,
                 threshold_center=correlation_threshold_center,
@@ -1332,7 +1332,7 @@ class Neo4jLoader:
             step_start = time.time()
             print(f"[4/{total_steps}] Loading temporal relationships (PRECEDES)...")
             print("   Creating PRECEDES relationships between consecutive windows")
-            self.load_temporal_propagation(kg_builder, window_indices)
+            self.load_temporal_propagation(kg, window_indices)
             step_time = time.time() - step_start
             print(f"   ✓ Completed in {step_time:.2f}s")
             print()
@@ -1620,8 +1620,8 @@ if __name__ == "__main__":
     print("Neo4j Loader for Window Analysis")
     print("Use this module programmatically:")
     print()
-    print("  from llm.kag.init_neo4j import Neo4jLoader")
+    print("  from llm.kag.graphdb import Neo4jLoader")
     print("  loader = Neo4jLoader()")
     print("  loader.create_schema()")
-    print("  loader.load_from_kg_builder(kg_builder)")
+    print("  loader.load_from_kg(kg)")
     print()

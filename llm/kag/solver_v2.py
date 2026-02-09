@@ -12,11 +12,12 @@ follow-up questions and refine its reasoning.
 import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 
 from llm.kag.neo4j_queries import Neo4jKAGQueries
-from llm.helpers.KG import KnowledgeGraphBuilder
+from kg.create_kg import KnowledgeGraph
 from llm.evaluation.evaluate_llm_baseline import call_llm, parse_llm_response
 
 
@@ -215,7 +216,7 @@ class KGQueryExecutor:
 
     def __init__(
         self,
-        kg_builder: KnowledgeGraphBuilder,
+        kg_builder: KnowledgeGraph,
         neo4j_queries: Neo4jKAGQueries,
         tool_tracker=None,
     ):
@@ -223,7 +224,7 @@ class KGQueryExecutor:
         Initialize KG Query Executor.
 
         Args:
-            kg_builder: KnowledgeGraphBuilder instance
+            kg_builder: KnowledgeGraph instance
             neo4j_queries: Neo4jKAGQueries instance for graph queries
             tool_tracker: Optional ToolTracker instance for tracking tool usage
         """
@@ -1174,7 +1175,7 @@ class KAGIterativeSolver:
 
     def __init__(
         self,
-        kg_builder: KnowledgeGraphBuilder,
+        kg_builder: KnowledgeGraph,
         neo4j_queries: Neo4jKAGQueries,
         sensor_names: List[str],
         model,
@@ -1186,7 +1187,7 @@ class KAGIterativeSolver:
         Initialize KAG Iterative Solver.
 
         Args:
-            kg_builder: KnowledgeGraphBuilder instance
+            kg_builder: KnowledgeGraph instance
             neo4j_queries: Neo4jKAGQueries instance
             sensor_names: List of sensor names
             model: Loaded LLM model
@@ -1205,7 +1206,8 @@ class KAGIterativeSolver:
         self.executor = KGQueryExecutor(
             kg_builder, neo4j_queries, tool_tracker=tool_tracker
         )
-        
+        self._example_prompt_dumped = False
+
         # Configuration constants for root cause selection
         self.ROOT_K = 1  # Maximum number of root causes per window
         self.ALPHA = 0.8  # Tie-breaking band: keep sensors within 80% of best score
@@ -2473,7 +2475,7 @@ Using only the structured evidence above, produce a JSON object in this EXACT fo
     "affected_sensors": ["SENSOR_NAME_1", "SENSOR_NAME_2"] or [],
     "faulty_sensors": ["SENSOR_NAME_1", "SENSOR_NAME_2"] or [],  # backward compatibility (root + affected combined)
     "fault_type": "VSS_DROPOUT" | "COOLANT_DROPOUT" | "MAF_SCALE_LOW" | "TPS_STUCK" | "gradual_drift" or null,
-    "reasoning": "2-4 sentences explaining why, referring to anomaly scores, violations and correlations from the structured results above",
+    "reasoning": "3-6 sentences, extensive and didactic: (1) state which evidence you used (which Step results, which violations/scores and values), (2) explain step-by-step how that evidence leads to the root cause or to normal operation, (3) briefly say why other sensors were or were not considered. Write so a reader can follow your logic.",
     "confidence": 0.85
 }}
 
@@ -2503,7 +2505,7 @@ Example 4 (no fault, despite high scores):
 2. **Prioritize violations**: If violations exist in Step results, use them to identify root cause (sensor with most violations)
 3. **Combine evidence**: Use BOTH anomaly scores AND violations when both are available
 4. **NORMAL prediction rule**: If max anomaly score < 0.6 AND violations < 2, predict NORMAL (root_cause_sensors: [], affected_sensors: [], faulty_sensors: [], fault_type: null)
-5. **Reference structured results**: In your reasoning, refer to specific Step results (e.g., "from Step 1 results", "Step 2 found...")
+5. **Reasoning must be extensive and didactic**: Write 3-6 sentences. State which evidence you used (Step 1 violations, Step 2 scores, exact values), explain step-by-step how it leads to your conclusion, and why other sensors were or were not chosen. Refer to specific Step results (e.g., "from Step 1 results", "Step 2 found...").
 6. **Violation severity**: Severe violations (deviation >0.5) are stronger signals than mild violations
 7. **Root cause = sensor with most violations**: When multiple sensors have violations, prioritize the one with most violations as root_cause_sensors
 8. **Affected sensors**: Sensors that show anomalies but are NOT the primary fault source should go in affected_sensors
@@ -2513,6 +2515,23 @@ Example 4 (no fault, despite high scores):
 
 Now produce the JSON response using ONLY the structured reasoning results above. Do NOT invent extra sensors or signals.
 """
+
+        # Log prompt length for debugging (chars, words as rough token proxy)
+        n_chars = len(prompt)
+        n_words = len(prompt.split())
+        if window_idx is not None:
+            print(f"  [Window {window_idx}] Answer prompt: {n_chars} chars, ~{n_words} words (~{n_words * 4 // 3} tokens est.)")
+
+        # One-time dump of example prompt to file for inspection
+        if not getattr(self, "_example_prompt_dumped", True):
+            try:
+                out = Path("results/example_kg_answer_prompt.txt")
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(prompt, encoding="utf-8")
+                print(f"  Example prompt written to {out}")
+                self._example_prompt_dumped = True
+            except Exception:
+                pass
 
         response = call_llm(
             prompt,
