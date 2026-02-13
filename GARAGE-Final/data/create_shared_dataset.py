@@ -57,9 +57,9 @@ import torch
 from scipy import stats
 import sys
 
-# Add path for preprocessing functions
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts" / "training"))
-from train_gdn_stage1_forecast import (
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+from training.train_stage1 import (
     remove_zero_variance_columns,
     mean_fill_missing_timestamps_and_remove_duplicates,
     downsample,
@@ -70,18 +70,10 @@ from train_gdn_stage1_forecast import (
     TIME_COL,
     WINDOW_SIZE,
 )
-from train_gdn_stage2_multilevel import build_clean_windows
+from training.train_stage2 import build_clean_windows
+from training.fault_injection import inject_faults_with_sensor_labels
 
-FORECAST_HORIZON = 1  # Default forecast horizon
-
-# Import shared fault injection with stratified distribution
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts" / "training"))
-from fault_injection import inject_faults_with_sensor_labels
-
-# Add paths for GDN and KG imports
-project_root = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(project_root / "anomaly-detection"))
-sys.path.insert(0, str(project_root))
+FORECAST_HORIZON = 1
 
 from llm.gdn_processor import GDNPredictor
 from kg.create_kg import KnowledgeGraph
@@ -269,6 +261,17 @@ def create_shared_evaluation_dataset(
     min_windows = min(len(X_normalized), len(X_unnormalized))
     X_normalized = X_normalized[:min_windows]
     X_unnormalized = X_unnormalized[:min_windows]
+    y_targets = y_targets[:min_windows]
+
+    # Apply max_windows limit early (before fault injection and statistical features)
+    if max_windows is not None and min_windows > max_windows:
+        rng = np.random.default_rng(random_state)
+        indices = np.sort(rng.choice(min_windows, max_windows, replace=False))
+        X_normalized = X_normalized[indices]
+        X_unnormalized = X_unnormalized[indices]
+        y_targets = y_targets[indices]
+        min_windows = max_windows
+        print(f"  Limited to {max_windows} windows (early)")
 
     print(f"  Created {len(X_unnormalized)} unnormalized windows")
 
@@ -276,8 +279,10 @@ def create_shared_evaluation_dataset(
     if fault_percentage > 0:
         print(f"5. Injecting faults ({fault_percentage * 100:.1f}% of windows)...")
         X_normalized_tensor = torch.tensor(X_normalized, dtype=torch.float32)
-        y_targets_tensor = torch.tensor(
-            y_targets.numpy()[:min_windows], dtype=torch.float32
+        y_targets_tensor = (
+            y_targets.float()
+            if hasattr(y_targets, "float")
+            else torch.tensor(y_targets, dtype=torch.float32)
         )
 
         X_faulty, _, sensor_labels, window_labels = inject_faults_with_sensor_labels(
@@ -308,7 +313,6 @@ def create_shared_evaluation_dataset(
 
     print("-" * 80)
     print("6. Computing statistical features...")
-    print("\n6. Computing statistical features...")
     statistical_features = np.zeros(
         (len(X_unnormalized), len(SENSOR_COLS_AVAILABLE), 9)
     )
@@ -343,21 +347,7 @@ def create_shared_evaluation_dataset(
                 fault_types[i] = "gradual_drift"
 
     print("-" * 80)
-    print("8. Limiting windows if requested...")
-    if max_windows is not None and len(X_normalized) > max_windows:
-        indices = np.random.choice(len(X_normalized), max_windows, replace=False)
-        indices = np.sort(indices)
-        X_normalized = X_normalized[indices]
-        X_unnormalized = X_unnormalized[indices]
-        sensor_labels = sensor_labels[indices]
-        window_labels = window_labels[indices]
-        fault_types = fault_types[indices]
-        statistical_features = statistical_features[indices]
-        print(f"\n7. Limited to {max_windows} windows")
-
-    print("-" * 80)
-    print("9. Saving dataset...")
-    print("\n8. Saving dataset...")
+    print("8. Saving dataset...")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -571,8 +561,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--gdn-model-path",
         type=str,
-        default="anomaly-detection/best_center_loss_gdn.pt",
-        help="Path to GDN model checkpoint (default: anomaly-detection/best_center_loss_gdn.pt)",
+        default="checkpoints/best_center_loss_gdn.pt",
+        help="Path to GDN model checkpoint (default: checkpoints/best_center_loss_gdn.pt)",
     )
     parser.add_argument(
         "--neo4j-uri",
