@@ -126,6 +126,9 @@ class LMInference:
         
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
+
+        if "response_format" in kwargs:
+            payload["response_format"] = kwargs["response_format"]
         
         # Add any additional parameters that LM Studio supports
         if "repetition_penalty" in kwargs:

@@ -7,7 +7,7 @@ to provide a compatible interface for LLM/RAG code.
 
 import numpy as np
 import torch
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 from pathlib import Path
 
 # Import existing helper functions from kg.create_kg
@@ -59,6 +59,8 @@ class GDNPredictor:
 
         self._normal_center = None
         self._anomalous_center = None
+        self._global_mask_threshold = 0.5
+        self._per_sensor_thresholds = np.array([])
         try:
             ckpt = torch.load(str(self.model_path), map_location=device, weights_only=False)
             if isinstance(ckpt, dict) and "sensor_centers" in ckpt:
@@ -67,6 +69,12 @@ class GDNPredictor:
                 if sc.ndim == 3:
                     self._normal_center = sc[:, 0, :].mean(axis=0).astype(np.float32)
                     self._anomalous_center = sc[:, 1, :].mean(axis=0).astype(np.float32)
+            if isinstance(ckpt, dict):
+                calibrated = ckpt.get("calibrated_thresholds", {})
+                self._global_mask_threshold = float(calibrated.get("window", 0.5))
+                per_sensor = calibrated.get("per_sensor", [])
+                if per_sensor:
+                    self._per_sensor_thresholds = np.array(per_sensor, dtype=np.float32)
         except Exception:
             pass
 
@@ -75,7 +83,12 @@ class GDNPredictor:
         self.top_k = self.metadata.get('top_k', top_k)
         self.hidden_dim = self.metadata.get('hidden_dim', hidden_dim)
         self.num_sensors = len(sensor_names)
-        
+
+    @property
+    def per_sensor_thresholds(self) -> np.ndarray:
+        """Per-sensor thresholds from checkpoint (empty array if not available)."""
+        return self._per_sensor_thresholds
+
     def get_sensor_embeddings(self) -> np.ndarray:
         """
         Extract learned sensor embeddings from the model.
@@ -118,39 +131,32 @@ class GDNPredictor:
         self,
         X_windows: Union[np.ndarray, torch.Tensor],
         batch_size: int = 32,
-    ) -> np.ndarray:
+        apply_global_mask: bool = True,
+        global_mask_threshold: Optional[float] = None,
+        return_global: bool = False,
+    ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         """
         Run inference on data windows to get sensor anomaly probabilities.
-        
+
         Args:
             X_windows: (num_windows, window_size, num_sensors) input windows
             batch_size: Batch size for inference
-            
-        Returns:
-            sensor_probs: (num_windows, num_sensors) numpy array of anomaly probabilities
-        """
-        return predict_anomalies(
-            self.model, X_windows, batch_size=batch_size, device=self.device
-        )
+            global_mask_threshold: If None, use checkpoint-calibrated value.
 
-    def extract_stage2_features(
-        self,
-        X_windows: Union[np.ndarray, torch.Tensor],
-        batch_size: int = 32,
-    ) -> Dict[int, Dict[str, float]]:
-        """Stage 2 features: embedding distances to normal/anomalous centers when available."""
-        if self._normal_center is None or self._anomalous_center is None:
-            return {}
-        emb = self.get_corr_embedding(X_windows, batch_size=batch_size)
-        emb = np.asarray(emb).astype(np.float32)
-        nc, ac = self._normal_center, self._anomalous_center
-        result = {}
-        for i in range(len(emb)):
-            result[i] = {
-                "embedding_distance_normal": float(np.linalg.norm(emb[i] - nc)),
-                "embedding_distance_anomalous": float(np.linalg.norm(emb[i] - ac)),
-            }
-        return result
+        Returns:
+            sensor_probs: (num_windows, num_sensors) numpy array of anomaly probabilities.
+            If `return_global=True`, returns tuple (sensor_probs, global_probs).
+        """
+        thr = global_mask_threshold if global_mask_threshold is not None else self._global_mask_threshold
+        return predict_anomalies(
+            self.model,
+            X_windows,
+            batch_size=batch_size,
+            device=self.device,
+            return_global=return_global,
+            apply_global_mask=apply_global_mask,
+            global_mask_threshold=thr,
+        )
 
     def process_for_kg(
         self,
@@ -158,6 +164,9 @@ class GDNPredictor:
         sensor_labels: Optional[Union[np.ndarray, torch.Tensor]] = None,
         window_labels: Optional[Union[np.ndarray, torch.Tensor]] = None,
         batch_size: int = 32,
+        apply_global_mask: bool = True,
+        global_mask_threshold: Optional[float] = None,
+        return_window_labels_from_mask: bool = True,
     ) -> Dict[str, Union[List[str], np.ndarray]]:
         """
         Process data and return dict needed for KG construction.
@@ -166,9 +175,15 @@ class GDNPredictor:
             X_windows = X_windows.cpu().numpy()
         X_windows = np.asarray(X_windows)
 
+        thr = global_mask_threshold if global_mask_threshold is not None else self._global_mask_threshold
         sensor_embeddings = self.get_sensor_embeddings()
         adjacency_matrix = self.compute_adjacency_matrix()
-        gdn_predictions = self.predict(X_windows, batch_size=batch_size)
+        gdn_predictions = self.predict(
+            X_windows,
+            batch_size=batch_size,
+            apply_global_mask=apply_global_mask,
+            global_mask_threshold=thr,
+        )
 
         if sensor_labels is not None:
             if isinstance(sensor_labels, torch.Tensor):
@@ -184,7 +199,11 @@ class GDNPredictor:
                 window_labels = window_labels.cpu().numpy()
             window_labels = np.asarray(window_labels).astype(np.int64)
         else:
-            window_labels = (gdn_predictions.max(axis=1) > 0.5).astype(np.int64)
+            window_labels = (
+                (gdn_predictions.max(axis=1) > thr).astype(np.int64)
+                if return_window_labels_from_mask
+                else (gdn_predictions.max(axis=1) > 0.5).astype(np.int64)
+            )
 
         return {
             "sensor_names": self.sensor_names,
