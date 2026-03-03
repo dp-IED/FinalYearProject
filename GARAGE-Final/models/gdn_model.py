@@ -13,13 +13,13 @@ from torch_geometric.nn import GATConv
 class GDN(nn.Module):
     """
     Graph Deviation Network (GDN) for anomaly detection.
-    
+
     Architecture:
     - Single-layer unidirectional GRU for temporal encoding
     - Graph Attention Network (GAT) for spatial relationships
     - LayerNorm and residual connections for training stability
     - Graph caching for efficiency
-    
+
     Features:
     - Contrastive learning provides embedding separation
     - Residual connections preserve sensor distinctiveness
@@ -31,7 +31,7 @@ class GDN(nn.Module):
         self,
         num_nodes,
         window_size,
-        embed_dim=64,
+        embed_dim=32,
         top_k=5,
         hidden_dim=64,
         rebuild_graph_every=50,
@@ -48,9 +48,11 @@ class GDN(nn.Module):
         self.cached_edge_index = None
         self._graph_step_counter = 0
 
-        # Learned sensor embeddings
+        # Learned sensor embeddings (Xavier init so diversity loss has gradient from start)
         self.sensor_embeddings = nn.Parameter(torch.randn(num_nodes, embed_dim))
         nn.init.xavier_uniform_(self.sensor_embeddings)
+        # Projects sensor identity into hidden_dim space for differentiable node injection
+        self.sensor_proj = nn.Linear(embed_dim, hidden_dim, bias=False)
 
         # Single-layer unidirectional GRU (baseline - fast)
         self.temporal_encoder = nn.GRU(
@@ -82,9 +84,9 @@ class GDN(nn.Module):
             # No sigmoid - use BCEWithLogitsLoss instead
         )
 
-        # Global window classifier (returns logits, no sigmoid)
+        # Global window classifier: concat(mean_pool(h_graph), sensor_logits) for coupling
         self.global_classifier = nn.Sequential(
-            nn.Linear(num_nodes * hidden_dim, 64),
+            nn.Linear(hidden_dim + num_nodes, 64),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(64, 1),
@@ -154,7 +156,10 @@ class GDN(nn.Module):
         self._graph_step_counter += 1
 
         # Normalize before GAT for stability
-        h_last_norm = F.normalize(h_last, p=2, dim=2)
+        h_last_norm = F.normalize(h_last, p=2, dim=2)  # (B, N, hidden_dim)
+        # Inject sensor identity — gives sensor_embeddings a differentiable gradient path
+        sensor_bias = self.sensor_proj(self.sensor_embeddings)  # (N, hidden_dim)
+        h_last_norm = h_last_norm + sensor_bias.unsqueeze(0)    # broadcast over batch
 
         # GAT processing (per-batch loop, but with residual)
         # PyTorch Geometric requires CPU for node features and edge_index
@@ -179,9 +184,9 @@ class GDN(nn.Module):
         return_values = [sensor_logits]
 
         if return_global:
-            # Global window anomaly logits
-            h_flat = h_graph.flatten(1)  # (B, N * hidden_dim)
-            global_logits = self.global_classifier(h_flat).squeeze(-1)  # (B,)
+            # Global window anomaly logits: concat(mean_pool(h_graph), sensor_logits)
+            global_input = torch.cat([h_graph.mean(dim=1), sensor_logits], dim=1)  # (B, hidden_dim + N)
+            global_logits = self.global_classifier(global_input).squeeze(-1)  # (B,)
             return_values.append(global_logits)
 
         if return_sensor_embeddings:
@@ -217,7 +222,10 @@ class GDN(nn.Module):
         self._graph_step_counter += 1
 
         # Normalize before GAT
-        h_last_norm = F.normalize(h_last, p=2, dim=2)
+        h_last_norm = F.normalize(h_last, p=2, dim=2)  # (B, N, hidden_dim)
+        # Inject sensor identity — gives sensor_embeddings a differentiable gradient path
+        sensor_bias = self.sensor_proj(self.sensor_embeddings)  # (N, hidden_dim)
+        h_last_norm = h_last_norm + sensor_bias.unsqueeze(0)    # broadcast over batch
 
         # GAT processing with residual
         # PyTorch Geometric requires CPU for node features and edge_index
@@ -270,7 +278,10 @@ class GDN(nn.Module):
         self._graph_step_counter += 1
 
         # Normalize before GAT
-        h_last_norm = F.normalize(h_last, p=2, dim=2)
+        h_last_norm = F.normalize(h_last, p=2, dim=2)  # (B, N, hidden_dim)
+        # Inject sensor identity — gives sensor_embeddings a differentiable gradient path
+        sensor_bias = self.sensor_proj(self.sensor_embeddings)  # (N, hidden_dim)
+        h_last_norm = h_last_norm + sensor_bias.unsqueeze(0)    # broadcast over batch
 
         # GAT processing with residual
         # PyTorch Geometric requires CPU for node features and edge_index
