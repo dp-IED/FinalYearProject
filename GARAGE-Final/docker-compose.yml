@@ -1,8 +1,0 @@
-services:
-  dashboard:
-    build: .
-    ports:
-      - "8080:80"
-    # Optional: mount results so the app can load JSON via a future API
-    # volumes:
-    #   - ./results:/usr/share/nginx/html/results:ro
