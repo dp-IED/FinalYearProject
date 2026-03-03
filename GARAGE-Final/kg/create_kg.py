@@ -6,10 +6,12 @@ Creates knowledge graphs from trained GDN models by:
 1. Loading trained GDN model
 2. Running inference on data windows
 3. Building knowledge graph with temporal relationships
-4. Optionally exporting to Neo4j or saving as NetworkX file
+4. Saving as NetworkX pickle or JSON file
 
 Usage:
-    python kg/create_kg.py --model_path checkpoints/stage1_best_forecast.pt --data_path data/carOBD/obdiidata --output_path kg_output/graph.pkl
+    python kg/create_kg.py --model_path checkpoints/stage2_clean_phase2_50ep_*/stage2_clean_best.pt --data_path data/carOBD/obdiidata --output_path kg_output/graph.pkl
+
+Note: Only Stage 2 clean checkpoints (stage2_clean_best.pt from train_stage2_clean.py) are accepted.
 """
 
 import os
@@ -186,6 +188,19 @@ def load_gdn_model(model_path: str, device: str = 'cpu') -> Tuple[GDN, Dict[str,
     print(f"Loading model from {model_path}...")
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     
+    # Only accept Stage 2 clean checkpoints (stage2_clean_best.pt)
+    if not isinstance(checkpoint, dict):
+        raise ValueError(
+            "create_kg expects a Stage 2 clean checkpoint (stage2_clean_best.pt). "
+            "Got raw state dict. Use a checkpoint from train_stage2_clean.py."
+        )
+    if checkpoint.get("stage") != 2 or checkpoint.get("stage2_mode") != "clean":
+        raise ValueError(
+            "create_kg expects a Stage 2 clean checkpoint (stage2_clean_best.pt). "
+            "Stage 1 or other model formats are not supported. "
+            "Train with train_stage2_clean.py and use the resulting checkpoint."
+        )
+    
     # Extract metadata from checkpoint
     if isinstance(checkpoint, dict):
         sensor_names = checkpoint.get('sensor_names', [])
@@ -213,36 +228,24 @@ def load_gdn_model(model_path: str, device: str = 'cpu') -> Tuple[GDN, Dict[str,
         top_k=top_k,
         hidden_dim=hidden_dim,
     ).to(device)
-    
-    # Handle checkpoint from GDNWithForecasting wrapper (has 'base_model.' prefix)
-    if any(key.startswith('base_model.') for key in state_dict.keys()):
-        # Remove 'base_model.' prefix
-        new_state_dict = {}
-        for key, value in state_dict.items():
-            if key.startswith('base_model.'):
-                new_key = key[len('base_model.'):]
-                new_state_dict[new_key] = value
-            else:
-                new_state_dict[key] = value
-        state_dict = new_state_dict
-        print("  ✓ Removed 'base_model.' prefix from checkpoint keys")
-    
-    # Handle GAT layer key mismatch between PyG versions
-    if "gat.lin.weight" in state_dict and "gat.lin_src.weight" not in state_dict:
-        gat_lin_weight = state_dict.pop("gat.lin.weight")
-        state_dict["gat.lin_src.weight"] = gat_lin_weight
-        state_dict["gat.lin_dst.weight"] = gat_lin_weight.clone()
-        print("  ✓ Converted GAT layer from old format to new format")
-    
-    # Load state dict
-    try:
-        model.load_state_dict(state_dict, strict=True)
-        print("  ✓ Model loaded successfully")
-    except RuntimeError as e:
-        print(f"  Warning: Strict loading failed: {e}")
-        print("  Attempting partial loading...")
-        model.load_state_dict(state_dict, strict=False)
-        print("  ✓ Model loaded with partial state dict")
+
+    # Remap GAT keys for PyG version compatibility (lin vs lin_src/lin_dst)
+    state_dict = dict(state_dict)
+    model_expects_lin = "gat.lin.weight" in model.state_dict()
+    model_expects_lin_src = "gat.lin_src.weight" in model.state_dict()
+    ckpt_has_lin = "gat.lin.weight" in state_dict
+    ckpt_has_lin_src = "gat.lin_src.weight" in state_dict
+
+    if model_expects_lin_src and ckpt_has_lin:
+        lin_weight = state_dict.pop("gat.lin.weight")
+        state_dict["gat.lin_src.weight"] = lin_weight.clone()
+        state_dict["gat.lin_dst.weight"] = lin_weight.clone()
+    elif model_expects_lin and ckpt_has_lin_src:
+        state_dict["gat.lin.weight"] = state_dict.pop("gat.lin_src.weight")
+        state_dict.pop("gat.lin_dst.weight", None)
+
+    model.load_state_dict(state_dict, strict=True)
+    print("  ✓ Model loaded successfully")
     
     model.eval()
     
@@ -300,7 +303,15 @@ def compute_adjacency_matrix(sensor_embeddings: np.ndarray) -> np.ndarray:
     return adjacency_matrix
 
 
-def predict_anomalies(model: GDN, X_windows: np.ndarray, batch_size: int = 32, device: str = 'cpu') -> np.ndarray:
+def predict_anomalies(
+    model: GDN,
+    X_windows: np.ndarray,
+    batch_size: int = 32,
+    device: str = 'cpu',
+    return_global: bool = False,
+    apply_global_mask: bool = True,
+    global_mask_threshold: float = 0.5,
+) -> np.ndarray:
     """
     Run inference on data windows to get sensor anomaly probabilities.
     
@@ -312,6 +323,8 @@ def predict_anomalies(model: GDN, X_windows: np.ndarray, batch_size: int = 32, d
         
     Returns:
         sensor_probs: (num_windows, num_sensors) numpy array of anomaly probabilities
+            (or raw/masked if global mask is enabled).
+            If `return_global=True`, returns tuple of (sensor_probs, global_probs).
     """
     if X_windows.dim() != 3 if isinstance(X_windows, torch.Tensor) else len(X_windows.shape) != 3:
         raise ValueError(f"Expected 3D input (num_windows, window_size, num_sensors), got shape {X_windows.shape}")
@@ -324,16 +337,31 @@ def predict_anomalies(model: GDN, X_windows: np.ndarray, batch_size: int = 32, d
     X_windows = X_windows.to(device)
     
     all_sensor_probs = []
+    all_global_probs = []
     model.eval()
     
     with torch.no_grad():
         for i in range(0, num_windows, batch_size):
-            batch = X_windows[i:i + batch_size]
-            sensor_logits = model(batch, return_global=False)  # (B, N)
+            batch = X_windows[i : i + batch_size]
+            if apply_global_mask or return_global:
+                sensor_logits, global_logits = model(batch, return_global=True)
+                global_probs = torch.sigmoid(global_logits)
+            else:
+                sensor_logits = model(batch, return_global=False)
+                global_probs = torch.zeros((batch.shape[0],), device=batch.device)
+
             sensor_probs = torch.sigmoid(sensor_logits)  # Convert logits to probabilities
+            if apply_global_mask:
+                support = (global_probs >= global_mask_threshold).float().unsqueeze(1)
+                sensor_probs = sensor_probs * support
             all_sensor_probs.append(sensor_probs.cpu().numpy())
+            if return_global:
+                all_global_probs.append(global_probs.cpu().numpy())
     
     sensor_probs = np.concatenate(all_sensor_probs, axis=0)
+    if return_global:
+        global_probs = np.concatenate(all_global_probs, axis=0)
+        return sensor_probs, global_probs
     return sensor_probs
 
 
@@ -375,7 +403,7 @@ def extract_window_embeddings(model: GDN, X_windows: np.ndarray, batch_size: int
 
 class KnowledgeGraph:
     """
-    Unified Knowledge Graph class that handles construction, Neo4j export, and per-window retrieval.
+    Unified Knowledge Graph class that handles construction and per-window retrieval.
     
     This class combines GDN inference results with KG construction, providing:
     - Temporal relationship tracking
@@ -406,7 +434,6 @@ class KnowledgeGraph:
         self.window_graphs = {}  # Per-window graphs
         self.window_stats = {}  # Per-window statistics
         self.window_embeddings = {}  # Per-window embedding data
-        self.window_stage2_features = {}  # Per-window Stage 2 features
         self.anomaly_propagation_chains = []  # Fault propagation chains
         self.distribution_thresholds = None  # Distribution-based thresholds
         self.X_windows = None  # Normalized windows
@@ -414,7 +441,15 @@ class KnowledgeGraph:
         
         # Initialize sensor nodes
         self._initialize_sensor_nodes()
-    
+
+    def number_of_nodes(self) -> int:
+        """Return the number of nodes in the graph (delegates to inner NetworkX graph)."""
+        return self.kg.number_of_nodes()
+
+    def number_of_edges(self) -> int:
+        """Return the number of edges in the graph (delegates to inner NetworkX graph)."""
+        return self.kg.number_of_edges()
+
     def _initialize_sensor_nodes(self):
         """Initialize sensor nodes in the knowledge graph with metadata"""
         for sensor_name in self.sensor_names:
@@ -433,39 +468,35 @@ class KnowledgeGraph:
     
     def construct(self, X_windows: np.ndarray, gdn_predictions: np.ndarray,
                   X_windows_unnormalized: Optional[np.ndarray] = None,
-                  stage2_features: Optional[Dict[int, Dict[str, float]]] = None,
                   sensor_labels_true: Optional[np.ndarray] = None,
                   window_labels_true: Optional[np.ndarray] = None) -> 'KnowledgeGraph':
         """
         Main method: Build KG by traversing windows temporally.
-        
+
         Builds knowledge graph from GDN model outputs (predictions), NOT ground truth labels.
-        
+
         Args:
             X_windows: (num_windows, window_size, num_sensors) normalized sensor data windows
             gdn_predictions: (num_windows, num_sensors) GDN anomaly scores (0.0-1.0) per sensor per window
             X_windows_unnormalized: (num_windows, window_size, num_sensors) unnormalized windows (optional)
-            stage2_features: Optional dict mapping window_idx to Stage 2 features (embedding distances)
             sensor_labels_true: Optional (num_windows, num_sensors) ground truth labels (for thresholds only)
             window_labels_true: Optional (num_windows,) ground truth window labels (for thresholds only)
-            
+
         Returns:
             self (for method chaining)
         """
         num_windows = len(X_windows)
-        
+
         # Store window data
         self.X_windows = X_windows
         self.X_windows_unnormalized = X_windows_unnormalized
-        self.window_stage2_features = stage2_features if stage2_features else {}
-        
+
         # First pass: Process all windows
         print(f"Processing {num_windows} windows...")
         for window_idx in tqdm(range(num_windows), desc="Building KG"):
             window_data = X_windows[window_idx]
             window_gdn_scores = gdn_predictions[window_idx]
-            window_stage2 = self.window_stage2_features.get(window_idx, {})
-            self._process_window(window_idx, window_data, window_gdn_scores, window_stage2)
+            self._process_window(window_idx, window_data, window_gdn_scores)
             
             if window_idx > 0:
                 self._build_temporal_edges(window_idx - 1, window_idx,
@@ -481,17 +512,16 @@ class KnowledgeGraph:
         for window_idx in range(num_windows):
             window_data = X_windows[window_idx]
             window_gdn_scores = gdn_predictions[window_idx]
-            window_stage2 = self.window_stage2_features.get(window_idx, {})
-            self._update_edges_with_thresholds(window_idx, window_data, window_gdn_scores, window_stage2)
+            self._update_edges_with_thresholds(window_idx, window_data, window_gdn_scores)
         
         # Track anomaly propagation
         self._track_anomaly_propagation(gdn_predictions)
         
-        print(f"✓ Knowledge Graph built: {self.kg.number_of_nodes()} nodes, {self.kg.number_of_edges()} edges")
+        print(f"✓ Knowledge Graph built: {self.number_of_nodes()} nodes, {self.number_of_edges()} edges")
         return self
     
     def _process_window(self, window_idx: int, window_data: np.ndarray,
-                       gdn_scores: np.ndarray, stage2_features: Optional[Dict[str, float]] = None):
+                       gdn_scores: np.ndarray):
         """Process a single window and build its graph."""
         window_stats = {}
         for sensor_idx, sensor_name in enumerate(self.sensor_names):
@@ -558,7 +588,6 @@ class KnowledgeGraph:
                     window_stats[sensor_i], window_stats[sensor_j],
                     anomaly_threshold=anomaly_threshold_global,
                     deviation_threshold=deviation_threshold,
-                    stage2_features=stage2_features
                 )
                 
                 if edge_type:
@@ -577,8 +606,7 @@ class KnowledgeGraph:
                             window_corr: float, expected_corr_gdn: float,
                             stats_i: WindowStats, stats_j: WindowStats,
                             anomaly_threshold: float = 0.5,
-                            deviation_threshold: float = 0.3,
-                            stage2_features: Optional[Dict[str, float]] = None) -> Tuple[Optional[str], Dict]:
+                            deviation_threshold: float = 0.3) -> Tuple[Optional[str], Dict]:
         """Infer semantic edge between two sensors."""
         if np.isnan(window_corr) or np.isinf(window_corr) or abs(window_corr) < 0.1:
             return None, {}
@@ -767,7 +795,7 @@ class KnowledgeGraph:
         }
     
     def _update_edges_with_thresholds(self, window_idx: int, window_data: np.ndarray,
-                                     gdn_scores: np.ndarray, stage2_features: Optional[Dict[str, float]] = None):
+                                     gdn_scores: np.ndarray):
         """Update edges with distribution-based thresholds."""
         if window_idx not in self.window_graphs:
             return
@@ -829,7 +857,6 @@ class KnowledgeGraph:
             "temporal_context": [],
             "anomaly_propagation": [],
             "distribution_thresholds": self.distribution_thresholds,
-            "stage_features": self.window_stage2_features.get(window_idx, {}),
         }
         
         if window_idx not in self.window_graphs:
@@ -939,123 +966,6 @@ class KnowledgeGraph:
                         break
         
         return context
-    
-    def save_to_neo4j(self, uri: str = "bolt://127.0.0.1:7687", 
-                     user: str = "neo4j", password: str = "password"):
-        """
-        Load KG into Neo4j database.
-        
-        Args:
-            uri: Neo4j connection URI
-            user: Neo4j username
-            password: Neo4j password
-        """
-        try:
-            import neo4j
-        except ImportError:
-            raise ImportError("neo4j package not installed. Install with: pip install neo4j")
-        
-        print(f"Connecting to Neo4j at {uri}...")
-        driver = neo4j.GraphDatabase.driver(uri, auth=(user, password))
-        
-        try:
-            with driver.session() as session:
-                # Create schema
-                session.run("""
-                    CREATE CONSTRAINT sensor_name_unique IF NOT EXISTS
-                    FOR (s:Sensor) REQUIRE s.name IS UNIQUE
-                """)
-                session.run("""
-                    CREATE CONSTRAINT window_label_unique IF NOT EXISTS
-                    FOR (w:Window) REQUIRE w.label IS UNIQUE
-                """)
-                
-                # Create Window nodes
-                for window_idx in sorted(self.window_graphs.keys()):
-                    session.run("""
-                        MERGE (w:Window {label: $window_idx})
-                        SET w.window_idx = $window_idx
-                    """, window_idx=window_idx)
-                
-                # Create Sensor nodes per window
-                for window_idx in sorted(self.window_graphs.keys()):
-                    window_stats = self.window_stats.get(window_idx, {})
-                    for sensor_idx, base_sensor_name in enumerate(self.sensor_names):
-                        if base_sensor_name not in window_stats:
-                            continue
-                        
-                        stats = window_stats[base_sensor_name]
-                        composite_name = f"Window_{window_idx}_Sensor_{base_sensor_name}"
-                        subsystem = SENSOR_SUBSYSTEMS.get(base_sensor_name, "Unknown")
-                        desc = SENSOR_DESCRIPTIONS.get(base_sensor_name, {})
-                        
-                        session.run("""
-                            MATCH (w:Window {label: $window_idx})
-                            MERGE (s:Sensor {name: $composite_name})
-                            SET s.window = $window_idx,
-                                s.base_sensor_name = $base_sensor_name,
-                                s.subsystem = $subsystem,
-                                s.description = $description,
-                                s.anomaly_score = $anomaly_score,
-                                s.is_faulty = $is_faulty,
-                                s.mean = $mean,
-                                s.std = $std,
-                                s.min = $min,
-                                s.max = $max
-                            MERGE (s)-[:BELONGS_TO]->(w)
-                        """,
-                            window_idx=window_idx,
-                            composite_name=composite_name,
-                            base_sensor_name=base_sensor_name,
-                            subsystem=subsystem,
-                            description=desc.get("description", ""),
-                            anomaly_score=float(stats.anomaly_score),
-                            is_faulty=bool(stats.anomaly_score > 0.5),
-                            mean=stats.mean,
-                            std=stats.std,
-                            min=stats.min,
-                            max=stats.max
-                        )
-                
-                # Create CORRELATES_WITH relationships
-                for window_idx in sorted(self.window_graphs.keys()):
-                    window_graph = self.window_graphs[window_idx]
-                    for u, v, data in window_graph.edges(data=True):
-                        if data.get('window_idx') != window_idx:
-                            continue
-                        
-                        sensor_u = f"Window_{window_idx}_Sensor_{u}"
-                        sensor_v = f"Window_{window_idx}_Sensor_{v}"
-                        
-                        session.run("""
-                            MATCH (s1:Sensor {name: $sensor_u}), (s2:Sensor {name: $sensor_v})
-                            MERGE (s1)-[r:CORRELATES_WITH]->(s2)
-                            SET r.actual_correlation = $correlation,
-                                r.expected_correlation = $expected_correlation,
-                                r.correlation_strength = $correlation_strength,
-                                r.violates_gdn_expectation = $violates_gdn
-                        """,
-                            sensor_u=sensor_u,
-                            sensor_v=sensor_v,
-                            correlation=float(data.get('correlation', 0)),
-                            expected_correlation=float(data.get('expected_correlation_gdn', 0)),
-                            correlation_strength=float(data.get('correlation_strength', 0)),
-                            violates_gdn=bool(data.get('violates_gdn_expectation', False))
-                        )
-                
-                # Create PRECEDES relationships
-                window_indices = sorted(self.window_graphs.keys())
-                for i in range(len(window_indices) - 1):
-                    prev_idx = window_indices[i]
-                    curr_idx = window_indices[i + 1]
-                    session.run("""
-                        MATCH (w1:Window {label: $prev_idx}), (w2:Window {label: $curr_idx})
-                        MERGE (w1)-[:PRECEDES]->(w2)
-                    """, prev_idx=prev_idx, curr_idx=curr_idx)
-            
-            print(f"✓ Knowledge Graph loaded into Neo4j")
-        finally:
-            driver.close()
     
     def save(self, path: str):
         """
@@ -1274,7 +1184,7 @@ def main():
         "--model_path",
         type=str,
         required=True,
-        help="Path to trained GDN checkpoint (.pt file)"
+        help="Path to Stage 2 clean checkpoint (stage2_clean_best.pt from train_stage2_clean.py)"
     )
     parser.add_argument(
         "--data_path",
@@ -1287,24 +1197,6 @@ def main():
         type=str,
         default=None,
         help="Path to save KG (NetworkX pickle or JSON). If not provided, KG is not saved."
-    )
-    parser.add_argument(
-        "--neo4j_uri",
-        type=str,
-        default="bolt://127.0.0.1:7687",
-        help="Neo4j connection URI (default: bolt://127.0.0.1:7687)"
-    )
-    parser.add_argument(
-        "--neo4j_user",
-        type=str,
-        default="neo4j",
-        help="Neo4j username (default: neo4j)"
-    )
-    parser.add_argument(
-        "--neo4j_password",
-        type=str,
-        default="password",
-        help="Neo4j password (default: password)"
     )
     parser.add_argument(
         "--batch_size",
@@ -1324,11 +1216,6 @@ def main():
         help="Force CPU usage"
     )
     parser.add_argument(
-        "--skip_neo4j",
-        action="store_true",
-        help="Skip Neo4j loading even if credentials provided"
-    )
-    parser.add_argument(
         "--window_size",
         type=int,
         default=300,
@@ -1340,6 +1227,17 @@ def main():
         nargs="+",
         default=None,
         help="Sensor column names. If not provided, uses default 8 sensors."
+    )
+    parser.add_argument(
+        "--disable_global_mask",
+        action="store_true",
+        help="Disable global-context masking of sensor scores",
+    )
+    parser.add_argument(
+        "--global_mask_threshold",
+        type=float,
+        default=0.5,
+        help="Global anomaly threshold used for gating sensor scores",
     )
     
     args = parser.parse_args()
@@ -1403,7 +1301,14 @@ def main():
     print("\n" + "=" * 80)
     print("Step 4: Running GDN Inference")
     print("=" * 80)
-    gdn_predictions = predict_anomalies(model, X_windows, args.batch_size, device)
+    gdn_predictions = predict_anomalies(
+        model,
+        X_windows,
+        batch_size=args.batch_size,
+        device=device,
+        apply_global_mask=not args.disable_global_mask,
+        global_mask_threshold=args.global_mask_threshold,
+    )
     print(f"✓ Generated predictions for {len(gdn_predictions)} windows")
     
     # Build Knowledge Graph
@@ -1424,22 +1329,11 @@ def main():
         print("=" * 80)
         kg.save(args.output_path)
     
-    # Load to Neo4j if requested
-    if not args.skip_neo4j:
-        print("\n" + "=" * 80)
-        print("Step 7: Loading to Neo4j")
-        print("=" * 80)
-        try:
-            kg.save_to_neo4j(args.neo4j_uri, args.neo4j_user, args.neo4j_password)
-        except Exception as e:
-            print(f"⚠ Warning: Failed to load to Neo4j: {e}")
-            print("  Continuing without Neo4j export...")
-    
     print("\n" + "=" * 80)
     print("✓ Knowledge Graph Creation Complete!")
     print("=" * 80)
-    print(f"  Nodes: {kg.kg.number_of_nodes()}")
-    print(f"  Edges: {kg.kg.number_of_edges()}")
+    print(f"  Nodes: {kg.number_of_nodes()}")
+    print(f"  Edges: {kg.number_of_edges()}")
     print(f"  Windows: {len(kg.window_graphs)}")
     if args.output_path:
         print(f"  Saved to: {args.output_path}")
