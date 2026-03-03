@@ -8,6 +8,7 @@ self-supervised forecasting task. No labels needed.
 """
 
 import os
+import random
 import sys
 import argparse
 import pandas as pd
@@ -32,7 +33,7 @@ torch.set_default_dtype(torch.float32)
 # ============================================================================
 
 # Data path - relative to GARAGE-Final directory
-DATA_PATH = str(Path(__file__).parent.parent / "data" / "carOBD" / "obdiidata")
+DATA_PATH = str(Path(__file__).parent.parent / "data" / "shared_dataset")
 SENSOR_COLS = [
     "ENGINE_RPM ()",
     "VEHICLE_SPEED ()",
@@ -46,6 +47,11 @@ SENSOR_COLS = [
 ID_COL = "drive_id"
 TIME_COL = "ENGINE_RUN_TINE ()"
 WINDOW_SIZE = 300
+
+# Drive split ratios: 70/15/15 for larger test set
+TRAIN_RATIO = 0.70
+VAL_RATIO = 0.15
+TEST_RATIO = 0.15
 FORECAST_HORIZONS = [1, 5, 10]  # Multi-horizon forecasting
 
 # Training hyperparameters
@@ -55,9 +61,9 @@ LEARNING_RATE = 1e-3
 WEIGHT_DECAY = 1e-4
 
 # Model architecture
-EMBED_DIM = 32  # Reduced from 64 for better generalization
-TOP_K = 5  # Increased from 3 for better connectivity
-HIDDEN_DIM = 64
+EMBED_DIM = 16
+TOP_K = 7  # Increased from 5 for better connectivity
+HIDDEN_DIM = 32
 
 # ============================================================================
 # Model with Forecasting Head
@@ -379,7 +385,12 @@ class TemporalContrastiveLoss(nn.Module):
         # Handle case where no positive pairs exist
         has_pos = positive_mask.sum(dim=1) > 0
         if has_pos.sum() == 0:
-            return torch.tensor(0.0, device=device, requires_grad=True)
+            # Fallback: uniformity loss to prevent embedding collapse
+            if B < 2:
+                return torch.tensor(0.0, device=device, requires_grad=True)
+            sq_pdist = torch.pdist(embeddings, p=2).pow(2)
+            uniformity = torch.log(torch.exp(-2.0 * sq_pdist).mean() + 1e-8)
+            return uniformity * 0.1
 
         loss = -torch.log((pos_sim[has_pos] / (all_sim[has_pos] + 1e-8)) + 1e-8).mean()
 
@@ -401,6 +412,7 @@ def train_stage1(
     learning_rate=LEARNING_RATE,
     weight_decay=WEIGHT_DECAY,
     checkpoint_dir="checkpoints",
+    checkpoint_name=None,
     use_compile=False,
     compile_mode="reduce-overhead",
     gradient_accumulation_steps=1,
@@ -408,6 +420,12 @@ def train_stage1(
     resume_from_checkpoint=None,
     focus_on_contrastive=False,
     max_batches_per_epoch=None,
+    scheduler_patience=15,
+    scheduler_factor=0.5,
+    contrastive_temperature=0.1,
+    lambda_contrast=0.7,
+    lambda_forecast=1.0,
+    early_stopping_patience=25,
 ):
     """
     Train GDN with forecasting loss only (self-supervised).
@@ -454,12 +472,38 @@ def train_stage1(
 
     # Loss functions
     forecast_criterion = nn.MSELoss()
-    recon_criterion = nn.MSELoss()
-    contrastive_loss_fn = TemporalContrastiveLoss(temperature=0.5)
+    contrastive_loss_fn = TemporalContrastiveLoss(temperature=contrastive_temperature)
+
+    # Diagnostic: sensor_embeddings gradient flow (run once before training)
+    print("\n[DIAG] sensor_embeddings gradient flow:")
+    print(f"  requires_grad: {base_model.sensor_embeddings.requires_grad}")
+    param_ids = {id(p) for p in optimizer.param_groups[0]["params"]}
+    print(f"  in optimizer: {id(base_model.sensor_embeddings) in param_ids}")
+    # Run one batch and check grad
+    for batch in train_loader:
+        X_b, y_f, d_ids = batch
+        X_b = X_b.to(device)
+        y_f = y_f.to(device)
+        d_ids = d_ids.to(device)
+        _, forecast = model(X_b, return_forecast=True, return_reconstruction=False)
+        loss_f = forecast_criterion(forecast, y_f)
+        emb = base_model.get_embeddings(X_b)
+        loss_c = contrastive_loss_fn(emb, d_ids)
+        loss = lambda_forecast * loss_f + lambda_contrast * loss_c
+        loss.backward()
+        break
+    grad = base_model.sensor_embeddings.grad
+    grad_norm = grad.norm().item() if grad is not None else float("nan")
+    print(f"  grad after 1 batch: {grad is not None} (norm={grad_norm:.6f})")
+    optimizer.zero_grad()
+    print()
 
     # Learning rate scheduler
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, patience=10, factor=0.5
+        optimizer,
+        patience=scheduler_patience,
+        factor=scheduler_factor,
+        min_lr=1e-6,
     )
 
     # Initialize training state
@@ -467,9 +511,7 @@ def train_stage1(
     best_val_loss = float("inf")
     best_contrastive_loss = float("inf")
     patience_counter = 0
-    max_patience = (
-        20 if not focus_on_contrastive else 999999
-    )  # Disable early stopping if focusing on contrastive
+    max_patience = early_stopping_patience if not focus_on_contrastive else 999999
 
     # Resume from checkpoint if provided
     if resume_from_checkpoint and os.path.exists(resume_from_checkpoint):
@@ -515,7 +557,8 @@ def train_stage1(
 
     # Create checkpoint directory
     os.makedirs(checkpoint_dir, exist_ok=True)
-    best_checkpoint_path = os.path.join(checkpoint_dir, "stage1_best_forecast.pt")
+    base_name = f"stage1_best_forecast_{checkpoint_name}" if checkpoint_name else "stage1_best_forecast"
+    best_checkpoint_path = os.path.join(checkpoint_dir, f"{base_name}.pt")
 
     print(f"\n{'=' * 80}")
     print("Stage 1: Graph Structure Learning (Self-Supervised Forecasting)")
@@ -532,14 +575,13 @@ def train_stage1(
         model.train()
         train_loss = 0.0
         train_loss_forecast = 0.0
-        train_loss_recon = 0.0
         train_loss_contrastive = 0.0
 
         # Limit batches for quick testing
         train_iter = train_loader
         if max_batches_per_epoch is not None:
             train_iter = list(train_loader)[:max_batches_per_epoch]
-        
+
         with tqdm(
             train_iter, desc=f"Epoch {epoch + 1}/{num_epochs}", leave=False
         ) as pbar:
@@ -557,15 +599,12 @@ def train_stage1(
                 # Forward pass with optional AMP
                 if use_amp and scaler is not None:
                     with autocast():
-                        _, forecast, reconstruction = model(
-                            X_batch, return_forecast=True, return_reconstruction=True
+                        _, forecast = model(
+                            X_batch, return_forecast=True, return_reconstruction=False
                         )
 
                         # Multi-horizon forecasting loss (averaged across horizons)
                         loss_forecast = forecast_criterion(forecast, y_forecast_batch)
-
-                        # Reconstruction loss
-                        loss_recon = recon_criterion(reconstruction, X_batch)
 
                         # Contrastive loss
                         window_embeddings = model.base_model.get_embeddings(X_batch)
@@ -575,19 +614,17 @@ def train_stage1(
 
                         # Combined loss (scale by accumulation steps)
                         loss = (
-                            loss_forecast + 0.5 * loss_recon + 0.3 * loss_contrastive
+                            lambda_forecast * loss_forecast
+                            + lambda_contrast * loss_contrastive
                         ) / gradient_accumulation_steps
                 else:
-                    # Forward pass: get forecast and reconstruction
-                    _, forecast, reconstruction = model(
-                        X_batch, return_forecast=True, return_reconstruction=True
+                    # Forward pass: get forecast
+                    _, forecast = model(
+                        X_batch, return_forecast=True, return_reconstruction=False
                     )
 
                     # Multi-horizon forecasting loss (averaged across horizons)
                     loss_forecast = forecast_criterion(forecast, y_forecast_batch)
-
-                    # Reconstruction loss
-                    loss_recon = recon_criterion(reconstruction, X_batch)
 
                     # Contrastive loss
                     window_embeddings = model.base_model.get_embeddings(X_batch)
@@ -597,7 +634,8 @@ def train_stage1(
 
                     # Combined loss (scale by accumulation steps)
                     loss = (
-                        loss_forecast + 0.5 * loss_recon + 0.3 * loss_contrastive
+                        lambda_forecast * loss_forecast
+                        + lambda_contrast * loss_contrastive
                     ) / gradient_accumulation_steps
 
                 # Backward pass with optional AMP
@@ -630,9 +668,6 @@ def train_stage1(
                 train_loss_forecast += (
                     loss_forecast.item() * X_batch.size(0) * gradient_accumulation_steps
                 )
-                train_loss_recon += (
-                    loss_recon.item() * X_batch.size(0) * gradient_accumulation_steps
-                )
                 train_loss_contrastive += (
                     loss_contrastive.item()
                     * X_batch.size(0)
@@ -641,14 +676,12 @@ def train_stage1(
 
         train_loss /= len(train_loader.dataset)
         train_loss_forecast /= len(train_loader.dataset)
-        train_loss_recon /= len(train_loader.dataset)
         train_loss_contrastive /= len(train_loader.dataset)
 
         # Validation
         model.eval()
         val_loss = 0.0
         val_loss_forecast = 0.0
-        val_loss_recon = 0.0
         val_loss_contrastive = 0.0
 
         with torch.no_grad():
@@ -660,43 +693,55 @@ def train_stage1(
                 y_forecast_batch = y_forecast_batch.to(device)
                 drive_ids_batch = drive_ids_batch.to(device)
 
-                _, forecast, reconstruction = model(
-                    X_batch, return_forecast=True, return_reconstruction=True
+                _, forecast = model(
+                    X_batch, return_forecast=True, return_reconstruction=False
                 )
 
                 loss_forecast = forecast_criterion(forecast, y_forecast_batch)
-                loss_recon = recon_criterion(reconstruction, X_batch)
 
                 window_embeddings = model.base_model.get_embeddings(X_batch)
                 loss_contrastive = contrastive_loss_fn(
                     window_embeddings, drive_ids_batch
                 )
 
-                loss = loss_forecast + 0.5 * loss_recon + 0.3 * loss_contrastive
+                loss = (
+                    lambda_forecast * loss_forecast + lambda_contrast * loss_contrastive
+                )
 
                 val_loss += loss.item() * X_batch.size(0)
                 val_loss_forecast += loss_forecast.item() * X_batch.size(0)
-                val_loss_recon += loss_recon.item() * X_batch.size(0)
                 val_loss_contrastive += loss_contrastive.item() * X_batch.size(0)
 
         val_loss /= len(val_loader.dataset)
         val_loss_forecast /= len(val_loader.dataset)
-        val_loss_recon /= len(val_loader.dataset)
         val_loss_contrastive /= len(val_loader.dataset)
 
         # Update scheduler
+        lr_before = optimizer.param_groups[0]["lr"]
         scheduler.step(val_loss)
+        if optimizer.param_groups[0]["lr"] < lr_before:
+            print(
+                f"  ↓ LR reduced: {lr_before:.2e} → {optimizer.param_groups[0]['lr']:.2e}"
+            )
+
+        # Off-diag sim for diversity monitoring
+        with torch.no_grad():
+            emb = F.normalize(base_model.sensor_embeddings, dim=-1)
+            sim = torch.mm(emb, emb.t())
+            n = base_model.num_nodes
+            m = ~torch.eye(n, dtype=torch.bool, device=emb.device)
+            off_diag_sim = sim[m].mean().item()
 
         print(
             f"Epoch {epoch + 1}/{num_epochs} | "
             f"Train Loss: {train_loss:.6f} | "
             f"Forecast: {train_loss_forecast:.6f} | "
-            f"Recon: {train_loss_recon:.6f} | "
             f"Contrastive: {train_loss_contrastive:.6f} | "
             f"Val Loss: {val_loss:.6f} | "
             f"Val Forecast: {val_loss_forecast:.6f} | "
             f"Val Contrastive: {val_loss_contrastive:.6f}"
         )
+        print(f"  Sensor off-diag cosine sim: {off_diag_sim:.4f}")
 
         # Track best contrastive loss if focusing on it
         if focus_on_contrastive:
@@ -809,6 +854,12 @@ def main():
         help="Directory to save checkpoints",
     )
     parser.add_argument(
+        "--checkpoint_name",
+        type=str,
+        default=None,
+        help="Suffix for checkpoint filename (e.g. 20250302_143022). Saves as stage1_best_forecast_<name>.pt",
+    )
+    parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
         default=1,
@@ -854,7 +905,52 @@ def main():
         default=None,
         help="Limit number of batches per epoch for quick testing (default: None = use all batches)",
     )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Random seed for reproducibility"
+    )
+    parser.add_argument(
+        "--scheduler_patience",
+        type=int,
+        default=15,
+        help="ReduceLROnPlateau patience (default: 15)",
+    )
+    parser.add_argument(
+        "--scheduler_factor",
+        type=float,
+        default=0.5,
+        help="ReduceLROnPlateau factor (default: 0.5)",
+    )
+    parser.add_argument(
+        "--contrastive_temperature",
+        type=float,
+        default=0.1,
+        help="InfoNCE temperature (default: 0.1)",
+    )
+    parser.add_argument(
+        "--lambda_contrast",
+        type=float,
+        default=0.7,
+        help="Weight for contrastive loss term (default: 0.7)",
+    )
+    parser.add_argument(
+        "--lambda_forecast",
+        type=float,
+        default=1.0,
+        help="Weight for forecast loss term (default: 1.0)",
+    )
+    parser.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=25,
+        help="Early stopping patience in epochs (default: 25)",
+    )
     args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     # Device detection (CUDA or CPU only - MPS not supported due to PyTorch Geometric incompatibility)
     if args.cpu_only:
@@ -878,90 +974,28 @@ def main():
             print("Using device: cpu (auto-detected)")
 
     # Load data
-    print(f"\nLoading data from {args.data_path}...")
-    df_list = []
-    for file in os.listdir(args.data_path):
-        if file.endswith(".csv"):
-            df = pd.read_csv(f"{args.data_path}/{file}", index_col=False)
-            df["drive_id"] = file
-            df_list.append(df)
+    print(f"\nLoading from .npz dataset: {args.data_path}")
+    train_npz = os.path.join(args.data_path, "train.npz")
+    val_npz   = os.path.join(args.data_path, "val.npz")
 
-    print(f"Loaded {len(df_list)} files")
+    if not os.path.exists(train_npz) or not os.path.exists(val_npz):
+        raise FileNotFoundError(
+            f"train.npz / val.npz not found in {args.data_path}. "
+            f"Run: python data/create_shared_dataset.py --output-dir {args.data_path}"
+        )
 
-    # Combine all dataframes
-    data = pd.concat(df_list, ignore_index=True)
-    print(f"Total samples: {len(data):,}")
-    print(f"Unique drives: {data[ID_COL].nunique()}")
+    train_data = np.load(train_npz, allow_pickle=True)
+    val_data   = np.load(val_npz,   allow_pickle=True)
 
-    # Preprocessing
-    print("\nPreprocessing data...")
-    data = data.drop(
-        columns=[
-            "WARM_UPS_SINCE_CODES_CLEARED ()",
-            "TIME_SINCE_TROUBLE_CODES_CLEARED ()",
-        ]
-    )
-    data = mean_fill_missing_timestamps_and_remove_duplicates(
-        data, time_col=TIME_COL, id_cols=[ID_COL]
-    )
-    data = remove_zero_variance_columns(data, exclude_cols=[ID_COL])
-    data = downsample(
-        data, time_col=TIME_COL, source_file_col=ID_COL, downsample_factor=1
-    )
-    data = filter_long_drives(
-        data, id_col=ID_COL, min_length=WINDOW_SIZE + max(FORECAST_HORIZONS) + 1
-    )
-    data = add_cross_channel_features(data)
-    print("Added cross-channel features")
+    X_train          = torch.tensor(train_data["clean_normalized_windows"], dtype=torch.float32)
+    y_train_forecast = torch.tensor(train_data["forecast_targets"],         dtype=torch.float32)
+    drive_ids_train  = train_data["drive_ids"]
+    X_val            = torch.tensor(val_data["clean_normalized_windows"],   dtype=torch.float32)
+    y_val_forecast   = torch.tensor(val_data["forecast_targets"],           dtype=torch.float32)
+    drive_ids_val    = val_data["drive_ids"]
 
-    # Sort data
-    data = data.sort_values([ID_COL, TIME_COL]).reset_index(drop=True)
-
-    # Split by drive (70/15/15)
-    print("\nSplitting data by drive...")
-    unique_drives = data[ID_COL].unique()
-    n_drives = len(unique_drives)
-
-    train_drives = unique_drives[: int(0.70 * n_drives)]
-    val_drives = unique_drives[int(0.70 * n_drives) : int(0.85 * n_drives)]
-    test_drives = unique_drives[int(0.85 * n_drives) :]
-
-    print(
-        f"Train drives: {len(train_drives)}, Val drives: {len(val_drives)}, Test drives: {len(test_drives)}"
-    )
-
-    train_data = data[data[ID_COL].isin(train_drives)].copy()
-    val_data = data[data[ID_COL].isin(val_drives)].copy()
-    test_data = data[data[ID_COL].isin(test_drives)].copy()
-
-    print(
-        f"Train shape: {train_data.shape}, Val shape: {val_data.shape}, Test shape: {test_data.shape}"
-    )
-
-    # Build forecast windows (self-supervised, no labels needed)
-    print("\nBuilding forecast windows...")
-    X_train, y_train_forecast, drive_ids_train, scaler_train = build_forecast_windows(
-        train_data,
-        SENSOR_COLS,
-        ID_COL,
-        TIME_COL,
-        WINDOW_SIZE,
-        horizons=FORECAST_HORIZONS,
-        scaler=None,
-    )
-    X_val, y_val_forecast, drive_ids_val, _ = build_forecast_windows(
-        val_data,
-        SENSOR_COLS,
-        ID_COL,
-        TIME_COL,
-        WINDOW_SIZE,
-        horizons=FORECAST_HORIZONS,
-        scaler=scaler_train,
-    )
-
-    print(f"Train windows: {len(X_train)}")
-    print(f"Val windows: {len(X_val)}")
-    print(f"Forecast horizons: {FORECAST_HORIZONS}")
+    print(f"  Train: {len(X_train)} windows, Val: {len(X_val)} windows")
+    print(f"  Forecast targets shape: {y_train_forecast.shape}")
 
     # Create dataloaders with drive IDs
     # Convert string drive IDs to integer indices for tensor dataset
@@ -981,10 +1015,12 @@ def main():
 
     # Optimized DataLoader configuration
     pin_memory = device.startswith("cuda")  # Only pin memory for CUDA
+    g = torch.Generator().manual_seed(args.seed)
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
+        generator=g,
         num_workers=args.num_workers,
         pin_memory=pin_memory,
         persistent_workers=args.num_workers > 0,
@@ -1014,6 +1050,7 @@ def main():
         learning_rate=args.lr,
         weight_decay=WEIGHT_DECAY,
         checkpoint_dir=args.checkpoint_dir,
+        checkpoint_name=args.checkpoint_name,
         use_compile=args.use_compile,
         compile_mode=args.compile_mode,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -1021,6 +1058,12 @@ def main():
         resume_from_checkpoint=args.resume,
         focus_on_contrastive=args.focus_on_contrastive,
         max_batches_per_epoch=args.max_batches_per_epoch,
+        scheduler_patience=args.scheduler_patience,
+        scheduler_factor=args.scheduler_factor,
+        contrastive_temperature=args.contrastive_temperature,
+        lambda_contrast=args.lambda_contrast,
+        lambda_forecast=args.lambda_forecast,
+        early_stopping_patience=args.early_stopping_patience,
     )
 
     print("✓ Stage 1 training complete!")

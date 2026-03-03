@@ -25,7 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from models.gdn_model import GDN
 from models.center_loss import SensorOnlyCenterLoss
-from training.fault_injection import inject_faults_with_sensor_labels
+from data.fault_injection import inject_faults_with_sensor_labels
 
 # Reuse data preprocessing from Stage 1
 from training.train_stage1 import (
@@ -35,6 +35,9 @@ from training.train_stage1 import (
     filter_long_drives,
     add_cross_channel_features,
     build_forecast_windows,
+    TRAIN_RATIO,
+    VAL_RATIO,
+    TEST_RATIO,
 )
 
 torch.set_default_dtype(torch.float32)
@@ -68,9 +71,9 @@ LAMBDA_CENTER = 0.5
 LAMBDA_GLOBAL = 0.3
 
 # Model architecture (must match Stage 1)
-EMBED_DIM = 32
+EMBED_DIM = 16
 TOP_K = 5
-HIDDEN_DIM = 64
+HIDDEN_DIM = 32
 
 # Center Loss parameters
 MLC_MARGIN = 2.0
@@ -685,21 +688,24 @@ def main():
         data, time_col=TIME_COL, id_cols=[ID_COL]
     )
     data = remove_zero_variance_columns(data, exclude_cols=[ID_COL])
-    data = downsample(data, time_col=TIME_COL, source_file_col=ID_COL, downsample_factor=1)
+    data = downsample(
+        data, time_col=TIME_COL, source_file_col=ID_COL, downsample_factor=2
+    )
     data = filter_long_drives(data, id_col=ID_COL, min_length=WINDOW_SIZE + 1)
     data = add_cross_channel_features(data)
     print("Added cross-channel features")
 
     data = data.sort_values([ID_COL, TIME_COL]).reset_index(drop=True)
 
-    # Split by drive (70/15/15)
+    # Split by drive (TRAIN_RATIO / VAL_RATIO / TEST_RATIO)
     print("\nSplitting data by drive...")
-    unique_drives = data[ID_COL].unique()
+    unique_drives = np.sort(data[ID_COL].unique())
     n_drives = len(unique_drives)
-
-    train_drives = unique_drives[: int(0.70 * n_drives)]
-    val_drives = unique_drives[int(0.70 * n_drives) : int(0.85 * n_drives)]
-    test_drives = unique_drives[int(0.85 * n_drives) :]
+    t_end = int(TRAIN_RATIO * n_drives)
+    v_end = int((TRAIN_RATIO + VAL_RATIO) * n_drives)
+    train_drives = unique_drives[:t_end]
+    val_drives = unique_drives[t_end:v_end]
+    test_drives = unique_drives[v_end:]
 
     print(
         f"Train drives: {len(train_drives)}, Val drives: {len(val_drives)}, Test drives: {len(test_drives)}"
@@ -724,7 +730,7 @@ def main():
 
     # Inject faults with sensor-level labels
     print("\nInjecting faults with sensor-level labels (stratified distribution)...")
-    X_train_sensor, _, train_sensor_labels, train_window_labels = (
+    X_train_sensor, _, train_sensor_labels, train_window_labels, _ = (
         inject_faults_with_sensor_labels(
             X_train,
             y_train,
@@ -734,7 +740,7 @@ def main():
             use_stratified=True,
         )
     )
-    X_val_sensor, _, val_sensor_labels, val_window_labels = (
+    X_val_sensor, _, val_sensor_labels, val_window_labels, _ = (
         inject_faults_with_sensor_labels(
             X_val,
             y_val,
